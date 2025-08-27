@@ -76,6 +76,8 @@ GUIを起動し、YouTube URLを入力して配信を開始できます。
 python build_distribution.py
 ```
 
+**注意**: ビルドされた実行可能ファイルは、FFmpegの依存関係が組み込まれているため、別途FFmpegをインストールする必要がありません。
+
 ## ライセンス
 
 MIT License - 詳細は[LICENSE](LICENSE)ファイルを参照してください。
