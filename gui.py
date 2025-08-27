@@ -141,6 +141,9 @@ def get_optimal_format_string():
     """環境に応じた最適なフォーマット文字列を生成"""
     av1_supported, av1_decoders = check_av1_support()
     
+    # 720p未満の古い動画も再生できるよう、'bestvideo+bestaudio/best'をフォールバックとして追加
+    fallback_formats = 'bestvideo+bestaudio/best'
+
     if av1_supported:
         # AV1対応環境: パフォーマンスを考慮して2160p以下に制限
         format_str = (
@@ -148,7 +151,7 @@ def get_optimal_format_string():
             'bestvideo[vcodec!*=av01][height<=1440][height>=720]+bestaudio/'  # AV1が重い場合のフォールバック
             'best[height<=2160][height>=720]/'
             'bestvideo[height>=720]+bestaudio/'
-            'best'
+            f'{fallback_formats}' # 低解像度動画用のフォールバック
         )
         codec_info = f"AV1対応 (デコーダー: {', '.join(av1_decoders)}, 2160p以下)"
     else:
@@ -158,7 +161,7 @@ def get_optimal_format_string():
             'bestvideo[vcodec!*=av01][height>=720]+bestaudio/'
             'best[vcodec!*=av01][height>=720]/'
             'bestvideo[height>=720]+bestaudio/'
-            'best'
+            f'{fallback_formats}' # 低解像度動画用のフォールバック
         )
         codec_info = "AV1非対応 (H.264/VP9を優先, 2160p以下)"
     
