@@ -25,7 +25,7 @@ ytdlpSpoutは、YouTube動画をダウンロードしてSpout（Windows用のリ
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/[username]/ytdlpSpout.git
+git clone https://github.com/7MPra/ytdlpSpout.git
 cd ytdlpSpout
 ```
 
