@@ -135,6 +135,14 @@ def create_distribution():
     else:
         print("警告: CLI版exeファイルが見つかりません")
     
+    # LICENSEファイルをコピー
+    license_src = Path("LICENSE")
+    if license_src.exists():
+        shutil.copy2(license_src, dist_path / "LICENSE.txt")
+        print(f"ライセンスファイルを配置: {dist_path / 'LICENSE.txt'}")
+    else:
+        print("警告: LICENSEファイルが見つかりません")
+    
     # READMEを作成
     readme_content = """# ytdlpSpout - YouTube to Spout Streamer
 
@@ -143,6 +151,7 @@ def create_distribution():
 - ytdlpSpoutCLI.exe (コマンドライン版)
 - bin/ffmpeg.exe (動画処理用)
 - bin/*.dll (ffmpeg依存ライブラリ)
+- LICENSE.txt (MITライセンス)
 
 ## GUI版の使用方法
 1. ytdlpSpoutGUI.exe を実行
@@ -163,6 +172,10 @@ ytdlpSpoutCLI.exe --verbose "https://youtu.be/dQw4w9WgXcQ"
 ヘルプ表示:
 ytdlpSpoutCLI.exe --help
 
+## ライセンス
+このソフトウェアはMITライセンスの下で配布されています。
+詳細はLICENSE.txtファイルをご確認ください。
+
 ## 注意事項
 - binフォルダとexeは同じディレクトリに配置してください
 - Spout対応アプリケーション（OBS Studio等）で受信できます
@@ -171,6 +184,18 @@ ytdlpSpoutCLI.exe --help
 ## トラブルシューティング
 - ffmpegが見つからない場合は、binフォルダの配置を確認してください
 - システムにffmpegがインストールされている場合は、そちらが使用されます
+
+## 再配布について
+このソフトウェアはMITライセンスの下で配布されており、自由に再配布できます。
+再配布時は以下を遵守してください：
+1. LICENSE.txtファイルを含めること
+2. 著作権表示を保持すること
+3. 改変した場合は改変内容を明記することを推奨します
+
+## プロジェクト情報
+- Original project: https://github.com/7MPra/ytdlpSpout
+- License: MIT License
+- ffmpeg: 外部バイナリとして同梱（GPL/LGPL、外部実行のため影響なし）
 """
     
     with open(dist_path / "README.txt", "w", encoding="utf-8") as f:
