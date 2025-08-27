@@ -617,13 +617,7 @@ class App:
         
         # ログ用フォント：日本語が多い場合は日本語フォントを優先
         self.log_font = self.japanese_font  # 日本語ログが多いので日本語フォントを使用
-        
-        # デバッグ用：選択されたフォントを後でログに出力
-        self._selected_fonts = {
-            'japanese': self.japanese_font,
-            'monospace': self.monospace_font,
-            'log': self.log_font
-        }
+
         
         # ウィンドウの初期サイズを設定
         self.root.geometry("1000x700")
@@ -739,9 +733,6 @@ class App:
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(33, self.update_preview)
-        
-        # フォント情報をログに出力
-        self.root.after(500, self._log_font_info)
 
     def log(self, msg: str):
         try:
@@ -751,12 +742,7 @@ class App:
             pass
     
 
-    def _log_font_info(self):
-        """選択されたフォント情報をログに出力"""
-        try:
-            self.log(f"選択されたフォント - 日本語UI: {self._selected_fonts['japanese']}, ログ: {self._selected_fonts['log']}, 等幅: {self._selected_fonts['monospace']}")
-        except Exception:
-            pass
+
 
     def on_start(self):
         if self.streamer:
