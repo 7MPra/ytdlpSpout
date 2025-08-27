@@ -82,12 +82,6 @@ python build_distribution.py
 
 MIT License - 詳細は[LICENSE](LICENSE)ファイルを参照してください。
 
-## 貢献
-
-プルリクエストやイシューの報告を歓迎します。
-
 ## 注意事項
 
-- YouTube 利用規約を遵守してください
-- 著作権で保護されたコンテンツの使用には注意してください
 - Spout は主に Windows 環境で動作します
