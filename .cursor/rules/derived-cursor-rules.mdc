@@ -1,0 +1,80 @@
+---
+description: AI rules derived by SpecStory from the project AI interaction history
+globs: *
+---
+
+## PROJECT RULES & CODING STANDARDS
+
+### GENERAL
+- Adhere to the principles of DRY (Don't Repeat Yourself) and KISS (Keep It Simple, Stupid).
+- Write clean, well-commented, and maintainable code.
+- Follow established coding conventions for each language (e.g., PEP 8 for Python).
+- All code must be thoroughly tested before deployment.
+- Avoid adding `| cat` to the end of PowerShell commands as it is often unnecessary and can cause errors.
+
+### CODE REVIEW
+- All code changes must be reviewed by at least one other developer.
+- Code reviews should focus on code quality, correctness, and adherence to coding standards.
+
+## TECH STACK
+
+### LANGUAGES
+- Python (3.x)
+    - Python 3.11 is the preferred version.
+
+### LIBRARIES & FRAMEWORKS
+- (Add specific libraries and frameworks as they are adopted)
+    - yt-dlp
+    - opencv-python
+    - spoutpy
+    - SpoutGL (resolved to `spoutgl==0.1.1`): Verify the correct package name or source (e.g., GitHub repository URL, wheel file) for installation.
+    - SpoutSDK: Note that `SpoutSDK` may not be directly installable via `pip` or `uv pip`. Verify the correct package name or source (e.g., GitHub repository URL, wheel file) for installation. If `SpoutSDK` is unavailable, consider using `spoutpy` and adapting the code accordingly.
+    - Pillow: Used for GUI preview functionality.
+
+### TOOLS
+- `uv`: Preferred tool for managing Python virtual environments.
+    - Use `uv venv --python 3.11 .venv` to create a virtual environment.
+    - Use `uv pip install -r requirements.txt` or `uv add <package_name>` to install dependencies.
+    - When installing from a Git repository, use the format `uv pip install --python .venv\Scripts\python.exe git+<repository_url>`.
+- PyInstaller: Used for building single executable files.
+    - Use `.venv\Scripts\pyinstaller.exe --noconfirm --onefile --windowed --name <executable_name> <script_name>.py` to build a windowed, single-file executable.
+- (Add other tools as they are adopted)
+
+## PROJECT DOCUMENTATION & CONTEXT SYSTEM
+
+### DOCUMENTATION STANDARDS
+- All modules, classes, and functions must have clear and concise docstrings.
+- API documentation should be generated using appropriate tools (e.g., Sphinx for Python).
+- High-level design documents should be maintained in a central repository.
+
+### CONTEXT SYSTEM
+- (Define how project context is maintained and accessed)
+
+## WORKFLOW & RELEASE RULES
+
+### VERSION CONTROL
+- Use Git for version control.
+- Follow a branching strategy (e.g., Gitflow).
+- All commits must have descriptive messages.
+
+### RELEASE PROCESS
+- (Define the steps involved in releasing new versions of the software)
+
+## DEBUGGING
+
+### DEBUGGING GUIDELINES
+- Use appropriate debugging tools and techniques for each language.
+- Write unit tests to catch errors early.
+- Log errors and warnings to aid in debugging.
+
+### PYTHON DEBUGGING
+- When using `uv` managed virtual environments, ensure `ensurepip` is used to initialize pip: `.venv\Scripts\python.exe -m ensurepip --upgrade`.
+- In PowerShell, activate the virtual environment using `.venv\Scripts\Activate.ps1` and deactivate using `deactivate`.
+- Verify Python version using `.venv\Scripts\python.exe -V` and pip version using `.venv\Scripts\python.exe -m pip --version`.
+- In PowerShell, to execute commands within the virtual environment, prefix them with `.venv\Scripts\`. For example: `.venv\Scripts\python.exe -V`.
+- When running Python scripts, use the full path to the Python executable within the virtual environment: `.venv\Scripts\python.exe <script_path>`.
+- When installing packages with uv, specify the Python executable within the virtual environment: `uv pip install --python .venv\Scripts\python.exe <package_name>`.
+- When installing packages from a Git repository, use the format `uv pip install --python .venv\Scripts\python.exe git+<repository_url>`.
+- When running commands in PowerShell, avoid piping to `cat` unless necessary, as it can cause errors.
+- When building executables with PyInstaller, use the `--noconfirm --onefile --windowed` options.
+- When using `subprocess.Popen` on Windows, set the `creationflags` parameter to `subprocess.CREATE_NO_WINDOW` to prevent the console window from appearing. Also set `stdin=subprocess.DEVNULL`.
