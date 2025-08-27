@@ -163,6 +163,9 @@ dist_package/
 *.zip
 *.exe
 
+# User data (cookies, etc.)
+/data/
+
 # OS generated files
 .DS_Store
 .DS_Store?
