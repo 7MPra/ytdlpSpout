@@ -124,12 +124,16 @@ def get_optimal_format_string():
 
 
 def build_ffmpeg_header_args(headers: dict) -> list:
-    args = []
+    """ffmpegに渡すHTTPヘッダーを構築する。-headersオプションは単一の文字列を要求する。"""
     if not headers:
-        return args
-    for k, v in headers.items():
-        args += ["-headers", f"{k}: {v}"]
-    return args
+        return []
+    
+    # ヘッダーを `Key: Value` の形式でリスト化し、CRLFで結合する
+    # 注: yt-dlpが返すhttp_headersにはCookieが含まれている想定
+    header_lines = [f"{k}: {v}" for k, v in headers.items()]
+    header_string = "\r\n".join(header_lines) + "\r\n"
+    
+    return ["-headers", header_string]
 
 
 def detect_fps(info: dict) -> Optional[int]:
@@ -209,11 +213,16 @@ class CLIStreamer:
 
     def _yt_refresh(self) -> bool:
         """yt-dlpでストリーム情報を取得・更新"""
+        # dataディレクトリを作成（存在しない場合）
+        os.makedirs("data", exist_ok=True)
+        cookie_file = os.path.join("data", "cookies.txt")
+
         # 環境に応じた最適なフォーマット文字列を取得
         format_str, codec_info = get_optimal_format_string()
         if self.verbose:
             self.log(f"コーデック対応状況: {codec_info}")
-        
+            self.log(f"Cookieファイルとして'{cookie_file}'を使用します。")
+
         ydl_opts = {
             # 環境に応じて動的に決定されたフォーマット
             'format': format_str,
@@ -226,6 +235,8 @@ class CLIStreamer:
             'retries': 3,
             # User-Agentを設定してブロック回避
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            # Cookieファイルを強制的に指定
+            'cookiefile': cookie_file,
         }
         
         # certifiパッケージが利用可能な場合は使用
@@ -253,6 +264,7 @@ class CLIStreamer:
         # URL取得
         self.stream_url = info.get("url")
         self.http_headers = info.get("http_headers", {})
+        
         if not self.stream_url:
             rf = info.get("requested_formats")
             if isinstance(rf, list):
@@ -261,6 +273,34 @@ class CLIStreamer:
                         self.stream_url = f.get("url")
                         self.http_headers = f.get("http_headers", {}) or self.http_headers
                         break
+
+        # --- Cookieヘッダーの手動挿入 ---
+        # yt-dlpがhttp_headersにCookieを含めない問題への対策
+        try:
+            import http.cookiejar
+            import urllib.parse
+
+            cj = http.cookiejar.MozillaCookieJar(cookie_file)
+            cj.load(ignore_discard=True, ignore_expires=True)
+
+            if self.stream_url:
+                parsed_url = urllib.parse.urlparse(self.stream_url)
+                domain = parsed_url.netloc
+                
+                cookie_dict = {}
+                for cookie in cj:
+                    if cookie.domain and domain.endswith(cookie.domain):
+                        cookie_dict[cookie.name] = cookie.value
+                
+                if cookie_dict:
+                    cookie_header_val = "; ".join([f"{k}={v}" for k, v in cookie_dict.items()])
+                    self.http_headers['Cookie'] = cookie_header_val
+                    if self.verbose:
+                        self.log("Cookieを手動で解析し、ffmpegヘッダーに追加しました。")
+        except Exception as e:
+            if self.verbose:
+                self.log(f"Cookieファイルの手動解析に失敗: {e}")
+        # --- 手動挿入ここまで ---
 
         self.is_live = bool(info.get("is_live"))
         
