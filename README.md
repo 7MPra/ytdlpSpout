@@ -39,8 +39,7 @@ uv venv --python 3.11 .venv
 ### 3. 依存関係のインストール
 
 ```bash
-uv add yt-dlp opencv-python customtkinter pillow numpy
-uv pip install git+https://github.com/spiraltechnica/spoutpy.git
+uv add yt-dlp opencv-python customtkinter pillow numpy SpoutGL
 ```
 
 ### 4. FFmpegのインストール
