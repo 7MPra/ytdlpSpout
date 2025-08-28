@@ -354,7 +354,6 @@ class Streamer:
         cmd = [
             ffmpeg_path,
             "-loglevel", "warning" if not (self.verbose and self.console_log) else "info",
-            "-re",
         ]
         # VODループ時はffmpeg側でループ処理
         if not self.is_live and self.loop_vod:
