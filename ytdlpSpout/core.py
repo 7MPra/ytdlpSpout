@@ -181,6 +181,9 @@ class Streamer:
         self.height = DEFAULT_HEIGHT
         self.detected_fps = DEFAULT_FPS
         self.is_live = False
+        self.is_vod = False
+        self.duration = 0
+        self.playback_time = 0
         self.http_headers = {}
         self.stream_url = None
         self.spout: SpoutGL.SpoutSender | None = None
@@ -191,6 +194,8 @@ class Streamer:
         self._stop_cb = stop_cb
         self.verbose = verbose
         self.console_log = False
+        self.seek_lock = threading.Lock()
+        self.seek_request = -1.0
 
 
     def log(self, msg: str):

@@ -84,6 +84,9 @@ class App:
         self.root = root
         self.root.title("ytdlpSpout GUI")
         self.streamer: Streamer | None = None
+        self._seeking = False
+        self.seek_value = 0.0
+        self.duration_cache = 0.0 # 動画の長さをキャッシュ
         
         # CustomTkinterの外観設定
         ctk.set_appearance_mode("dark")  # "dark" or "light"
@@ -189,6 +192,19 @@ class App:
         self.preview_label.pack(fill="both", expand=True)
         self.preview_imgtk = None
         self._no_signal_shown = True
+
+        # --- シークバー関連 --- #
+        seek_frame = ctk.CTkFrame(preview_frame, fg_color="transparent")
+        seek_frame.pack(fill="x", padx=10, pady=5, side="bottom")
+
+        self.seek_slider = ctk.CTkSlider(seek_frame, from_=0, to=100, state="disabled", command=self.on_seek_drag)
+        self.seek_slider.pack(fill="x", expand=True, side="left", padx=(0, 10))
+        self.seek_slider.bind("<ButtonPress-1>", self.on_seek_press)
+        self.seek_slider.bind("<ButtonRelease-1>", self.on_seek_release)
+
+        self.time_label = ctk.CTkLabel(seek_frame, text="--:-- / --:--", font=ctk.CTkFont(family=self.monospace_font, size=12))
+        self.time_label.pack(side="right")
+        # -------------------- #
         
         # ログエリア（下部）- CustomTkinterフレームをPanedWindowに追加
         log_frame = ctk.CTkFrame(main_paned)
@@ -218,6 +234,53 @@ class App:
             self.log_text.see("end")
         except Exception:
             pass
+    
+    def format_time(self, seconds: float) -> str:
+        """秒を HH:MM:SS 形式の文字列に変換"""
+        if not isinstance(seconds, (int, float)) or seconds < 0:
+            return "--:--"
+        seconds = int(seconds)
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        else:
+            return f"{m:02d}:{s:02d}"
+
+    def on_seek_drag(self, value):
+        if self._seeking:
+            self.seek_value = value
+            current_t = self.format_time(value)
+            total_t = self.format_time(self.duration_cache)
+            self.time_label.configure(text=f"{current_t} / {total_t}")
+
+    def on_seek_press(self, event):
+        if self.streamer and self.streamer.is_vod:
+            self._seeking = True
+            # マウスのクリック位置からスライダーの値を計算して設定
+            slider_width = self.seek_slider.winfo_width()
+            if slider_width == 0: return
+
+            slider_range = self.seek_slider.cget("to") - self.seek_slider.cget("from_")
+            
+            click_x = event.x
+            if click_x < 0:
+                click_x = 0
+            if click_x > slider_width:
+                click_x = slider_width
+            
+            percentage = click_x / slider_width
+            new_value = self.seek_slider.cget("from_") + (percentage * slider_range)
+            
+            self.seek_slider.set(new_value)
+
+    def on_seek_release(self, event):
+        if self.streamer and self.streamer.is_vod and self._seeking:
+            self._seeking = False
+            # マウスリリース時の最終的な値を元にシーク
+            final_seek_value = self.seek_slider.get()
+            self.streamer.seek(final_seek_value)
     
 
 
@@ -274,16 +337,23 @@ class App:
                     loop_vod=self.vod_loop.get(),
                     log_cb=lambda m: self.root.after(0, self.log, m),
                     stop_cb=lambda: self.root.after(0, self.on_auto_stop),
+                    init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success)
                 )
                 self.streamer.start()
-                # 成功時のUI更新
-                self.root.after(0, lambda: self.info_label.configure(text="ストリーミング開始"))
             except Exception as e:
                 # エラー時のUI更新
                 self.root.after(0, lambda: self._handle_start_error(str(e)))
         
         # 別スレッドで実行
         threading.Thread(target=start_streaming, daemon=True).start()
+
+    def on_stream_start_success(self):
+        self.info_label.configure(text="ストリーミング開始")
+        if self.streamer and self.streamer.is_vod:
+            self.duration_cache = self.streamer.duration
+            self.log(f"動画の長さを取得しました: {self.duration_cache} 秒")
+            self.seek_slider.configure(state="normal", to=self.duration_cache)
+            self.time_label.configure(text=f"00:00 / {self.format_time(self.duration_cache)}")
 
     def on_stop(self):
         if not self.streamer:
@@ -293,6 +363,8 @@ class App:
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         self.info_label.configure(text="Stopped")
+        self.seek_slider.configure(state="disabled")
+        self.time_label.configure(text="--:-- / --:--")
 
     def _handle_start_error(self, error_msg: str):
         """ストリーミング開始エラーの処理"""
@@ -310,6 +382,8 @@ class App:
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         self.info_label.configure(text="動画再生完了")
+        self.seek_slider.configure(state="disabled")
+        self.time_label.configure(text="--:-- / --:--")
 
     def on_close(self):
         try:
@@ -358,10 +432,22 @@ class App:
                                                text_color="white")
                     self._no_signal_shown = True
                     
-            # 解像度情報の更新
+            # 解像度情報と再生時間の更新
             if self.streamer:
-                self.info_label.configure(
-                    text=f"Resolution: {self.streamer.width}x{self.streamer.height} @ {self.streamer.detected_fps}fps")
+                if self.streamer.is_vod:
+                    # シーク中でなければ、再生時間に合わせてUIを更新
+                    if not self._seeking:
+                        self.seek_slider.set(self.streamer.playback_time)
+                        current_t = self.format_time(self.streamer.playback_time)
+                        total_t = self.format_time(self.duration_cache)
+                        self.time_label.configure(text=f"{current_t} / {total_t}")
+
+                    # 解像度情報は常に更新
+                    self.info_label.configure(
+                        text=f"Resolution: {self.streamer.width}x{self.streamer.height} @ {self.streamer.detected_fps}fps")
+                else: # ライブの場合
+                    self.info_label.configure(
+                        text=f"(LIVE) Resolution: {self.streamer.width}x{self.streamer.height} @ {self.streamer.detected_fps}fps")
             else:
                 self.info_label.configure(text="No stream active")
         finally:
