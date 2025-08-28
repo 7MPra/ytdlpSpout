@@ -7,7 +7,7 @@ import sys
 import ssl
 import cv2
 import numpy as np
-import SpoutGL
+import syphon
 import yt_dlp
 from typing import Optional, Tuple, Callable, Dict, Any
 
@@ -183,7 +183,7 @@ class Streamer:
         self.is_live = False
         self.http_headers = {}
         self.stream_url = None
-        self.spout: SpoutGL.SpoutSender | None = None
+        self.syphon: syphon.SyphonServer | None = None
         self.max_resolution = max_resolution
         self.manual_resolution = manual_resolution
         self.loop_vod = loop_vod
@@ -466,9 +466,7 @@ class Streamer:
             return False
         
         # Spout init
-        self.spout = SpoutGL.SpoutSender()
-        self.spout.createOpenGL()
-        self.spout.setSenderName(self.sender_name)
+        self.syphon = syphon.SyphonServer(name=self.sender_name, width=self.width, height=self.height)
         self.log(
             f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
 
@@ -597,14 +595,8 @@ class Streamer:
 
                 frame = np.frombuffer(data, dtype=np.uint8)
                 frame = frame.reshape((self.height, self.width, 3))
-                with self.frame_lock:
-                    self.latest_frame_bgr = frame
-
-                # Spout send
-                gl_format = SpoutGL.enums.GL_BGR_EXT
-                bpp = SpoutGL.helpers.getBytesPerPixel(gl_format)
-                self.spout.sendImage(
-                    frame.tobytes(), self.width, self.height, gl_format, False, bpp)
+                # Syphon send
+                self.syphon.publish_frame(frame)
         except KeyboardInterrupt:
             self.log("終了します。")
         finally:
@@ -619,5 +611,5 @@ class Streamer:
         except Exception:
             pass
         
-        if self.spout:
-            self.spout.releaseSender()
+        if self.syphon:
+            self.syphon.stop()

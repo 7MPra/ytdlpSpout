@@ -8,7 +8,7 @@ YouTube動画をSpout経由でリアルタイム配信するCLIツール
 import argparse
 import cv2
 import yt_dlp
-import SpoutGL
+import syphon
 import subprocess
 import sys
 import os
