@@ -87,6 +87,8 @@ class App:
         self._seeking = False
         self.seek_value = 0.0
         self.duration_cache = 0.0 # 動画の長さをキャッシュ
+        self.local_video_path: str | None = None
+        self.download_in_progress = False
         
         # CustomTkinterの外観設定
         ctk.set_appearance_mode("dark")  # "dark" or "light"
@@ -162,13 +164,18 @@ class App:
                        font=ctk.CTkFont(family=self.japanese_font, size=12)).grid(
             row=6, column=0, sticky="w", padx=6, pady=6)
 
-        self.btn_start = ctk.CTkButton(frm, text="Start", command=self.on_start, 
+        # --- ボタン定義 ---
+        self.btn_start = ctk.CTkButton(frm, text="Start", command=self.on_start,
                                       font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
-        self.btn_stop = ctk.CTkButton(
-            frm, text="Stop", command=self.on_stop, state="disabled",
-            font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
+        self.btn_stream = ctk.CTkButton(frm, text="Stream", command=self.on_stream, state="normal",
+                                       font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
+        self.btn_stop = ctk.CTkButton(frm, text="Stop", command=self.on_stop, state="disabled",
+                                     font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
+
         self.btn_start.grid(row=1, column=2, padx=6, pady=6)
-        self.btn_stop.grid(row=1, column=3, padx=6, pady=6)
+        self.btn_stream.grid(row=1, column=3, padx=6, pady=6)
+        self.btn_stop.grid(row=1, column=4, padx=6, pady=6)
+
 
         self.info_label = ctk.CTkLabel(root, text="", font=ctk.CTkFont(family=self.japanese_font, size=14))
         self.info_label.pack(padx=8, pady=4)
@@ -193,7 +200,7 @@ class App:
         self.preview_imgtk = None
         self._no_signal_shown = True
 
-        # --- シークバー関連 --- #
+        # --- シークバー関連 ---
         seek_frame = ctk.CTkFrame(preview_frame, fg_color="transparent")
         seek_frame.pack(fill="x", padx=10, pady=5, side="bottom")
 
@@ -204,7 +211,7 @@ class App:
 
         self.time_label = ctk.CTkLabel(seek_frame, text="--:-- / --:--", font=ctk.CTkFont(family=self.monospace_font, size=12))
         self.time_label.pack(side="right")
-        # -------------------- #
+        # --------------------
         
         # ログエリア（下部）- CustomTkinterフレームをPanedWindowに追加
         log_frame = ctk.CTkFrame(main_paned)
@@ -281,19 +288,90 @@ class App:
             # マウスリリース時の最終的な値を元にシーク
             final_seek_value = self.seek_slider.get()
             self.streamer.seek(final_seek_value)
-    
-
-
 
     def on_start(self):
+        """「Start」ボタン：動画のダウンロードを開始"""
+        if self.download_in_progress or self.streamer:
+            return
+
+        self.download_in_progress = True
+        self.btn_start.configure(state="disabled")
+        self.btn_stream.configure(state="disabled")
+        self.info_label.configure(text="動画情報を解析中...")
+        self.log("動画のダウンロード準備を開始します...")
+
+        url = self.url_var.get().strip()
+
+        def download_video():
+            try:
+                os.makedirs("data", exist_ok=True)
+
+                # 1. Get video info to determine the final filename
+                ydl_opts_info = {
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'outtmpl': 'data/%(id)s.%(ext)s',
+                    'nocheckcertificate': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+                    self.log("動画情報を解析中...")
+                    info = ydl.extract_info(url, download=False)
+                    final_filename = ydl.prepare_filename(info)
+                    self.log(f"最終的なファイル名が {final_filename} になることを確認しました。")
+
+                # 2. Perform download with progress hooks
+                def progress_hook(d):
+                    if d['status'] == 'downloading':
+                        percent = d['_percent_str']
+                        speed = d['_speed_str']
+                        eta = d['_eta_str']
+                        self.root.after(0, self.info_label.configure, {"text": f"ダウンロード中: {percent} ({speed}, ETA: {eta})"})
+                    elif d['status'] == 'finished':
+                        self.root.after(0, self.info_label.configure, {"text": "ダウンロード完了"})
+
+                ydl_opts_dl = {
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'outtmpl': 'data/%(id)s.%(ext)s',
+                    'progress_hooks': [progress_hook],
+                    'nocheckcertificate': True,
+                }
+
+                with yt_dlp.YoutubeDL(ydl_opts_dl) as ydl:
+                    self.log("ダウンロードを開始します（既存の場合はスキップされます）")
+                    ydl.download([url])
+
+                # 3. Set path and update UI
+                self.local_video_path = final_filename
+                self.root.after(0, self.on_download_complete)
+
+            except Exception as e:
+                self.root.after(0, self._handle_start_error, f"ダウンロード失敗: {e}")
+            finally:
+                self.download_in_progress = False
+
+        threading.Thread(target=download_video, daemon=True).start()
+
+    def on_download_complete(self):
+        self.log(f"動画をローカルに保存しました: {self.local_video_path}")
+        self.btn_stream.configure(state="normal")
+        self.btn_start.configure(state="normal") # 次のダウンロードのために有効化
+        self.info_label.configure(text="準備完了。Streamボタンで再生を開始できます。")
+        # ダウンロード完了後、自動で再生を開始
+        if self.local_video_path:
+            self._start_spout_stream(self.local_video_path)
+
+
+    def _start_spout_stream(self, video_source_url: str):
+        """Spoutストリームを開始する内部ヘルパー関数"""
         if self.streamer:
+            self.log("エラー: 既にストリームがアクティブです。")
             return
         
         # UIを即座に更新
         self.btn_start.configure(state="disabled")
+        self.btn_stream.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.info_label.configure(text="動画情報を取得中...")
-        self.log("ストリーミング開始準備中...")
+        self.info_label.configure(text="ストリーミング準備中...")
+        self.log(f"{video_source_url} からストリーミングを開始します...")
         
         # プレビュー表示をリセット
         if hasattr(self, '_no_signal_shown'):
@@ -301,7 +379,7 @@ class App:
         self.preview_label.configure(text="")
         
         # パラメータを取得
-        url = self.url_var.get().strip()
+        url = video_source_url
         sender = self.sender_var.get().strip() or DEFAULT_SENDER_NAME
         maxw = self.maxw_var.get().strip()
         maxh = self.maxh_var.get().strip()
@@ -310,10 +388,8 @@ class App:
         max_res = None
         manual_res = None
         
-        # 1440p制限の処理（他の設定より優先度低）
         if self.perf_limit.get() and not self.max_enable.get() and not self.manual_enable.get():
             max_res = (2560, 1440)
-            self.log("1440p制限を適用しました (パフォーマンス重視)")
         
         try:
             if self.max_enable.get() and maxw and maxh:
@@ -327,7 +403,7 @@ class App:
             manual_res = None
         
         # 非同期でStreamerを初期化・開始
-        def start_streaming():
+        def start_streaming_thread():
             try:
                 self.streamer = Streamer(
                     url,
@@ -341,11 +417,17 @@ class App:
                 )
                 self.streamer.start()
             except Exception as e:
-                # エラー時のUI更新
-                self.root.after(0, lambda: self._handle_start_error(str(e)))
+                self.root.after(0, self._handle_start_error, f"ストリーミング開始エラー: {e}")
         
-        # 別スレッドで実行
-        threading.Thread(target=start_streaming, daemon=True).start()
+        threading.Thread(target=start_streaming_thread, daemon=True).start()
+
+    def on_stream(self):
+        """「Stream」ボタン：URLから直接ストリーミングを開始"""
+        url = self.url_var.get().strip()
+        if not url:
+            self.log("エラー: ストリーミングするURLが入力されていません。")
+            return
+        self._start_spout_stream(url)
 
     def on_stream_start_success(self):
         self.info_label.configure(text="ストリーミング開始")
@@ -356,34 +438,44 @@ class App:
             self.time_label.configure(text=f"00:00 / {self.format_time(self.duration_cache)}")
 
     def on_stop(self):
-        if not self.streamer:
-            return
-        self.streamer.stop()
-        self.streamer = None
-        self.btn_start.configure(state="normal")
-        self.btn_stop.configure(state="disabled")
-        self.info_label.configure(text="Stopped")
-        self.seek_slider.configure(state="disabled")
-        self.time_label.configure(text="--:-- / --:--")
-
-    def _handle_start_error(self, error_msg: str):
-        """ストリーミング開始エラーの処理"""
-        self.log(f"ストリーミング開始エラー: {error_msg}")
-        self.streamer = None
-        self.btn_start.configure(state="normal")
-        self.btn_stop.configure(state="disabled")
-        self.info_label.configure(text="開始に失敗しました")
-
-    def on_auto_stop(self):
-        """動画終了時の自動停止処理"""
         if self.streamer:
             self.streamer.stop()
             self.streamer = None
+        
+        # UIリセット
         self.btn_start.configure(state="normal")
+        self.btn_stream.configure(state="normal") # Streamボタンは常に有効
         self.btn_stop.configure(state="disabled")
-        self.info_label.configure(text="動画再生完了")
+        self.info_label.configure(text="停止しました")
         self.seek_slider.configure(state="disabled")
         self.time_label.configure(text="--:-- / --:--")
+
+        # ローカルファイルを削除
+        if self.local_video_path and os.path.exists(self.local_video_path):
+            try:
+                os.remove(self.local_video_path)
+                self.log(f"一時ファイルを削除しました: {self.local_video_path}")
+                self.local_video_path = None
+            except Exception as e:
+                self.log(f"一時ファイルの削除に失敗: {e}")
+
+    def _handle_start_error(self, error_msg: str):
+        """開始エラーの共通処理"""
+        self.log(f"エラー: {error_msg}")
+        if self.streamer:
+            self.streamer.stop()
+            self.streamer = None
+        
+        self.download_in_progress = False
+        self.btn_start.configure(state="normal")
+        self.btn_stream.configure(state="normal") # Streamボタンは常に有効
+        self.btn_stop.configure(state="disabled")
+        self.info_label.configure(text="エラーが発生しました")
+
+    def on_auto_stop(self):
+        """動画終了時の自動停止処理"""
+        self.log("動画の再生が完了しました。")
+        self.on_stop() # 共通の停止処理を呼ぶ
 
     def on_close(self):
         try:
@@ -398,57 +490,42 @@ class App:
                     frame = self.streamer.latest_frame_bgr
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # プレビューエリアのサイズを取得
                 self.preview_label.update_idletasks()
                 label_width = self.preview_label.winfo_width()
                 label_height = self.preview_label.winfo_height()
                 
-                # 最小サイズを確保
-                if label_width < 100:
-                    label_width = 640
-                if label_height < 100:
-                    label_height = 360
+                if label_width < 100: label_width = 640
+                if label_height < 100: label_height = 360
                 
-                # アスペクト比を維持してリサイズ
                 h, w, _ = rgb.shape
-                scale_w = label_width / float(w)
-                scale_h = label_height / float(h)
-                scale = min(scale_w, scale_h)
-                
-                new_w = int(w * scale)
-                new_h = int(h * scale)
+                scale = min(label_width / float(w), label_height / float(h))
+                new_w, new_h = int(w * scale), int(h * scale)
                 
                 if new_w > 0 and new_h > 0:
                     dst = cv2.resize(rgb, (new_w, new_h))
                     img = Image.fromarray(dst)
-                    # CustomTkinter用のCTkImageを作成
                     self.preview_imgtk = ctk.CTkImage(light_image=img, dark_image=img, size=(new_w, new_h))
                     self.preview_label.configure(image=self.preview_imgtk, text="")
                     self._no_signal_shown = False
             else:
-                # ストリーミング停止時は黒画面を表示
                 if not hasattr(self, '_no_signal_shown') or not self._no_signal_shown:
-                    self.preview_label.configure(image="", text="No Signal", 
-                                               text_color="white")
+                    self.preview_label.configure(image="", text="No Signal", text_color="white")
                     self._no_signal_shown = True
                     
-            # 解像度情報と再生時間の更新
             if self.streamer:
                 if self.streamer.is_vod:
-                    # シーク中でなければ、再生時間に合わせてUIを更新
                     if not self._seeking:
                         self.seek_slider.set(self.streamer.playback_time)
                         current_t = self.format_time(self.streamer.playback_time)
                         total_t = self.format_time(self.duration_cache)
                         self.time_label.configure(text=f"{current_t} / {total_t}")
 
-                    # 解像度情報は常に更新
                     self.info_label.configure(
                         text=f"Resolution: {self.streamer.width}x{self.streamer.height} @ {self.streamer.detected_fps}fps")
                 else: # ライブの場合
                     self.info_label.configure(
                         text=f"(LIVE) Resolution: {self.streamer.width}x{self.streamer.height} @ {self.streamer.detected_fps}fps")
-            else:
+            elif not self.download_in_progress:
                 self.info_label.configure(text="No stream active")
         finally:
             self.root.after(33, self.update_preview)
