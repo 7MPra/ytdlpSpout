@@ -6,6 +6,7 @@ import os
 import sys
 import ssl
 import cv2
+import av
 import numpy as np
 import SpoutGL
 import yt_dlp
@@ -171,20 +172,23 @@ def detect_max_resolution(info: Dict[str, Any]) -> Optional[Tuple[int, int]]:
 
 
 class Streamer:
-    def __init__(self, video_url: str, sender_name: str, 
-                 max_resolution: tuple[int, int] | None = None, 
-                 manual_resolution: tuple[int, int] | None = None, 
-                 loop_vod: bool = False, verbose = True, 
-                 log_cb: Callable[[str], None] | None = None, 
-                 stop_cb: Callable[[], None] | None = None,
-                 init_ok_cb: Callable[[], None] | None = None):
+    def __init__(self, video_url, sender_name, 
+                 max_resolution=None, 
+                 manual_resolution=None, 
+                 loop_vod=False, verbose=True, 
+                 log_cb=None, 
+                 stop_cb=None,
+                 init_ok_cb=None):
         self.video_url = video_url
         self.sender_name = sender_name
-        self.proc: subprocess.Popen | None = None
+        self.proc = None
+        self.container = None  # PyAV用
+        self.video_stream = None
+        self.av_frame_gen = None
         self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
+        self.thread = None
         self.frame_lock = threading.Lock()
-        self.latest_frame_bgr: np.ndarray | None = None
+        self.latest_frame_bgr = None
         self.width = DEFAULT_WIDTH
         self.height = DEFAULT_HEIGHT
         self.detected_fps = DEFAULT_FPS
@@ -193,8 +197,7 @@ class Streamer:
         self.duration = 0.0
         self.playback_time = 0.0
         self.http_headers = {}
-        self.stream_url: str | None = None
-        self.spout: SpoutGL.SpoutSender | None = None
+        self.stream_url = None
         self.max_resolution = max_resolution
         self.manual_resolution = manual_resolution
         self.loop_vod = loop_vod
@@ -215,6 +218,7 @@ class Streamer:
                 print(msg)
         except Exception:
             pass
+
 
     def _get_local_file_info(self) -> bool:
         """ffprobeを使ってローカルファイルの情報を取得"""
@@ -243,15 +247,23 @@ class Streamer:
             # FPS
             fps_str = video_stream.get('avg_frame_rate', '30/1')
             if '/' in fps_str:
-                num, den = map(int, fps_str.split('/'))
-                self.detected_fps = round(num / den) if den != 0 else 30
+                num, den = fps_str.split('/')
+                try:
+                    num = float(num)
+                    den = float(den)
+                    self.detected_fps = round(num / den) if den != 0 else 30
+                except Exception:
+                    self.detected_fps = 30
             else:
-                self.detected_fps = round(float(fps_str))
+                try:
+                    self.detected_fps = round(float(fps_str))
+                except Exception:
+                    self.detected_fps = 30
             self.detected_fps = max(MIN_FPS, min(MAX_FPS, self.detected_fps))
 
             # 長さ
             self.duration = float(info['format'].get('duration', 0.0))
-            
+
             self.is_vod = True
             self.is_live = False
             self.stream_url = self.video_url # ストリームURLはファイルパスそのもの
@@ -261,7 +273,10 @@ class Streamer:
 
         except Exception as e:
             self.log(f"ffprobeでのファイル情報取得に失敗: {e}")
+            if self._stop_cb:
+                self._stop_cb()
             return False
+
 
     def _yt_refresh(self) -> bool:
         # ... (このメソッドは変更なし)
@@ -271,7 +286,7 @@ class Streamer:
         if self.verbose:
             self.log(f"コーデック対応状況: {codec_info}")
             self.log(f"Cookieファイルとして'{cookie_file}'を使用します。")
-        
+
         class YtDlpLogger:
             def debug(self, msg):
                 if msg.startswith('[debug]'): return
@@ -279,10 +294,10 @@ class Streamer:
             def info(self, msg): self.log(f"yt-dlp: {msg}")
             def warning(self, msg): self.log(f"yt-dlp 警告: {msg}")
             def error(self, msg): self.log(f"yt-dlp エラー: {msg}")
-        
+
         logger = YtDlpLogger()
         logger.log = self.log
-        
+
         ydl_opts = {
             'format': format_str,
             'noplaylist': True,
@@ -294,7 +309,7 @@ class Streamer:
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'cookiefile': cookie_file,
         }
-        
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.video_url, download=False)
@@ -321,7 +336,7 @@ class Streamer:
         fps = detect_fps(info)
         if fps:
             self.detected_fps = max(MIN_FPS, min(MAX_FPS, fps))
-        
+
         selected_format = info.get('format_id', 'unknown')
         vcodec = info.get('vcodec', 'unknown')
         resolution = f"{info.get('width', '?')}x{info.get('height', '?')}"
@@ -431,113 +446,202 @@ class Streamer:
         if self.is_local_file:
             if not self._get_local_file_info():
                 self.log("ローカルファイルのメタデータ取得に失敗しました。")
-                if self._stop_cb: self._stop_cb()
+                if self._stop_cb:
+                    self._stop_cb()
                 return False
+            try:
+                import av
+                self.container = av.open(self.video_url)
+                self.video_stream = self.container.streams.video[0]
+                self.av_frame_gen = self.container.decode(self.video_stream)
+            except Exception as e:
+                self.log(f"PyAV初期化失敗: {e}")
+                if self._stop_cb:
+                    self._stop_cb()
+                return False
+            if self.av_frame_gen is None:
+                self.log("PyAVフレームデコーダ初期化失敗: av_frame_gen is None")
+                if self._stop_cb:
+                    self._stop_cb()
+                return False
+            self.spout = SpoutGL.SpoutSender()
+            self.spout.createOpenGL()
+            self.spout.setSenderName(self.sender_name)
+            self.log(f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
+            if self._init_ok_cb: self._init_ok_cb()
+            self.log(f"VOD を検出しました。{'ループ再生' if self.loop_vod else '1回再生'}します。")
+            frame_interval = 1.0 / self.detected_fps
+            self.playback_time = 0.0
+            last_frame_time = time.perf_counter()
+            try:
+                while not self.stop_event.is_set():
+                    with self.seek_lock:
+                        if self.seek_request >= 0:
+                            seek_pos = self.seek_request
+                            self.seek_request = -1.0
+                            self.log(f"{seek_pos:.2f}秒へシークします... (PyAV)")
+                            try:
+                                pts = int(seek_pos / float(self.video_stream.time_base))
+                                self.container.seek(pts, any_frame=False, backward=True, stream=self.video_stream)
+                                self.av_frame_gen = self.container.decode(self.video_stream)
+                                # シーク後、目的の時刻に到達するまでフレームをスキップ
+                                # 最大30フレームだけ先読みして、seek_posに最も近いフレームを選ぶ
+                                best_frame = None
+                                best_time_diff = None
+                                first_frame = None
+                                for i, f in enumerate(self.av_frame_gen):
+                                    if i == 0:
+                                        first_frame = f
+                                    if hasattr(f, 'time') and f.time is not None:
+                                        diff = abs(f.time - seek_pos)
+                                        if best_time_diff is None or diff < best_time_diff:
+                                            best_time_diff = diff
+                                            best_frame = f
+                                        # 完全一致なら即決
+                                        if diff < 0.01:
+                                            break
+                                    if i >= 30:
+                                        break
+                                frame = best_frame if best_frame is not None else first_frame
+                                if frame is None:
+                                    self.log("シーク後に有効なフレームが見つかりませんでした。")
+                                    continue
+                                self.playback_time = frame.time if hasattr(frame, 'time') and frame.time is not None else seek_pos
+                                img = frame.to_ndarray(format='bgr24')
+                                with self.frame_lock:
+                                    self.latest_frame_bgr = img
+                                self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
+                                last_frame_time = time.perf_counter()
+                                continue  # ループ先頭に戻る（以降の通常再生へ）
+                            except Exception as e:
+                                self.log(f"PyAVシーク失敗: {e}")
+                    frame = None
+                    try:
+                        frame = next(self.av_frame_gen)
+                    except StopIteration:
+                        frame = None
+                    except Exception as e:
+                        self.log(f"PyAVフレーム取得失敗: {e}")
+                        frame = None
+                    if frame is None:
+                        self.log("動画の終端または読み込み失敗。ループ再生判定...")
+                        if self.loop_vod:
+                            try:
+                                self.container.seek(0, any_frame=False, backward=True, stream=self.video_stream)
+                                self.av_frame_gen = self.container.decode(self.video_stream)
+                                self.playback_time = 0.0
+                                continue
+                            except Exception as e:
+                                self.log(f"PyAVループ失敗: {e}")
+                                if self._stop_cb: self._stop_cb()
+                                break
+                        else:
+                            if self._stop_cb: self._stop_cb()
+                            break
+                    img = frame.to_ndarray(format='bgr24')
+                    now = time.perf_counter()
+                    # 再生位置はフレームのタイムスタンプを優先
+                    self.playback_time = frame.time if hasattr(frame, 'time') and frame.time is not None else self.playback_time + frame_interval
+                    with self.frame_lock:
+                        self.latest_frame_bgr = img
+                    self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
+                    elapsed = time.perf_counter() - last_frame_time
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    last_frame_time = time.perf_counter()
+            except KeyboardInterrupt:
+                self.log("終了します。")
+            finally:
+                self.cleanup()
         else:
             if not self._yt_refresh():
                 self.log("ストリームURL取得に失敗しました。")
                 if self._stop_cb: self._stop_cb()
                 return False
-        
-        self.proc = self._start_ffmpeg()
-        if not self.proc or not self.proc.stdout:
-            self.log("ffmpeg の起動に失敗しました。")
-            if self._stop_cb: self._stop_cb()
-            return False
-        
-        time.sleep(0.1)
-        if self.proc.poll() is not None:
-            exit_code = self.proc.poll()
-            self.log(f"ffmpegプロセスが即座に終了しました。終了コード: {exit_code}")
-            if self.proc.stderr:
+            self.proc = self._start_ffmpeg()
+            if not self.proc or not self.proc.stdout:
+                self.log("ffmpeg の起動に失敗しました。")
+                if self._stop_cb: self._stop_cb()
+                return False
+            time.sleep(0.1)
+            if self.proc.poll() is not None:
+                exit_code = self.proc.poll()
+                self.log(f"ffmpegプロセスが即座に終了しました。終了コード: {exit_code}")
+                if self.proc.stderr:
+                    try:
+                        stderr_output = self.proc.stderr.read().decode('utf-8', errors='ignore')
+                        if stderr_output.strip(): self.log(f"ffmpegエラー詳細: {stderr_output}")
+                    except Exception: pass
+                if self._stop_cb: self._stop_cb()
+                return False
+            # Spout init
+            self.spout = SpoutGL.SpoutSender()
+            self.spout.createOpenGL()
+            self.spout.setSenderName(self.sender_name)
+            self.log(f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
+            if self._init_ok_cb: self._init_ok_cb()
+            if self.is_live:
+                self.log("ライブストリームを検出しました。")
+            else:
+                self.log(f"VOD を検出しました。{'ループ再生' if self.loop_vod else '1回再生'}します。")
+            frame_size = self.width * self.height * 3
+            last_frame_time = time.perf_counter()
+            frame_interval = 1.0 / self.detected_fps
+            self.playback_time = 0.0
+            start_time = time.perf_counter()
+            def _read_stderr(proc, cb):
                 try:
-                    stderr_output = self.proc.stderr.read().decode('utf-8', errors='ignore')
-                    if stderr_output.strip(): self.log(f"ffmpegエラー詳細: {stderr_output}")
+                    while proc and proc.stderr and not self.stop_event.is_set():
+                        line = proc.stderr.readline()
+                        if not line: break
+                        txt = line.decode('utf-8', errors='ignore').strip()
+                        if txt: cb(f"ffmpeg: {txt}")
                 except Exception: pass
-            if self._stop_cb: self._stop_cb()
-            return False
-        
-        # Spout init
-        self.spout = SpoutGL.SpoutSender()
-        self.spout.createOpenGL()
-        self.spout.setSenderName(self.sender_name)
-        self.log(f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
-
-        if self._init_ok_cb: self._init_ok_cb()
-
-        if self.is_live:
-            self.log("ライブストリームを検出しました。")
-        else:
-            self.log(f"VOD を検出しました。{'ループ再生' if self.loop_vod else '1回再生'}します。")
-
-        frame_size = self.width * self.height * 3
-        last_frame_time = time.perf_counter()
-        frame_interval = 1.0 / self.detected_fps
-        self.playback_time = 0.0
-        start_time = time.perf_counter()
-
-        def _read_stderr(proc, cb):
+            stderr_thread = threading.Thread(target=_read_stderr, args=(self.proc, self.log), daemon=True)
+            stderr_thread.start()
             try:
-                while proc and proc.stderr and not self.stop_event.is_set():
-                    line = proc.stderr.readline()
-                    if not line: break
-                    txt = line.decode('utf-8', errors='ignore').strip()
-                    if txt: cb(f"ffmpeg: {txt}")
-            except Exception: pass
-
-        stderr_thread = threading.Thread(target=_read_stderr, args=(self.proc, self.log), daemon=True)
-        stderr_thread.start()
-
-        try:
-            while not self.stop_event.is_set():
-                with self.seek_lock:
-                    if self.seek_request >= 0 and self.is_vod:
-                        seek_pos = self.seek_request
-                        self.seek_request = -1.0
-                        self.log(f"{seek_pos:.2f}秒へシークします...")
-                        if self.proc: 
-                            self.proc.kill()
-                            self.proc.wait()
-                        
-                        self.proc = self._start_ffmpeg(start_time_sec=seek_pos)
-                        if not self.proc or not self.proc.stdout:
-                            self.log("シーク後のffmpeg再起動に失敗しました。")
+                while not self.stop_event.is_set():
+                    with self.seek_lock:
+                        if self.seek_request >= 0 and self.is_vod:
+                            seek_pos = self.seek_request
+                            self.seek_request = -1.0
+                            self.log(f"{seek_pos:.2f}秒へシークします...")
+                            if self.proc: 
+                                self.proc.kill()
+                                self.proc.wait()
+                            self.proc = self._start_ffmpeg(start_time_sec=seek_pos)
+                            if not self.proc or not self.proc.stdout:
+                                self.log("シーク後のffmpeg再起動に失敗しました。")
+                                break
+                            start_time = time.perf_counter() - seek_pos
+                            stderr_thread = threading.Thread(target=_read_stderr, args=(self.proc, self.log), daemon=True)
+                            stderr_thread.start()
+                            continue # ループの先頭に戻る
+                    data = self.proc.stdout.read(frame_size)
+                    if not data or len(data) < frame_size:
+                        self.log("ストリームが終了または中断しました。")
+                        if not self.is_live and not self.loop_vod:
+                            if self._stop_cb: self._stop_cb()
                             break
-                        
-                        start_time = time.perf_counter() - seek_pos
-                        stderr_thread = threading.Thread(target=_read_stderr, args=(self.proc, self.log), daemon=True)
-                        stderr_thread.start()
-                        continue # ループの先頭に戻る
-
-                data = self.proc.stdout.read(frame_size)
-                if not data or len(data) < frame_size:
-                    self.log("ストリームが終了または中断しました。")
-                    if not self.is_live and not self.loop_vod:
-                        if self._stop_cb: self._stop_cb()
-                        break
-                    else:
-                        time.sleep(0.5)
-                        continue
-
-                now = time.perf_counter()
-                self.playback_time = now - start_time
-
-                frame = np.frombuffer(data, dtype=np.uint8).reshape((self.height, self.width, 3))
-                with self.frame_lock:
-                    self.latest_frame_bgr = frame
-
-                self.spout.sendImage(frame.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
-                
-                elapsed = time.perf_counter() - last_frame_time
-                sleep_time = frame_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                last_frame_time = time.perf_counter()
-
-        except KeyboardInterrupt:
-            self.log("終了します。")
-        finally:
-            self.cleanup()
+                        else:
+                            time.sleep(0.5)
+                            continue
+                    now = time.perf_counter()
+                    self.playback_time = now - start_time
+                    frame = np.frombuffer(data, dtype=np.uint8).reshape((self.height, self.width, 3))
+                    with self.frame_lock:
+                        self.latest_frame_bgr = frame
+                    self.spout.sendImage(frame.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
+                    elapsed = time.perf_counter() - last_frame_time
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    last_frame_time = time.perf_counter()
+            except KeyboardInterrupt:
+                self.log("終了します。")
+            finally:
+                self.cleanup()
 
     def seek(self, time_seconds: float):
         if self.is_vod:
@@ -553,10 +657,16 @@ class Streamer:
                 self.proc.wait(timeout=1)
         except Exception as e:
             self.log(f"ffmpegプロセスの終了に失敗: {e}")
-        
+        if self.container:
+            try:
+                self.container.close()
+            except Exception as e:
+                self.log(f"PyAVの解放に失敗: {e}")
+        self.container = None
+        self.video_stream = None
+        self.av_frame_gen = None
         if self.spout:
             try:
                 self.spout.releaseSender()
             except Exception as e:
                 self.log(f"Spoutの解放に失敗: {e}")
-        self.spout = None
