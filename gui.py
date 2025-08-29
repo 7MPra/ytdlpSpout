@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import cv2
 import numpy as np
-import SpoutGL
+# import SpoutGL
 import customtkinter as ctk
 import tkinter as tk  # PanedWindow用
 from PIL import Image, ImageTk

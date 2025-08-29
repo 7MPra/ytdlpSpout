@@ -183,7 +183,7 @@ class Streamer:
         self.is_live = False
         self.http_headers = {}
         self.stream_url = None
-        self.syphon: syphon.SyphonServer | None = None
+        self.syphon = None
         self.max_resolution = max_resolution
         self.manual_resolution = manual_resolution
         self.loop_vod = loop_vod
@@ -464,9 +464,11 @@ class Streamer:
                 except Exception:
                     pass
             return False
-        
-        # Spout init
-        self.syphon = syphon.SyphonServer(name=self.sender_name, width=self.width, height=self.height)
+
+        # Syphon init
+        self.syphon = syphon.SyphonMetalServer(self.sender_name)
+        self.log(
+            f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
         self.log(
             f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
 
@@ -596,7 +598,9 @@ class Streamer:
                 frame = np.frombuffer(data, dtype=np.uint8)
                 frame = frame.reshape((self.height, self.width, 3))
                 # Syphon send
-                self.syphon.publish_frame(frame)
+                # Syphon-python expects RGB, float32 or uint8, shape (H, W, 3)
+                # すでにframeはnp.uint8, (H, W, 3) なのでそのまま渡す
+                self.syphon.publishFrame(frame)
         except KeyboardInterrupt:
             self.log("終了します。")
         finally:
@@ -613,3 +617,4 @@ class Streamer:
         
         if self.syphon:
             self.syphon.stop()
+            self.syphon = None
