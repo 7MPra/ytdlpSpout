@@ -1,34 +1,27 @@
+
 #!/bin/bash
+
+# venvが無ければuvで作成
+if [ ! -d ".venv" ]; then
+    echo ".venv ディレクトリが見つかりません。uvで仮想環境を作成します..."
+    uv venv .venv
+fi
+
+source ./.venv/bin/activate
 
 # macOS向けビルドスクリプト
 
 # PyInstallerがインストールされているか確認
-if ! command -v pyinstaller &> /dev/null
-then
-    echo "PyInstallerが見つかりません。インストールします..."
-    pip3 install pyinstaller
-fi
+echo "ライブラリをインストールしています..."
+uv pip install yt-dlp opencv-python customtkinter pillow numpy
 
-# syphon-pythonがインストールされているか確認
-if ! python3 -c "import syphon" &> /dev/null
-then
-    echo "syphon-pythonが見つかりません。インストールします..."
-    pip3 install syphon-python
-fi
-
-# yt-dlpがインストールされているか確認
-if ! python3 -c "import yt_dlp" &> /dev/null
-then
-    echo "yt-dlpが見つかりません。インストールします..."
-    pip3 install yt-dlp
-fi
 
 # ffmpegのダウンロードと配置
 FFMPEG_DIR="./ffmpeg"
 if [ ! -d "$FFMPEG_DIR" ]; then
     echo "ffmpegをダウンロードしています..."
     mkdir -p "$FFMPEG_DIR"
-    curl -L "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o "$FFMPEG_DIR/ffmpeg.zip"
+    curl -L "https://evermeet.cx/ffmpeg/ffmpeg-8.0.zip" -o "$FFMPEG_DIR/ffmpeg.zip"
     unzip "$FFMPEG_DIR/ffmpeg.zip" -d "$FFMPEG_DIR"
     mv "$FFMPEG_DIR"/*/bin/* "$FFMPEG_DIR"/
     rm -rf "$FFMPEG_DIR"/ffmpeg.zip "$FFMPEG_DIR"/*/ # ダウンロードしたzipと展開したディレクトリを削除
