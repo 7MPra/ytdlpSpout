@@ -23,6 +23,43 @@ from ytdlpSpout.core import (
 )
 
 
+def clean_playlist_url(url: str) -> str:
+    """
+    プレイリストURLから単体動画URLに変換
+    プレイリストパラメータ（list, playlist）を除去
+    """
+    import re
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    
+    try:
+        # URLをパース
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query)
+        
+        # プレイリストパラメータを除去
+        playlist_params = ['list', 'playlist', 'pl']
+        for param in playlist_params:
+            if param in query_params:
+                del query_params[param]
+        
+        # パラメータを再構築
+        new_query = urlencode(query_params, doseq=True)
+        
+        # URLを再構築
+        new_parsed = parsed._replace(query=new_query)
+        cleaned_url = urlunparse(new_parsed)
+        
+        # 元のURLと異なる場合はログ出力
+        if cleaned_url != url:
+            print(f"プレイリストURL変換: {url} -> {cleaned_url}")
+        
+        return cleaned_url
+        
+    except Exception as e:
+        print(f"URL変換エラー: {e}")
+        return url  # エラー時は元のURLをそのまま返す
+
+
 class YtdlpLogger:
     """yt-dlp用のカスタムロガー：ログをGUIにリダイレクト"""
     def __init__(self, log_callback):
@@ -195,6 +232,7 @@ class App:
         self.duration_cache = 0.0 # 動画の長さをキャッシュ
         self.local_video_path: str | None = None
         self.download_in_progress = False
+        self.original_url: str | None = None  # 元のURL保持用
         
         # ログキューを追加（ログ処理の非同期化）
         import queue
@@ -286,21 +324,52 @@ class App:
         subprocess_cb.grid(row=6, column=0, sticky="w", padx=6, pady=6)
 
         # --- ボタン定義 ---
-        self.btn_start = ctk.CTkButton(frm, text="Start", command=self.on_start,
+        self.btn_start = ctk.CTkButton(frm, text="Start", command=self.on_stream,
                                       font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
-        self.btn_stream = ctk.CTkButton(frm, text="Stream", command=self.on_stream, state="normal",
-                                       font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
         self.btn_stop = ctk.CTkButton(frm, text="Stop", command=self.on_stop, state="disabled",
                                      font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"))
 
-        self.btn_start.grid(row=7, column=2, padx=6, pady=6)
-        self.btn_stream.grid(row=7, column=3, padx=6, pady=6)
+        self.btn_start.grid(row=7, column=3, padx=6, pady=6)
         self.btn_stop.grid(row=7, column=4, padx=6, pady=6)
 
+        # --- ダウンロード進捗表示エリア ---（info_labelの上に配置）
+        self.progress_frame = ctk.CTkFrame(root, fg_color="#2b2b2b", border_width=2, border_color="#404040")
+        # デフォルトで配置しておく（内容は非表示）
+        self.progress_frame.pack(fill="x", padx=8, pady=4)
+        
+        # 進捗エリアのタイトル - より目立つように
+        progress_title = ctk.CTkLabel(self.progress_frame, text="🔄 ダウンロード進捗:", 
+                                     font=ctk.CTkFont(family=self.japanese_font, size=12, weight="bold"),
+                                     text_color="#ff6b00")  # オレンジ色
+        progress_title.pack(anchor="w", padx=8, pady=(4, 0))
+        
+        # プログレスバー - より目立つ色に変更
+        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, progress_color="#ff6b00", height=25)
+        self.progress_bar.pack(fill="x", padx=8, pady=4)
+        self.progress_bar.set(0)  # 初期値
+        
+        # 進捗詳細情報
+        self.progress_info = ctk.CTkLabel(self.progress_frame, text="", 
+                                         font=ctk.CTkFont(family=self.monospace_font, size=11),
+                                         text_color="#ffffff")
+        self.progress_info.pack(padx=8, pady=(0, 4))
+        
+        # 最初は非表示（pack_forgetで隠す）
+        self.progress_frame.pack_forget()
+        
+        # 進捗状態の管理
+        self.download_progress = {
+            'percent': 0.0,
+            'downloaded_bytes': 0,
+            'total_bytes': 0,
+            'speed': '',
+            'eta': '',
+            'filename': ''
+        }
 
         self.info_label = ctk.CTkLabel(root, text="", font=ctk.CTkFont(family=self.japanese_font, size=14))
         self.info_label.pack(padx=8, pady=4)
-        
+
         # コーデック対応状況を表示
         format_str, codec_info = get_optimal_format_string()
         self.codec_label = ctk.CTkLabel(root, text=f"コーデック対応: {codec_info}", 
@@ -312,17 +381,17 @@ class App:
         main_paned.pack(fill="both", expand=True, padx=8, pady=8)
         
         # プレビューエリア（上部）- CustomTkinterフレームをPanedWindowに追加
-        preview_frame = ctk.CTkFrame(main_paned, fg_color="black")
-        main_paned.add(preview_frame, minsize=200)  # 最小高さ200px
+        self.preview_frame = ctk.CTkFrame(main_paned, fg_color="black")
+        main_paned.add(self.preview_frame, minsize=200)  # 最小高さ200px
         
-        self.preview_label = ctk.CTkLabel(preview_frame, text="No Signal", 
+        self.preview_label = ctk.CTkLabel(self.preview_frame, text="No Signal", 
                                          text_color="white", font=ctk.CTkFont(family=self.japanese_font, size=16))
         self.preview_label.pack(fill="both", expand=True)
         self.preview_imgtk = None
         self._no_signal_shown = True
 
         # --- シークバー関連 ---
-        seek_frame = ctk.CTkFrame(preview_frame, fg_color="transparent")
+        seek_frame = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
         seek_frame.pack(fill="x", padx=10, pady=5, side="bottom")
 
         self.seek_slider = ctk.CTkSlider(seek_frame, from_=0, to=100, state="disabled", command=self.on_seek_drag)
@@ -458,8 +527,61 @@ class App:
                 import subprocess
                 import sys
                 import json
+                import time
                 
-                self.root.after(0, self.log, f"別プロセスダウンロード開始: {url}")
+                # URLをクリーンアップ（プレイリストパラメータを除去）
+                cleaned_url = clean_playlist_url(url)
+                if cleaned_url != url:
+                    self.root.after(0, self.log, f"プレイリストURL検出：単体動画として処理します")
+                
+                self.root.after(0, self.log, f"別プロセスダウンロード開始: {cleaned_url}")
+                
+                # 進捗バーを表示して初期状態を設定
+                def init_subprocess_progress():
+                    if not self.progress_frame.winfo_viewable():
+                        self.progress_frame.pack(fill="x", padx=8, pady=4, before=self.info_label)
+                    # 初期進捗情報を設定
+                    initial_progress = {
+                        'percent': 0.0,
+                        'downloaded_bytes': 0,
+                        'total_bytes': 0,
+                        'speed': '別プロセス実行中',
+                        'eta': '推定中...',
+                        'filename': '別プロセスでダウンロード中...'
+                    }
+                    self.update_download_progress(initial_progress)
+                
+                self.root.after(0, init_subprocess_progress)
+                
+                # 別プロセス実行中の模擬進捗更新
+                def simulate_progress():
+                    start_time = time.time()
+                    max_wait_time = 120  # 最大2分
+                    
+                    def update_mock_progress():
+                        elapsed = time.time() - start_time
+                        if elapsed < max_wait_time:
+                            # 進捗を模擬的に更新（時間ベース）
+                            mock_percent = min(95, (elapsed / max_wait_time) * 100)
+                            mock_progress = {
+                                'percent': mock_percent,
+                                'downloaded_bytes': 0,
+                                'total_bytes': 0,
+                                'speed': '別プロセス実行中',
+                                'eta': f'{max_wait_time - elapsed:.0f}秒',
+                                'filename': '別プロセスでダウンロード中...'
+                            }
+                            self.root.after(0, self.update_download_progress, mock_progress)
+                            
+                            # 5秒ごとに更新
+                            if hasattr(self, '_subprocess_progress_active') and self._subprocess_progress_active:
+                                self.root.after(5000, update_mock_progress)
+                    
+                    # 模擬進捗開始
+                    self._subprocess_progress_active = True
+                    self.root.after(1000, update_mock_progress)
+                
+                simulate_progress()
                 
                 # Python スクリプトとして実行するためのコード
                 download_script = f"""
@@ -489,9 +611,13 @@ def download_video():
         sys.stdout = open(os.devnull, 'w')
         
         try:
+            # ストリーミング時と同じ最適化された品質設定を使用
+            from ytdlpSpout.core import get_optimal_format_string
+            format_str, codec_info = get_optimal_format_string()
+            
             ydl_opts = {{
-                'format': 'best',
-                'outtmpl': 'data/%(title)s.%(ext)s',
+                'format': format_str,  # 最適化されたフォーマット文字列を使用
+                'outtmpl': 'data/%(id)s.%(ext)s',
                 'cookiefile': 'data/cookies.txt',
                 'quiet': True,
                 'no_warnings': True,
@@ -501,10 +627,11 @@ def download_video():
                 'writeinfojson': False,
                 'progress_hooks': [progress_hook],
                 'noprogress': True,  # プログレス出力を完全に無効化
+                'noplaylist': True,  # プレイリスト無効化（単体動画のみダウンロード）
             }}
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info('{url}', download=True)
+                info = ydl.extract_info('{cleaned_url}', download=True)
                 title = info.get('title', 'Unknown')
                 
                 # ダウンロードされたファイルパスを確実に取得
@@ -577,21 +704,51 @@ if __name__ == '__main__':
                         self.root.after(0, self.log, f"ダウンロード結果受信: {result}")
                         
                         if result['status'] == 'success' and result.get('file_path'):
+                            # 模擬進捗を停止
+                            self._subprocess_progress_active = False
+                            # 完了時の進捗表示
+                            completion_progress = {
+                                'percent': 100.0,
+                                'downloaded_bytes': 0,
+                                'total_bytes': 0,
+                                'speed': '完了',
+                                'eta': '完了',
+                                'filename': result.get('title', 'ダウンロード完了')
+                            }
+                            self.root.after(0, self.update_download_progress, completion_progress)
+                            # 2秒後に進捗バーを非表示
+                            self.root.after(2000, self.hide_download_progress)
+                            
                             self.root.after(0, self.log, f"別プロセスダウンロード完了: {result['title']}")
                             self.root.after(0, self.log, f"ファイルパス: {result['file_path']}")
                             # **シームレス切り替えを実行**
                             self.root.after(0, self.switch_to_local_file, result['file_path'])
                         else:
+                            # エラー時も進捗バーを非表示
+                            self._subprocess_progress_active = False
+                            self.root.after(0, self.hide_download_progress)
                             self.root.after(0, self.log, f"ダウンロード結果: {result['message']}")
                     except json.JSONDecodeError as e:
+                        # エラー時も進捗バーを非表示
+                        self._subprocess_progress_active = False
+                        self.root.after(0, self.hide_download_progress)
                         self.root.after(0, self.log, f"JSON解析エラー: {e}")
                         self.root.after(0, self.log, f"生出力: {stdout.strip()}")
                     except IndexError:
+                        # エラー時も進捗バーを非表示
+                        self._subprocess_progress_active = False
+                        self.root.after(0, self.hide_download_progress)
                         self.root.after(0, self.log, f"出力形式エラー: {stdout.strip()}")
                 else:
+                    # エラー時も進捗バーを非表示
+                    self._subprocess_progress_active = False
+                    self.root.after(0, self.hide_download_progress)
                     self.root.after(0, self.log, f"別プロセスダウンロードエラー: {stderr.strip()}")
                     
             except Exception as e:
+                # エラー時も進捗バーを非表示
+                self._subprocess_progress_active = False
+                self.root.after(0, self.hide_download_progress)
                 self.root.after(0, self.log, f"別プロセス実行エラー: {e}")
         
         # バックグラウンドで実行
@@ -612,58 +769,158 @@ if __name__ == '__main__':
             
             # 現在の再生位置を保存
             current_time = 0.0
-            if self.streamer and hasattr(self.streamer, 'playback_time'):
-                current_time = self.streamer.playback_time
+            old_streamer = self.streamer  # 古いストリーマーを保持
+            if old_streamer and hasattr(old_streamer, 'playback_time'):
+                current_time = old_streamer.playback_time
                 self.log(f"現在の再生位置: {current_time:.1f}秒")
-            
-            self.log(f"現在のストリーマーを停止中...")
-            
-            # 現在のストリーマーを停止
-            if self.streamer:
-                self.streamer.stop()
-                self.streamer = None
-                self.log("ストリーマー停止完了")
             
             # ローカルファイルパスを設定
             self.local_video_path = abs_file_path
             self.log(f"ローカルビデオパス設定: {self.local_video_path}")
             
-            # 少し待機してからローカルファイルでストリーミング再開
-            def restart_with_local():
-                try:
-                    self.log("ローカルファイルでストリーミング再開中...")
-                    
-                    # URLフィールドをローカルファイルパスに更新
-                    self.url_var.set(abs_file_path)
-                    self.log(f"URL更新: {abs_file_path}")
-                    
-                    # ローカルファイルでストリーミング開始
-                    self.on_stream()
-                    self.log("ストリーミング再開コマンド実行")
-                    
-                    # UI状態を更新
-                    self.info_label.configure(text="ローカルファイル再生中")
-                    
-                    # 再生位置を復元（少し遅れて実行）
-                    if current_time > 5.0:  # 5秒以上再生していた場合のみ復元
-                        def restore_position():
-                            if self.streamer and hasattr(self.streamer, 'seek'):
-                                # 少し手前から再開（スムーズな切り替えのため）
-                                seek_time = max(0, current_time - 2.0)
-                                self.streamer.seek(seek_time)
-                                self.log(f"再生位置を復元: {seek_time:.1f}秒 (元位置: {current_time:.1f}秒)")
-                            else:
-                                self.log("警告: ストリーマーにseek機能がありません")
-                        
-                        self.root.after(3000, restore_position)  # 3秒後に位置復元
-                    
-                    self.log("シームレス切り替え完了: ローカルファイルからストリーミング中")
-                    
-                except Exception as e:
-                    self.log(f"ローカルファイル切り替えエラー: {e}")
+            # シームレス切り替えのために、ローカル動画を2秒先にシークして準備
+            seek_ahead_time = 2.0  # 2秒先読み
+            target_seek_time = max(0, current_time + seek_ahead_time)
+            self.log(f"ローカル動画を{seek_ahead_time}秒先 ({target_seek_time:.1f}秒) にシークして準備開始")
             
-            # 1秒後にローカルファイルで再開
-            self.root.after(1000, restart_with_local)
+            # 新しいストリーマーを並行準備してシームレス切り替え
+            def prepare_and_switch():
+                try:
+                    self.log("新しいローカルストリーマーを準備中...")
+                    
+                    # 現在の設定を取得（他の部分のコードと同様に）
+                    maxw = self.maxw_var.get().strip()
+                    maxh = self.maxh_var.get().strip()
+                    manw = self.manw_var.get().strip()
+                    manh = self.manh_var.get().strip()
+                    
+                    max_res = None
+                    manual_res = None
+                    
+                    if self.perf_limit.get() and not self.max_enable.get() and not self.manual_enable.get():
+                        max_res = (2560, 1440)
+                    
+                    try:
+                        if self.max_enable.get() and maxw and maxh:
+                            max_res = (int(maxw), int(maxh))
+                    except Exception:
+                        max_res = None
+                    try:
+                        if self.manual_enable.get() and manw and manh:
+                            manual_res = (int(manw), int(manh))
+                    except Exception:
+                        manual_res = None
+                    
+                    # 新しいStreamerインスタンスを作成
+                    from ytdlpSpout.core import Streamer
+                    new_streamer = Streamer(
+                        abs_file_path,
+                        self.sender_var.get(),
+                        max_resolution=max_res,
+                        manual_resolution=manual_res,
+                        loop_vod=self.vod_loop.get(),
+                        verbose=True,
+                        log_cb=lambda m: self.root.after(0, self.log, m),
+                        stop_cb=None,
+                        init_ok_cb=None
+                    )
+                    
+                    # 新しいストリーマーでフレーム送信開始
+                    self.log("新しいストリーマーを開始中...")
+                    new_streamer.start()
+                    
+                    # ローカル動画を目標位置にシーク（2秒先）
+                    time.sleep(0.8)  # ストリーマー初期化待ち
+                    if hasattr(new_streamer, 'seek'):
+                        new_streamer.seek(target_seek_time)
+                        self.log(f"ローカル動画を{target_seek_time:.1f}秒にシーク完了")
+                    
+                    # 新しいストリーマーがフレーム送信を開始するまで待機
+                    max_wait_time = 3.0  # 最大3秒待機（短縮）
+                    wait_start = time.time()
+                    frames_started = False
+                    
+                    self.log("新しいストリーマーのフレーム送信開始を待機中...")
+                    
+                    while (time.time() - wait_start) < max_wait_time:
+                        # より確実なフレーム送信検出
+                        if (hasattr(new_streamer, 'is_sending_frames') and new_streamer.is_sending_frames and
+                            hasattr(new_streamer, 'frames_sent') and new_streamer.frames_sent >= 3):
+                            # 少なくとも3フレーム送信されたことを確認
+                            frames_started = True
+                            self.log(f"フレーム送信確認: {new_streamer.frames_sent}フレーム送信済み")
+                            break
+                        elif (hasattr(new_streamer, 'spout') and new_streamer.spout is not None and
+                              hasattr(new_streamer, 'latest_frame_bgr') and new_streamer.latest_frame_bgr is not None):
+                            # 代替検証：Spoutとフレームバッファがあることを確認
+                            time.sleep(0.2)  # 少し待ってから再確認
+                            if (hasattr(new_streamer, 'frames_sent') and new_streamer.frames_sent >= 1):
+                                frames_started = True
+                                self.log(f"代替検証でフレーム送信確認: {new_streamer.frames_sent}フレーム")
+                                break
+                        time.sleep(0.05)  # 50msごとにチェック（高頻度化）
+                    
+                    if frames_started:
+                        # シームレス切り替えのタイミング調整
+                        # ローカル動画が2秒先にいるので、古いストリーマーの現在位置+2秒の時点で切り替え
+                        
+                        # 切り替えタイミングまでの残り時間を計算
+                        if old_streamer and hasattr(old_streamer, 'playback_time'):
+                            # リアルタイムで古いストリーマーの時間を取得
+                            old_current_time = old_streamer.playback_time
+                            time_until_switch = target_seek_time - old_current_time
+                            
+                            if time_until_switch > 0 and time_until_switch < 3.0:  # 最大3秒まで待機
+                                self.log(f"切り替えタイミングまで{time_until_switch:.1f}秒待機...")
+                                time.sleep(time_until_switch)
+                            else:
+                                self.log(f"タイミング調整スキップ (残り時間: {time_until_switch:.1f}秒)")
+                        
+                        # 最後の確認：新しいストリーマーが実際にアクティブな状態か
+                        if (hasattr(new_streamer, 'stop_event') and not new_streamer.stop_event.is_set() and
+                            hasattr(new_streamer, 'thread') and new_streamer.thread and new_streamer.thread.is_alive()):
+                            
+                            self.log("タイミング調整完了 - 古いストリーマーを停止中...")
+                            
+                            # この時点で新しいストリーマーがフレームを出力開始
+                            # 古いストリーマーを停止
+                            if old_streamer:
+                                old_streamer.stop()
+                                self.log("古いストリーマー停止完了")
+                            
+                            # GUIのストリーマー参照を更新
+                            self.streamer = new_streamer
+                            
+                            # URLフィールドは元のURLを保持し、ステータスのみ更新
+                            original_url_display = self.original_url if self.original_url else "不明"
+                            self.root.after(0, lambda: self.info_label.configure(
+                                text=f"ローカルファイル再生中（{original_url_display} からダウンロード済み）"
+                            ))
+                            
+                            self.log("シームレス切り替え完了: ローカルファイルからストリーミング中")
+                            
+                            # シームレス切り替え完了後は進捗バーを非表示（即座に＋遅延で確実に）
+                            self.root.after(0, self.hide_download_progress)
+                            self.root.after(500, self.hide_download_progress)  # 0.5秒後にも実行
+                        else:
+                            self.log("エラー: 新しいストリーマーがアクティブでありません")
+                            new_streamer.stop()
+                            frames_started = False
+                    
+                    if not frames_started:
+                        self.log("エラー: 新しいストリーマーの映像出力が開始されませんでした - フォールバック処理")
+                        # 失敗時は新しいストリーマーを停止し、古いものを維持
+                        new_streamer.stop()
+                        self.log("フォールバック: 古いストリーマーを継続使用します")
+                        
+                except Exception as e:
+                    self.log(f"シームレス切り替え準備エラー: {e}")
+                    # エラー時は新しいストリーマーを停止
+                    if 'new_streamer' in locals():
+                        new_streamer.stop()
+            
+            # バックグラウンドで並行準備
+            threading.Thread(target=prepare_and_switch, daemon=True).start()
             
         except Exception as e:
             self.log(f"シームレス切り替えエラー: {e}")
@@ -750,16 +1007,95 @@ if __name__ == '__main__':
             final_seek_value = self.seek_slider.get()
             self.streamer.seek(final_seek_value)
 
-    def on_start(self):
-        """「Start」ボタン：Streamボタンと同じ挙動に統一"""
-        # Streamボタンと同じ処理を呼び出し
-        self.on_stream()
+    def update_download_progress(self, progress_data):
+        """ダウンロード進捗を更新する"""
+        try:
+            # デバッグ: どこから呼ばれているかログ出力
+            import traceback
+            caller_info = traceback.extract_stack()[-2]
+            self.log(f"[DEBUG] update_download_progress called from {caller_info.filename}:{caller_info.lineno}")
+            
+            # 進捗データを更新
+            self.download_progress.update(progress_data)
+            
+            # プログレスバーを表示（まだ表示されていない場合のみ）
+            if not self.progress_frame.winfo_viewable():
+                # info_labelの上に表示するため、info_labelの前に挿入
+                self.progress_frame.pack(fill="x", padx=8, pady=4, before=self.info_label)
+                self.log("進捗バーを表示しました")
+            
+            # プログレスバーの値を更新
+            percent = self.download_progress.get('percent', 0.0)
+            if percent > 0:
+                self.progress_bar.set(percent / 100.0)  # CTkProgressBarは0-1の範囲
+            
+            # 詳細情報を更新
+            info_parts = []
+            
+            # ファイル名
+            filename = self.download_progress.get('filename', '')
+            if filename:
+                # ファイル名が長い場合は短縮
+                if len(filename) > 50:
+                    filename = f"...{filename[-47:]}"
+                info_parts.append(f"📁 {filename}")
+            
+            # 進捗パーセンテージ
+            if percent > 0:
+                info_parts.append(f"📊 {percent:.1f}%")
+            
+            # ダウンロード済み/合計サイズ
+            downloaded = self.download_progress.get('downloaded_bytes', 0)
+            total = self.download_progress.get('total_bytes', 0)
+            if downloaded > 0:
+                downloaded_mb = downloaded / (1024 * 1024)
+                if total > 0:
+                    total_mb = total / (1024 * 1024)
+                    info_parts.append(f"💾 {downloaded_mb:.1f}MB / {total_mb:.1f}MB")
+                else:
+                    info_parts.append(f"💾 {downloaded_mb:.1f}MB")
+            
+            # ダウンロード速度
+            speed = self.download_progress.get('speed', '')
+            if speed:
+                info_parts.append(f"⚡ {speed}")
+            
+            # 残り時間
+            eta = self.download_progress.get('eta', '')
+            if eta and eta != 'Unknown':
+                info_parts.append(f"⏱️ ETA: {eta}")
+            
+            # 情報を表示
+            info_text = " | ".join(info_parts) if info_parts else "ダウンロード中..."
+            self.progress_info.configure(text=info_text)
+            
+        except Exception as e:
+            self.log(f"進捗更新エラー: {e}")
+
+    def hide_download_progress(self):
+        """ダウンロード進捗表示を非表示にする"""
+        try:
+            self.progress_frame.pack_forget()
+            self.progress_bar.set(0)
+            self.progress_info.configure(text="")
+            self.download_progress = {
+                'percent': 0.0,
+                'downloaded_bytes': 0,
+                'total_bytes': 0,
+                'speed': '',
+                'eta': '',
+                'filename': ''
+            }
+        except Exception:
+            pass
 
     def on_download_complete(self):
         """ダウンロード完了処理（Streamボタンに統合済みのため、簡素化）"""
+        # 進捗バーを非表示にする
+        self.hide_download_progress()
+        
         self.log(f"動画をローカルに保存しました: {self.local_video_path}")
-        self.btn_stream.configure(state="normal")
-        self.btn_start.configure(state="normal") 
+        self.btn_start.configure(state="normal")
         self.info_label.configure(text="準備完了。")
         # 注意：自動再生はon_streamで処理されるため、ここでは実行しない
 
@@ -772,7 +1108,6 @@ if __name__ == '__main__':
         
         # UIを即座に更新
         self.btn_start.configure(state="disabled")
-        self.btn_stream.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.info_label.configure(text="ストリーミング準備中...")
         self.log(f"{video_source_url} からストリーミングを開始します...")
@@ -872,6 +1207,10 @@ if __name__ == '__main__':
         # メインスレッド監視を開始（ブロッキング検出のため）
         self._start_main_thread_monitor()
 
+        # 元のURLを保存（ローカルファイルでない場合のみ）
+        if not os.path.exists(url):
+            self.original_url = url
+
         # まずストリーミング再生
         self._start_spout_stream(url)
 
@@ -944,9 +1283,23 @@ if __name__ == '__main__':
             self.root.after(0, self.log, "すでにバックグラウンドダウンロード中です。")
             return
         
+        # URLをクリーンアップ（プレイリストパラメータを除去）
+        cleaned_url = clean_playlist_url(url)
+        if cleaned_url != url:
+            self.root.after(0, self.log, f"プレイリストURL検出：単体動画として処理します")
+        
         # ダウンロード開始の表示を非同期で行う
         self.download_in_progress = True
         self.root.after(0, self.log, "バックグラウンドダウンロードを準備中...")
+        
+        # 進捗バーを表示
+        def show_progress_bar():
+            if not self.progress_frame.winfo_viewable():
+                self.progress_frame.pack(fill="x", padx=8, pady=4, before=self.info_label)
+                self.progress_info.configure(text="ダウンロード準備中...")
+                self.progress_bar.set(0)
+        
+        self.root.after(0, show_progress_bar)
         
         def download_video():
             try:
@@ -993,8 +1346,12 @@ if __name__ == '__main__':
                 custom_logger = YtdlpLogger(async_log)
                 
                 # まず動画情報を軽量に取得
+                # ストリーミング時と同じ最適化された品質設定を使用
+                from ytdlpSpout.core import get_optimal_format_string
+                format_str, codec_info = get_optimal_format_string()
+                
                 ydl_opts_info = {
-                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'format': format_str,  # 最適化されたフォーマット文字列を使用
                     'outtmpl': 'data/%(id)s.%(ext)s',
                     'nocheckcertificate': True,
                     'logger': custom_logger,
@@ -1002,10 +1359,13 @@ if __name__ == '__main__':
                     'no_warnings': False,
                     'extract_flat': False,  # 詳細情報が必要
                     'verbose': False,  # 詳細ログを無効化（プレビューフリーズを防ぐ）
+                    'noplaylist': True,  # プレイリスト無効化（単体動画のみダウンロード）
                 }
                 
+                self.root.after(0, self.log, f"動画情報取得品質設定: {codec_info}")
+                
                 with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                    info = ydl.extract_info(cleaned_url, download=False)
                     final_filename = ydl.prepare_filename(info)
                     # 動画情報をログに出力
                     title = info.get('title', 'Unknown')
@@ -1016,38 +1376,102 @@ if __name__ == '__main__':
                 import time
                 time.sleep(0.1)
                 
-                # プログレスフックの定義（最適化版）
+                # プログレスフックの定義（進捗バー対応版）
                 def progress_hook(d):
                     try:
+                        # サブプロセス進捗が活動中の場合は通常の進捗フックを無効化
+                        if hasattr(self, '_subprocess_progress_active') and self._subprocess_progress_active:
+                            return
+                        
                         if d['status'] == 'downloading':
-                            percent = d.get('_percent_str', '')
-                            speed = d.get('_speed_str', '')
-                            eta = d.get('_eta_str', '')
-                            # GUI更新頻度を制限（1秒間隔）
+                            # 詳細な進捗情報を取得
+                            progress_data = {}
+                            
+                            # パーセンテージ
+                            if '_percent_str' in d:
+                                percent_str = d['_percent_str'].strip('%')
+                                try:
+                                    progress_data['percent'] = float(percent_str)
+                                except ValueError:
+                                    progress_data['percent'] = 0.0
+                            
+                            # バイト数
+                            progress_data['downloaded_bytes'] = d.get('downloaded_bytes', 0)
+                            progress_data['total_bytes'] = d.get('total_bytes', 0)
+                            
+                            # 速度とETA
+                            progress_data['speed'] = d.get('_speed_str', '')
+                            progress_data['eta'] = d.get('_eta_str', '')
+                            
+                            # ファイル名
+                            progress_data['filename'] = d.get('filename', '')
+                            if not progress_data['filename'] and hasattr(progress_hook, 'filename'):
+                                progress_data['filename'] = progress_hook.filename
+                            
+                            # GUI更新（メインスレッドで実行）
+                            self.root.after(0, self.update_download_progress, progress_data)
+                            
+                            # ログ出力頻度を制限（1秒間隔）
                             if hasattr(progress_hook, 'last_log_time'):
                                 import time
                                 current_time = time.time()
-                                if current_time - progress_hook.last_log_time < 1.0:  # 1秒間隔で制限
+                                if current_time - progress_hook.last_log_time < 2.0:  # 2秒間隔に変更
                                     return
                                 progress_hook.last_log_time = current_time
                             else:
                                 import time
                                 progress_hook.last_log_time = time.time()
                             
-                            self.root.after(0, self.log, f"BGダウンロード中: {percent} ({speed}, ETA: {eta})")
+                            # 簡潔なログ出力
+                            percent = progress_data.get('percent', 0)
+                            speed = progress_data.get('speed', '')
+                            if percent > 0:
+                                self.root.after(0, self.log, f"ダウンロード中: {percent:.1f}% ({speed})")
+                            
                         elif d['status'] == 'finished':
-                            self.root.after(0, self.log, "BGダウンロード完了")
+                            # ダウンロード完了時は進捗バーを非表示
+                            self.root.after(0, self.hide_download_progress)
+                            self.root.after(0, self.log, "ダウンロード完了")
                         elif d['status'] == 'error':
-                            self.root.after(0, self.log, f"BGダウンロードエラー: {d.get('_error_str', 'Unknown error')}")
-                    except Exception:
-                        pass  # プログレスフックのエラーでダウンロードを停止させない
+                            # エラー時も進捗バーを非表示
+                            self.root.after(0, self.hide_download_progress)
+                            self.root.after(0, self.log, f"ダウンロードエラー: {d.get('_error_str', 'Unknown error')}")
+                    except Exception as e:
+                        # プログレスフックのエラーでダウンロードを停止させない
+                        self.root.after(0, self.log, f"進捗処理エラー: {e}")
                 
-                # ダウンロード開始の明示的なログ
+                # ファイル名をプログレスフックに保存
+                progress_hook.filename = final_filename
+                
+                # ダウンロード開始の明示的なログと進捗バー初期化
                 self.root.after(0, self.log, f"ダウンロードを開始します: {final_filename}")
                 
+                # 進捗バーの初期状態を設定
+                def init_progress():
+                    # サブプロセス進捗が活動中でない場合のみ進捗バー初期化
+                    if not (hasattr(self, '_subprocess_progress_active') and self._subprocess_progress_active):
+                        if not self.progress_frame.winfo_viewable():
+                            self.progress_frame.pack(fill="x", padx=8, pady=4, before=self.info_label)
+                        # 初期進捗情報を設定
+                        initial_progress = {
+                            'percent': 0.0,
+                            'downloaded_bytes': 0,
+                            'total_bytes': 0,
+                            'speed': '',
+                            'eta': '',
+                            'filename': final_filename
+                        }
+                        self.update_download_progress(initial_progress)
+                
+                self.root.after(0, init_progress)
+                
                 # ダウンロード実行
+                # ストリーミング時と同じ最適化された品質設定を使用
+                from ytdlpSpout.core import get_optimal_format_string
+                format_str, codec_info = get_optimal_format_string()
+                
                 ydl_opts_dl = {
-                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'format': format_str,  # 最適化されたフォーマット文字列を使用
                     'outtmpl': 'data/%(id)s.%(ext)s',
                     'progress_hooks': [progress_hook],
                     'nocheckcertificate': True,
@@ -1059,7 +1483,10 @@ if __name__ == '__main__':
                     'fragment_retries': 3,  # フラグメントリトライも制限
                     'extractor_retries': 1,  # エクストラクターリトライを制限
                     'file_access_retries': 3,  # ファイルアクセスリトライを制限
+                    'noplaylist': True,  # プレイリスト無効化（単体動画のみダウンロード）
                 }
+                
+                self.root.after(0, self.log, f"ダウンロード品質設定: {codec_info}")
                 
                 with yt_dlp.YoutubeDL(ydl_opts_dl) as ydl:
                     import time
@@ -1067,7 +1494,7 @@ if __name__ == '__main__':
                     self.root.after(0, self.log, f"[DEBUG] BGダウンロード開始: {bg_download_start_time:.3f}")
                     self.root.after(0, self.log, "yt-dlpダウンロード処理を実行中...")
                     
-                    ydl.download([url])
+                    ydl.download([cleaned_url])
                     
                     bg_download_end_time = time.time()
                     bg_download_duration = bg_download_end_time - bg_download_start_time
@@ -1122,9 +1549,8 @@ if __name__ == '__main__':
             import threading
             threading.Thread(target=start_local, daemon=True).start()
         else:
-            self.btn_stream.configure(state="normal")
             self.btn_start.configure(state="normal")
-            self.info_label.configure(text="準備完了。Streamボタンで再生を開始できます。")
+            self.info_label.configure(text="準備完了。Startボタンで再生を開始できます。")
 
     def on_stream_start_success(self):
         self.info_label.configure(text="ストリーミング開始")
@@ -1138,10 +1564,13 @@ if __name__ == '__main__':
         if self.streamer:
             self.streamer.stop()
             self.streamer = None
+        
+        # 進捗バーを非表示にする
+        self.hide_download_progress()
+        
         # UIリセット
         if not skip_ui_reset:
             self.btn_start.configure(state="normal")
-            self.btn_stream.configure(state="normal") # Streamボタンは常に有効
             self.btn_stop.configure(state="disabled")
             self.info_label.configure(text="停止しました")
             self.seek_slider.configure(state="disabled")
@@ -1163,9 +1592,11 @@ if __name__ == '__main__':
             self.streamer.stop()
             self.streamer = None
         
+        # 進捗バーを非表示にする
+        self.hide_download_progress()
+        
         self.download_in_progress = False
         self.btn_start.configure(state="normal")
-        self.btn_stream.configure(state="normal") # Streamボタンは常に有効
         self.btn_stop.configure(state="disabled")
         self.info_label.configure(text="エラーが発生しました")
 

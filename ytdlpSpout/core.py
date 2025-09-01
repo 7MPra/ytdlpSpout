@@ -229,6 +229,13 @@ class Streamer:
         self.seek_lock = threading.Lock()
         self.seek_request = -1.0
         self.is_local_file = os.path.exists(video_url) and os.path.isfile(video_url)
+        
+        # フレーム送信監視用
+        self.frame_count = 0
+        self.frames_sent = 0
+        self.first_frame_sent_time = None
+        self.is_sending_frames = False
+        self.spout = None
 
     def log(self, msg: str):
         try:
@@ -530,6 +537,13 @@ class Streamer:
                                 img = frame.to_ndarray(format='bgr24')
                                 with self.frame_lock:
                                     self.latest_frame_bgr = img
+                                
+                                # フレーム送信状態を更新
+                                self.frames_sent += 1
+                                if not self.is_sending_frames:
+                                    self.is_sending_frames = True
+                                    self.first_frame_sent_time = time.perf_counter()
+                                
                                 self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                                 last_frame_time = time.perf_counter()
                                 continue  # ループ先頭に戻る（以降の通常再生へ）
@@ -564,6 +578,13 @@ class Streamer:
                     self.playback_time = frame.time if hasattr(frame, 'time') and frame.time is not None else self.playback_time + frame_interval
                     with self.frame_lock:
                         self.latest_frame_bgr = img
+                    
+                    # フレーム送信状態を更新
+                    self.frames_sent += 1
+                    if not self.is_sending_frames:
+                        self.is_sending_frames = True
+                        self.first_frame_sent_time = time.perf_counter()
+                    
                     self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                     elapsed = time.perf_counter() - last_frame_time
                     sleep_time = frame_interval - elapsed
@@ -652,6 +673,13 @@ class Streamer:
                     frame = np.frombuffer(data, dtype=np.uint8).reshape((self.height, self.width, 3))
                     with self.frame_lock:
                         self.latest_frame_bgr = frame
+                    
+                    # フレーム送信状態を更新
+                    self.frames_sent += 1
+                    if not self.is_sending_frames:
+                        self.is_sending_frames = True
+                        self.first_frame_sent_time = time.perf_counter()
+                    
                     self.spout.sendImage(frame.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                     elapsed = time.perf_counter() - last_frame_time
                     sleep_time = frame_interval - elapsed
