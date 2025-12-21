@@ -236,6 +236,41 @@ class Streamer:
         self.first_frame_sent_time = None
         self.is_sending_frames = False
         self.spout = None
+        
+        # フレーム同期用（PTS: Presentation Timestamp）
+        self.current_frame_pts: float = 0.0  # 現在フレームのPTS（秒）
+        self.pts_lock = threading.Lock()  # PTSアクセス用ロック
+        
+        # Spout送信制御（dry-run用）
+        self.spout_enabled: bool = True  # FalseならSpout送信をスキップ
+        self.spout_enabled_lock = threading.Lock()
+        
+        # 一時停止制御（待ち伏せ同期用）
+        self.pause_request_pts: Optional[float] = None
+        self.is_paused = False
+        self.pause_lock = threading.Lock()
+    
+    def set_spout_enabled(self, enabled: bool):
+        """Spout送信の有効/無効を切り替える"""
+        with self.spout_enabled_lock:
+            self.spout_enabled = enabled
+        self.log(f"[SPOUT] 送信{'有効' if enabled else '無効'}化")
+
+    def pause_at_pts(self, pts: float):
+        """指定したPTSで一時停止するよう予約"""
+        with self.pause_lock:
+            self.pause_request_pts = pts
+            self.is_paused = False  # まだ停止していない
+        self.log(f"[SYNC] PTS {pts:.3f}秒での一時停止を予約")
+
+    def resume(self):
+        """一時停止を解除して再開"""
+        with self.pause_lock:
+            was_paused = self.is_paused
+            self.is_paused = False
+            self.pause_request_pts = None
+        if was_paused:
+            self.log("[SYNC] 再生再開")
 
     def log(self, msg: str):
         try:
@@ -245,6 +280,44 @@ class Streamer:
                 print(msg)
         except Exception:
             pass
+
+    def wait_for_pts(self, target_pts: float, timeout: float = 15.0) -> bool:
+        """
+        指定したPTSに到達するまで待機する。
+        
+        Args:
+            target_pts: 待機対象のPTS（秒）
+            timeout: タイムアウト秒数（デフォルト15秒）
+        
+        Returns:
+            True: 目標PTSに到達
+            False: タイムアウトまたは停止
+        """
+        start_time = time.perf_counter()
+        frame_interval = 1.0 / max(self.detected_fps, 1)
+        tolerance = frame_interval / 2  # 1フレームの半分を許容差とする
+        
+        self.log(f"[SYNC] PTS待機開始: 目標={target_pts:.3f}秒, 許容差={tolerance:.4f}秒")
+        
+        while not self.stop_event.is_set():
+            elapsed = time.perf_counter() - start_time
+            if elapsed > timeout:
+                self.log(f"[SYNC] PTS待機タイムアウト: {elapsed:.1f}秒経過")
+                return False
+            
+            with self.pts_lock:
+                current = self.current_frame_pts
+            
+            # 目標PTSに到達（許容差内）
+            if current >= target_pts - tolerance:
+                self.log(f"[SYNC] PTS到達: 現在={current:.3f}秒, 目標={target_pts:.3f}秒, 差分={abs(current - target_pts) * self.detected_fps:.2f}フレーム")
+                return True
+            
+            # まだ到達していない場合は短い間隔で待機
+            time.sleep(frame_interval / 4)
+        
+        self.log("[SYNC] PTS待機中断: ストリーマー停止")
+        return False
 
 
     def _get_local_file_info(self) -> bool:
@@ -267,9 +340,26 @@ class Streamer:
                 self.log("エラー: ファイル内に映像ストリームが見つかりません。")
                 return False
 
-            # 解像度
-            self.width = int(video_stream['width'])
-            self.height = int(video_stream['height'])
+            # 解像度（ファイルメタデータから）
+            w = int(video_stream['width'])
+            h = int(video_stream['height'])
+            self.original_width = w
+            self.original_height = h
+            
+            # 解像度制限・手動設定の適用
+            if self.max_resolution:
+                maxw, maxh = self.max_resolution
+                if w > maxw or h > maxh:
+                    scale = min(maxw / w, maxh / h)
+                    w, h = int(w * scale), int(h * scale)
+            
+            if self.manual_resolution:
+                mw, mh = self.manual_resolution
+                if mw and mh:
+                    w, h = int(mw), int(mh)
+            
+            self.width = w
+            self.height = h
 
             # FPS
             fps_str = video_stream.get('avg_frame_rate', '30/1')
@@ -535,6 +625,8 @@ class Streamer:
                                     continue
                                 self.playback_time = frame.time if hasattr(frame, 'time') and frame.time is not None else seek_pos
                                 img = frame.to_ndarray(format='bgr24')
+                                if img.shape[1] != self.width or img.shape[0] != self.height:
+                                    img = cv2.resize(img, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
                                 with self.frame_lock:
                                     self.latest_frame_bgr = img
                                 
@@ -544,7 +636,29 @@ class Streamer:
                                     self.is_sending_frames = True
                                     self.first_frame_sent_time = time.perf_counter()
                                 
-                                self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
+                                # PTS更新（フレーム同期用）
+                                with self.pts_lock:
+                                    self.current_frame_pts = self.playback_time
+                                
+                                # 一時停止PTSチェック
+                                check_pause = False
+                                with self.pause_lock:
+                                    if self.pause_request_pts is not None and self.current_frame_pts >= self.pause_request_pts:
+                                        check_pause = True
+                                        self.is_paused = True
+                                
+                                if check_pause:
+                                    self.log(f"[SYNC] 目標PTS({self.current_frame_pts:.3f}s)到達により一時停止待機...")
+                                    while not self.stop_event.is_set():
+                                        with self.pause_lock:
+                                            if not self.is_paused:
+                                                break
+                                        time.sleep(0.01)
+
+                                # Spout送信（有効時のみ）
+                                with self.spout_enabled_lock:
+                                    if self.spout_enabled:
+                                        self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                                 last_frame_time = time.perf_counter()
                                 continue  # ループ先頭に戻る（以降の通常再生へ）
                             except Exception as e:
@@ -573,6 +687,8 @@ class Streamer:
                             if self._stop_cb: self._stop_cb()
                             break
                     img = frame.to_ndarray(format='bgr24')
+                    if img.shape[1] != self.width or img.shape[0] != self.height:
+                        img = cv2.resize(img, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
                     now = time.perf_counter()
                     # 再生位置はフレームのタイムスタンプを優先
                     self.playback_time = frame.time if hasattr(frame, 'time') and frame.time is not None else self.playback_time + frame_interval
@@ -585,7 +701,30 @@ class Streamer:
                         self.is_sending_frames = True
                         self.first_frame_sent_time = time.perf_counter()
                     
-                    self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
+                    # PTS更新（フレーム同期用）
+                    with self.pts_lock:
+                        self.current_frame_pts = self.playback_time
+                    
+                    
+                    # 一時停止PTSチェック
+                    check_pause = False
+                    with self.pause_lock:
+                        if self.pause_request_pts is not None and self.current_frame_pts >= self.pause_request_pts:
+                            check_pause = True
+                            self.is_paused = True
+                    
+                    if check_pause:
+                        self.log(f"[SYNC] 目標PTS({self.current_frame_pts:.3f}s)到達により一時停止待機...")
+                        while not self.stop_event.is_set():
+                            with self.pause_lock:
+                                if not self.is_paused:
+                                    break
+                            time.sleep(0.01)
+                    
+                    # Spout送信（有効時のみ）
+                    with self.spout_enabled_lock:
+                        if self.spout_enabled:
+                            self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                     elapsed = time.perf_counter() - last_frame_time
                     sleep_time = frame_interval - elapsed
                     if sleep_time > 0:
@@ -680,7 +819,14 @@ class Streamer:
                         self.is_sending_frames = True
                         self.first_frame_sent_time = time.perf_counter()
                     
-                    self.spout.sendImage(frame.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
+                    # PTS更新（フレーム同期用）
+                    with self.pts_lock:
+                        self.current_frame_pts = self.playback_time
+                    
+                    # Spout送信（有効時のみ）
+                    with self.spout_enabled_lock:
+                        if self.spout_enabled:
+                            self.spout.sendImage(frame.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                     elapsed = time.perf_counter() - last_frame_time
                     sleep_time = frame_interval - elapsed
                     if sleep_time > 0:
