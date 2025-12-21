@@ -321,75 +321,64 @@ class Streamer:
 
 
     def _get_local_file_info(self) -> bool:
-        """ffprobeを使ってローカルファイルの情報を取得"""
+        """PyAVを使ってローカルファイルの情報を取得"""
         try:
-            ffprobe_path = find_ffmpeg_path('ffprobe')
-            cmd = [
-                ffprobe_path,
-                '-v', 'quiet',
-                '-print_format', 'json',
-                '-show_format', '-show_streams',
-                self.video_url
-            ]
-            self.log(f"ffprobeでファイル情報を取得: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            info = json.loads(result.stdout)
+            # PyAVでファイルを開く（メタデータ取得のみなので読み込みは最小限）
+            with av.open(self.video_url) as container:
+                video_stream = next((s for s in container.streams if s.type == 'video'), None)
+                if not video_stream:
+                    self.log("エラー: ファイル内に映像ストリームが見つかりません。")
+                    return False
 
-            video_stream = next((s for s in info['streams'] if s['codec_type'] == 'video'), None)
-            if not video_stream:
-                self.log("エラー: ファイル内に映像ストリームが見つかりません。")
-                return False
+                # 解像度
+                w = video_stream.width
+                h = video_stream.height
+                self.original_width = w
+                self.original_height = h
+                
+                # 解像度制限・手動設定の適用
+                if self.max_resolution:
+                    maxw, maxh = self.max_resolution
+                    if w > maxw or h > maxh:
+                        scale = min(maxw / w, maxh / h)
+                        w, h = int(w * scale), int(h * scale)
+                
+                if self.manual_resolution:
+                    mw, mh = self.manual_resolution
+                    if mw and mh:
+                        w, h = int(mw), int(mh)
+                
+                self.width = w
+                self.height = h
 
-            # 解像度（ファイルメタデータから）
-            w = int(video_stream['width'])
-            h = int(video_stream['height'])
-            self.original_width = w
-            self.original_height = h
-            
-            # 解像度制限・手動設定の適用
-            if self.max_resolution:
-                maxw, maxh = self.max_resolution
-                if w > maxw or h > maxh:
-                    scale = min(maxw / w, maxh / h)
-                    w, h = int(w * scale), int(h * scale)
-            
-            if self.manual_resolution:
-                mw, mh = self.manual_resolution
-                if mw and mh:
-                    w, h = int(mw), int(mh)
-            
-            self.width = w
-            self.height = h
-
-            # FPS
-            fps_str = video_stream.get('avg_frame_rate', '30/1')
-            if '/' in fps_str:
-                num, den = fps_str.split('/')
-                try:
-                    num = float(num)
-                    den = float(den)
-                    self.detected_fps = round(num / den) if den != 0 else 30
-                except Exception:
+                # FPS
+                # average_rate は Fraction 型で返ることが多い
+                if video_stream.average_rate:
+                    try:
+                        fps = float(video_stream.average_rate)
+                        self.detected_fps = int(round(fps))
+                    except Exception:
+                        self.detected_fps = 30
+                else:
                     self.detected_fps = 30
-            else:
-                try:
-                    self.detected_fps = round(float(fps_str))
-                except Exception:
-                    self.detected_fps = 30
-            self.detected_fps = max(MIN_FPS, min(MAX_FPS, self.detected_fps))
+                
+                self.detected_fps = max(MIN_FPS, min(MAX_FPS, self.detected_fps))
 
-            # 長さ
-            self.duration = float(info['format'].get('duration', 0.0))
+                # 長さ (container.duration は通常マイクロ秒単位)
+                if container.duration:
+                    self.duration = float(container.duration) / 1000000.0
+                else:
+                    self.duration = 0.0
 
-            self.is_vod = True
-            self.is_live = False
-            self.stream_url = self.video_url # ストリームURLはファイルパスそのもの
+                self.is_vod = True
+                self.is_live = False
+                self.stream_url = self.video_url 
 
-            self.log(f"ファイル情報: {self.width}x{self.height} @ {self.detected_fps}fps, 長さ: {self.duration:.2f}s")
-            return True
+                self.log(f"ファイル情報(PyAV): {self.width}x{self.height} @ {self.detected_fps}fps, 長さ: {self.duration:.2f}s")
+                return True
 
         except Exception as e:
-            self.log(f"ffprobeでのファイル情報取得に失敗: {e}")
+            self.log(f"PyAVでのファイル情報取得に失敗: {e}")
             if self._stop_cb:
                 self._stop_cb()
             return False
@@ -436,6 +425,21 @@ class Streamer:
 
         self.stream_url = info.get("url")
         self.http_headers = info.get("http_headers", {})
+        
+        # Cookieをヘッダーに追加
+        if hasattr(ydl, 'cookiejar'):
+            cookies = []
+            for cookie in ydl.cookiejar:
+                cookies.append(f"{cookie.name}={cookie.value}")
+            if cookies:
+                cookie_header = "; ".join(cookies)
+                # 既存のCookieがあれば維持しつつ追加（上書きせず）
+                if 'Cookie' in self.http_headers:
+                     self.log(f"既存のCookieヘッダーが見つかりました、今回取得したCookieで更新します。")
+                     self.http_headers['Cookie'] = cookie_header # ここではシンプルに置き換えを選択（通常yt-dlpが正）
+                else:
+                    self.http_headers['Cookie'] = cookie_header
+                # self.log(f"Cookieをヘッダーに注入しました: {len(cookies)}個")
 
         if not self.stream_url:
             rf = info.get("requested_formats")
@@ -537,7 +541,7 @@ class Streamer:
         
         if self.verbose:
             cmd_str = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in cmd])
-            self.log(f"ffmpegコマンド: {cmd_str}")
+            # self.log(f"ffmpegコマンド: {cmd_str}")  # ログが長すぎるため抑制
             
         return subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,

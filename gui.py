@@ -85,7 +85,8 @@ class YtdlpLogger:
         # 署名関数やキャッシュ関連のデバッグログは抑制
         if msg and any(keyword in msg.lower() for keyword in [
             'signature function', 'sigfuncs', 'nsig', 'decrypted nsig',
-            'loading youtube-', 'extracting signature', 'from cache'
+            'loading youtube-', 'extracting signature', 'from cache',
+            'no supported javascript runtime', 'some web_safari client', 'some web client'
         ]):
             return False
             
@@ -650,16 +651,16 @@ class App:
                 heartbeat_start = current_time
                 self.root.after(0, self._main_thread_heartbeat)
                 
-                # Spout送信状態を定期的にログ
-                if current_time - last_frame_check > 2.0:  # 2秒に1回
-                    try:
-                        if self.streamer and hasattr(self.streamer, 'latest_frame_bgr'):
-                            frame_info = "フレーム有" if self.streamer.latest_frame_bgr is not None else "フレーム無"
-                            playback_time = getattr(self.streamer, 'playback_time', 0)
-                            self.root.after(0, self.log, f"[SPOUT] {frame_info}, 再生時間: {playback_time:.1f}秒")
-                        last_frame_check = current_time
-                    except Exception:
-                        pass
+                # Spout送信状態を定期的にログ（削除：ログが多すぎるため）
+                # if current_time - last_frame_check > 2.0:  # 2秒に1回
+                #     try:
+                #         if self.streamer and hasattr(self.streamer, 'latest_frame_bgr'):
+                #             frame_info = "フレーム有" if self.streamer.latest_frame_bgr is not None else "フレーム無"
+                #             playback_time = getattr(self.streamer, 'playback_time', 0)
+                #             self.root.after(0, self.log, f"[SPOUT] {frame_info}, 再生時間: {playback_time:.1f}秒")
+                #         last_frame_check = current_time
+                #     except Exception:
+                #         pass
                 
                 time.sleep(0.2)  # 200ms間隔でチェック
                 
@@ -692,15 +693,16 @@ class App:
         self._download_cancelled = True
         self._subprocess_progress_active = False
         
-        if self._download_process is not None:
+        proc = self._download_process
+        if proc is not None:
             try:
-                self._download_process.terminate()
+                proc.terminate()
                 self.log("ダウンロードプロセスを終了しました")
                 # プロセスの終了を待機（最大2秒）
                 try:
-                    self._download_process.wait(timeout=2)
+                    proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    self._download_process.kill()
+                    proc.kill()
                     self.log("ダウンロードプロセスを強制終了しました")
             except Exception as e:
                 self.log(f"ダウンロードキャンセルエラー: {e}")
@@ -1030,9 +1032,9 @@ class App:
                 self.log(f"エラー: ローカルファイルが見つかりません: {file_path}")
                 return
             
-            # ファイルの絶対パスを取得
+            # ファイルの絶対パスを取得（ログ省略）
             abs_file_path = os.path.abspath(file_path)
-            self.log(f"絶対パス: {abs_file_path}")
+            # self.log(f"絶対パス: {abs_file_path}")
             
             # 旧ストリーマーの参照を保持
             old_streamer = self.streamer
@@ -1040,24 +1042,25 @@ class App:
                 self.log("エラー: 現在アクティブなストリーマーがありません")
                 return
             
-            # 現在のPTSを取得（フレーム同期用）
+            # 現在のPTSを取得
             with old_streamer.pts_lock:
                 current_pts = old_streamer.current_frame_pts
             
-            self.log(f"[SYNC] 旧ストリーマーPTS取得: {current_pts:.3f}秒")
+            # 詳細ログ省略
+            # self.log(f"[SYNC] 旧ストリーマーPTS取得: {current_pts:.3f}秒")
             
             # ローカルファイルパスを設定
             self.local_video_path = abs_file_path
             
-            # 同期目標PTSを計算（15フレーム分のバッファを加算）
+            # 同期目標PTSを計算
             buffer_frames = 15
             fps = old_streamer.detected_fps if old_streamer.detected_fps > 0 else 30
             buffer_time = buffer_frames / fps
             sync_target_pts = current_pts + buffer_time
             
-            self.log(f"[SYNC] 同期目標PTS: {sync_target_pts:.3f}秒 ({buffer_frames}フレームバッファ, FPS={fps})")
+            # self.log(f"[SYNC] 同期目標PTS: {sync_target_pts:.3f}秒 ({buffer_frames}フレームバッファ, FPS={fps})")
             
-            # フレーム同期による切り替え処理（ブラックアウト防止版）
+            # フレーム同期による切り替え処理
             def prepare_and_switch():
                 try:
                     # キャンセルチェック
@@ -1068,11 +1071,11 @@ class App:
                     # === フェーズ1: 新ストリーマーを先に準備 ===
                     self.log("新しいローカルストリーマーを準備中...")
                     
-                    # 旧ストリーマーの解像度を引き継ぐ（OBSでのズレ防止）
+                    # 旧ストリーマーの解像度を引き継ぐ（ログ省略）
                     old_resolution = None
                     if old_streamer and hasattr(old_streamer, 'width') and hasattr(old_streamer, 'height'):
                         old_resolution = (old_streamer.width, old_streamer.height)
-                        self.log(f"[SYNC] 旧ストリーマーの解像度を引き継ぎ: {old_resolution[0]}x{old_resolution[1]}")
+                        # self.log(f"[SYNC] 旧ストリーマーの解像度を引き継ぎ: {old_resolution[0]}x{old_resolution[1]}")
                     
                     max_res, manual_res = self._get_resolution_settings()
                     
@@ -1131,35 +1134,30 @@ class App:
                     # 指定PTSで自動的に一時停止するように設定
                     new_streamer.pause_at_pts(target_switch_pts)
                     
-                    self.log(f"[SYNC] 新ストリーマーを{target_switch_pts:.3f}秒にシーク...")
+                    # self.log(f"[SYNC] 新ストリーマーを{target_switch_pts:.3f}秒にシーク...")
                     new_streamer.seek(target_switch_pts)
                     
                     # === フェーズ5: 新ストリーマーが目標PTSに到達（一時停止）するまで待機 ===
-                    self.log("[SYNC] 新ストリーマーの準備（シーク＆プリロード）を待機中...")
+                    # self.log("[SYNC] 新ストリーマーの準備（シーク＆プリロード）を待機中...")
                     
                     # タイムアウト10秒で待機
-                    # wait_for_ptsは「到達」を確認するが、pause_at_ptsにより到達直後に一時停止する
                     if new_streamer.wait_for_pts(target_switch_pts, timeout=10.0):
-                        self.log("[SYNC] 新ストリーマー準備完了（一時停止中）")
+                        # self.log("[SYNC] 新ストリーマー準備完了（一時停止中）")
+                        pass
                     else:
-                        self.log("[SYNC] 警告: 新ストリーマーの準備がタイムアウトしました。同期がずれる可能性があります。")
+                        self.log("[SYNC] 警告: 新ストリーマーの準備がタイムアウトしました")
                     
                     # === フェーズ6: 旧ストリーマーが目標PTSに到達するのを監視 ===
-                    self.log(f"[SYNC] 旧ストリーマーが目標PTS({target_switch_pts:.3f}秒)に到達するのを待機中...")
+                    # self.log(f"[SYNC] 旧ストリーマーが目標PTS({target_switch_pts:.3f}秒)に到達するのを待機中...")
                     
                     wait_start = time.time()
                     while (time.time() - wait_start) < 10.0:
                         with old_streamer.pts_lock:
                             current_old = old_streamer.current_frame_pts
                         
-                        # 残り時間をログ出力（デバッグ用）
-                        # diff = target_switch_pts - current_old
-                        # if diff < 0.5: self.log(f"[SYNC] 残り: {diff:.3f}秒")
-                        
                         # 目標PTSに到達（または通過）したら切り替え
-                        # 少し早め（0.05秒前）にトリガーして遅延を相殺
                         if current_old >= target_switch_pts - 0.05:
-                            self.log(f"[SYNC] 到達確認: 旧PTS={current_old:.3f}秒")
+                            # self.log(f"[SYNC] 到達確認: 旧PTS={current_old:.3f}秒")
                             break
                         
                         time.sleep(0.01)
@@ -1180,7 +1178,7 @@ class App:
                     with new_streamer.pts_lock:
                         final_new_pts = new_streamer.current_frame_pts
                     
-                    self.log(f"[SYNC] 最終状態: 目標={target_switch_pts:.3f}秒, 実際={final_new_pts:.3f}秒")
+                    # self.log(f"[SYNC] 最終状態: 目標={target_switch_pts:.3f}秒, 実際={final_new_pts:.3f}秒")
                     
                     # === フェーズ8: 完了処理 ===
                     # 最終キャンセルチェック
@@ -1194,12 +1192,10 @@ class App:
                     self._new_streamer = None  # 参照をクリア
                     
                     # 同期精度計算（参考）
-                    # 待ち伏せ戦略なので、理論上は target_switch_pts と final_new_pts は一致するはず
-                    # 実際の切り替えタイミングでの旧PTSと比較
                     pts_diff = abs(current_old - final_new_pts)
                     frame_diff = pts_diff * fps
                     
-                    self.log(f"[SYNC] 同期完了 - 旧PTS(直前)={current_old:.3f}秒, 新PTS={final_new_pts:.3f}秒, 差分={frame_diff:.2f}フレーム")
+                    self.log(f"[SYNC] 同期切替完了 (精度: {frame_diff:.2f}フレーム)")
                     
                     # ステータス更新
                     original_url_display = self.original_url if self.original_url else "不明"
