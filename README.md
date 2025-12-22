@@ -14,6 +14,8 @@ ytdlpSpout は、YouTube 動画をダウンロードして Spout（Windows 用�
 - GUI（グラフィカル）インターフェース
 - 日本語対応
 
+> **詳細な機能比較**: GUI版とCLI版の機能差分については [FEATURES.md](FEATURES.md) を参照してください。
+
 ## 必要な環境
 
 - Windows 10/11

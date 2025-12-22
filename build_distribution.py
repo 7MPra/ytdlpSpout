@@ -18,6 +18,8 @@ from datetime import datetime
 # 設定
 # BtbN/FFmpeg-Buildsの最新リリースURL（latestタグを使用）
 FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+# yt-dlpの最新リリースURL
+YT_DLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 DIST_DIR = "dist_package"
 BIN_DIR = "bin"
 
@@ -70,6 +72,22 @@ def download_ffmpeg():
     finally:
         # 一時ディレクトリを削除
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+def download_yt_dlp():
+    """yt-dlp.exeをダウンロード"""
+    print("yt-dlpをダウンロード中...")
+    
+    bin_dir = Path(DIST_DIR) / BIN_DIR
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    
+    yt_dlp_path = bin_dir / "yt-dlp.exe"
+    
+    try:
+        urllib.request.urlretrieve(YT_DLP_URL, yt_dlp_path)
+        print(f"yt-dlp.exeを配置: {yt_dlp_path}")
+    except Exception as e:
+        print(f"yt-dlpダウンロードエラー: {e}")
+        raise
 
 def build_exe():
     """PyInstallerでexeをビルド"""
@@ -143,6 +161,20 @@ def create_distribution():
     else:
         print("警告: LICENSEファイルが見つかりません")
     
+    # dataフォルダを作成（cookies.txtのプレースホルダ）
+    data_dir = dist_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    # cookies.txtをコピー（存在する場合）
+    cookies_src = Path("data") / "cookies.txt"
+    if cookies_src.exists():
+        shutil.copy2(cookies_src, data_dir / "cookies.txt")
+        print(f"cookies.txtを配置: {data_dir / 'cookies.txt'}")
+    else:
+        # プレースホルダファイルを作成
+        placeholder = data_dir / "cookies.txt"
+        placeholder.write_text("# Netscape HTTP Cookie File\n# 認証が必要な場合はここにcookiesを配置\n", encoding="utf-8")
+        print(f"cookies.txtプレースホルダを作成: {placeholder}")
+    
     # READMEを作成
     readme_content = """# ytdlpSpout - YouTube to Spout Streamer
 
@@ -150,6 +182,7 @@ def create_distribution():
 - ytdlpSpoutGUI.exe (GUI版アプリケーション)
 - ytdlpSpoutCLI.exe (コマンドライン版)
 - bin/ffmpeg.exe (動画処理用)
+- bin/yt-dlp.exe (動画ダウンロード用)
 - bin/*.dll (ffmpeg依存ライブラリ)
 - LICENSE.txt (MITライセンス)
 
@@ -182,8 +215,8 @@ ytdlpSpoutCLI.exe --help
 - yt-dlpはexeに埋め込まれているため、別途インストール不要です
 
 ## トラブルシューティング
-- ffmpegが見つからない場合は、binフォルダの配置を確認してください
-- システムにffmpegがインストールされている場合は、そちらが使用されます
+- ffmpegやyt-dlpが見つからない場合は、binフォルダの配置を確認してください
+- システムにffmpegやyt-dlpがインストールされている場合は、そちらが使用されることがあります
 
 ## 再配布について
 このソフトウェアはMITライセンスの下で配布されており、自由に再配布できます。
@@ -252,7 +285,10 @@ def main():
         # 3. ffmpegをダウンロード・配置
         download_ffmpeg()
         
-        # 4. ZIP圧縮
+        # 4. yt-dlpをダウンロード・配置
+        download_yt_dlp()
+        
+        # 5. ZIP圧縮
         zip_file = create_zip_package()
         
         print("\n=== 完了 ===")
