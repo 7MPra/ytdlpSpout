@@ -161,19 +161,7 @@ def create_distribution():
     else:
         print("警告: LICENSEファイルが見つかりません")
     
-    # dataフォルダを作成（cookies.txtのプレースホルダ）
-    data_dir = dist_path / "data"
-    data_dir.mkdir(exist_ok=True)
-    # cookies.txtをコピー（存在する場合）
-    cookies_src = Path("data") / "cookies.txt"
-    if cookies_src.exists():
-        shutil.copy2(cookies_src, data_dir / "cookies.txt")
-        print(f"cookies.txtを配置: {data_dir / 'cookies.txt'}")
-    else:
-        # プレースホルダファイルを作成
-        placeholder = data_dir / "cookies.txt"
-        placeholder.write_text("# Netscape HTTP Cookie File\n# 認証が必要な場合はここにcookiesを配置\n", encoding="utf-8")
-        print(f"cookies.txtプレースホルダを作成: {placeholder}")
+
     
     # READMEを作成
     readme_content = """# ytdlpSpout - YouTube to Spout Streamer
