@@ -8,14 +8,13 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import customtkinter as ctk
 import tkinter as tk
-import tkinter.font as tkfont
 import yt_dlp
+import SpoutGL
 from PIL import Image
 
 from ytdlpSpout.core import (
@@ -25,233 +24,25 @@ from ytdlpSpout.core import (
     get_optimal_format_string,
 )
 
+# 分離したGUIモジュールからのインポート
+from ytdlpSpout_gui.constants import (
+    UIConfig,
+    PREFERRED_JAPANESE_FONTS,
+    PREFERRED_MONOSPACE_FONTS,
+)
+from ytdlpSpout_gui.fonts import get_best_japanese_font, get_best_monospace_font
+from ytdlpSpout_gui.logger import YtdlpLogger
+from ytdlpSpout_gui.utils import clean_playlist_url
+
 if TYPE_CHECKING:
     import numpy as np
 
-
-def clean_playlist_url(url: str) -> str:
-    """
-    プレイリストURLから単体動画URLに変換
-    プレイリストパラメータ（list, playlist）を除去
-    """
-    try:
-        # URLをパース
-        parsed = urlparse(url)
-        query_params = parse_qs(parsed.query)
-        
-        # プレイリストパラメータを除去
-        playlist_params = ['list', 'playlist', 'pl']
-        for param in playlist_params:
-            if param in query_params:
-                del query_params[param]
-        
-        # パラメータを再構築
-        new_query = urlencode(query_params, doseq=True)
-        
-        # URLを再構築
-        new_parsed = parsed._replace(query=new_query)
-        cleaned_url = urlunparse(new_parsed)
-        
-        # 元のURLと異なる場合はログ出力
-        if cleaned_url != url:
-            print(f"プレイリストURL変換: {url} -> {cleaned_url}")
-        
-        return cleaned_url
-        
-    except Exception as e:
-        print(f"URL変換エラー: {e}")
-        return url  # エラー時は元のURLをそのまま返す
-
-
-class YtdlpLogger:
-    """yt-dlp用のカスタムロガー：ログをGUIにリダイレクト"""
-    def __init__(self, log_callback: Callable[[str], None] | None) -> None:
-        self.log_callback = log_callback
-        self.last_log_time: float = 0
-        self.log_throttle_interval: float = 0.05  # 50ms間隔
-        self.debug_start_time: float = time.time()
-        
-    def _should_log(self, msg: str | None) -> bool:
-        """ログ出力の制限を判定"""
-        current_time = time.time()
-        
-        # デバッグ用：重要なキーワードは必ず通す
-        if msg and any(keyword in msg.lower() for keyword in [
-            'downloading', 'format', 'merging', 'writing', 'finished',
-            'error', 'warning', 'connection', 'timeout'
-        ]):
-            return True
-        
-        # 署名関数やキャッシュ関連のデバッグログは抑制
-        if msg and any(keyword in msg.lower() for keyword in [
-            'signature function', 'sigfuncs', 'nsig', 'decrypted nsig',
-            'loading youtube-', 'extracting signature', 'from cache',
-            'no supported javascript runtime', 'some web_safari client', 'some web client'
-        ]):
-            return False
-            
-        # 時間制限チェック（より短い間隔で詳細ログ）
-        if current_time - self.last_log_time < self.log_throttle_interval:
-            return False
-            
-        self.last_log_time = current_time
-        return True
-    
-    def _log_with_timing(self, level: str, msg: str | None) -> bool:
-        """タイミング情報付きでログ出力"""
-        if self.log_callback and msg:
-            elapsed = time.time() - self.debug_start_time
-            
-            # より多くのメッセージをタイミング付きで出力
-            if any(keyword in msg.lower() for keyword in [
-                'downloading tv simply player api json',
-                'downloading 1 format(s)',
-                'format selection',
-                'merged format',
-                'writing',
-                'merging',
-                'finished',
-                'post-processing'
-            ]):
-                self.log_callback(f"[{elapsed:.3f}s] [{level}] {msg}")
-                return True
-                
-        return False
-    
-    def debug(self, msg):
-        # タイミング重要なメッセージは必ず出力
-        if self._log_with_timing("DEBUG", msg):
-            return
-            
-        # より多くのデバッグメッセージを表示
-        if self.log_callback and msg and self._should_log(msg):
-            self.log_callback(f"[yt-dlp DEBUG] {msg}")
-    
-    def info(self, msg):
-        if self._log_with_timing("INFO", msg):
-            return
-            
-        if self.log_callback and msg and self._should_log(msg):
-            self.log_callback(f"[yt-dlp] {msg}")
-    
-    def warning(self, msg):
-        if self.log_callback and msg:
-            self.log_callback(f"[yt-dlp WARNING] {msg}")
-    
-    def error(self, msg):
-        if self.log_callback and msg:
-            self.log_callback(f"[yt-dlp ERROR] {msg}")
-    
-    # yt-dlpが期待する可能性のある追加メソッド
-    def critical(self, msg):
-        if self.log_callback and msg:
-            self.log_callback(f"[yt-dlp CRITICAL] {msg}")
-    
-    def log(self, level, msg):
-        """汎用ログメソッド"""
-        if self._log_with_timing(f"L{level}", msg):
-            return
-            
-        if self.log_callback and msg and self._should_log(msg):
-            self.log_callback(f"[yt-dlp L{level}] {msg}")
 
 # SSL証明書の設定（Windows環境での証明書問題を回避）
 try:
     ssl._create_default_https_context = ssl._create_unverified_context
 except AttributeError:
     pass  # 古いPythonバージョンでは無視
-
-
-# =============================================================================
-# 定数定義
-# =============================================================================
-
-class UIConfig:
-    """アプリケーションUI設定定数"""
-    # ウィンドウ設定
-    WINDOW_TITLE = "ytdlpSpout GUI"
-    INITIAL_SIZE = "650x650"
-    MIN_WIDTH = 600
-    MIN_HEIGHT = 500
-    
-    # プレビュー・ログエリアの最小高さ
-    PREVIEW_MIN_HEIGHT = 120
-    LOG_MIN_HEIGHT = 80
-    
-    # フォントサイズ
-    FONT_SIZE_NORMAL = 12
-    FONT_SIZE_SMALL = 11
-    FONT_SIZE_LARGE = 14
-    FONT_SIZE_TITLE = 16
-    
-    # 色設定
-    PROGRESS_BAR_COLOR = "#ff6b00"
-    PROGRESS_FRAME_BG = "#2b2b2b"
-    PROGRESS_FRAME_BORDER = "#404040"
-    PANED_BG = "#212121"
-    
-    # ステータス色（シークバーノブ）
-    SEEKBAR_KNOB_STANDBY = "#565b5e"       # 待機中（グレー）
-    SEEKBAR_KNOB_DOWNLOADING = "#ff6b00"   # ダウンロード中/ストリーミング中（オレンジ）
-    SEEKBAR_KNOB_LOCAL = "#1f6aa5"         # ローカル再生中（水色）
-    
-    # 更新間隔 (ms)
-    PREVIEW_UPDATE_INTERVAL = 50  # 20fps
-    LOG_PROCESS_INTERVAL = 25
-    SASH_SETUP_DELAY = 100
-    
-    # パフォーマンス設定
-    DEFAULT_MAX_RESOLUTION = (2560, 1440)  # 1440p制限
-    
-    # デフォルト値
-    DEFAULT_MAX_WIDTH = "1920"
-    DEFAULT_MAX_HEIGHT = "1080"
-    
-    # シークバー最小高さ
-    SEEKBAR_MIN_HEIGHT = 35
-    
-
-# 優先フォントリスト
-PREFERRED_JAPANESE_FONTS = (
-    "Yu Gothic UI",      # Windows 10/11
-    "BIZ UDPGothic",     # Windows 11
-    "Noto Sans CJK JP",  # Google Noto
-    "Noto Sans JP",      # Google Noto別名
-    "Hiragino Sans",     # macOS
-    "Yu Gothic",         # フォールバック
-    "Meiryo UI",
-    "Meiryo",
-    "MS Gothic",
-)
-
-PREFERRED_MONOSPACE_FONTS = (
-    "BIZ UDGothic",      # Windows 11日本語等幅
-    "MS Gothic",         # 日本語対応等幅
-    "Noto Sans Mono CJK JP",
-    "Source Han Code JP",
-    "Cascadia Code",     # Windows Terminal
-    "Consolas",          # Windows標準
-    "Courier New",
-    "monospace",
-)
-
-
-def get_best_japanese_font() -> str:
-    """システムで利用可能な最適な日本語フォントを取得"""
-    available_fonts = tkfont.families()
-    for font in PREFERRED_JAPANESE_FONTS:
-        if font in available_fonts:
-            return font
-    return "system"
-
-
-def get_best_monospace_font() -> str:
-    """システムで利用可能な最適な等幅フォントを取得（日本語対応優先）"""
-    available_fonts = tkfont.families()
-    for font in PREFERRED_MONOSPACE_FONTS:
-        if font in available_fonts:
-            return font
-    return "monospace"
 
 
 class App:
@@ -283,6 +74,9 @@ class App:
         
         # デバッグ用
         self.preview_update_disabled = False
+        
+        # 共有SpoutSender
+        self.spout_sender = None
         
         # プログレス管理用
         self._subprocess_progress_active = False
@@ -1090,10 +884,10 @@ class App:
                         max_resolution=max_res,
                         manual_resolution=manual_res,
                         loop_vod=self.vod_loop.get(),
-                        verbose=True,
                         log_cb=lambda m: self.root.after(0, self.log, m),
                         stop_cb=None,
-                        init_ok_cb=None
+                        init_ok_cb=None,
+                        external_spout_sender=self.get_shared_spout_sender(self.sender_var.get())
                     )
                     
                     # 新Streamerを保持（キャンセル用）
@@ -1116,61 +910,128 @@ class App:
                             break
                         time.sleep(0.05)
                     
+                    # 動画長チェック
+                    old_dur = getattr(old_streamer, 'duration', 0.0)
+                    new_dur = getattr(new_streamer, 'duration', 0.0)
+                    if old_dur > 0 and new_dur > 0:
+                        dur_diff = abs(old_dur - new_dur)
+                        self.log(f"[SYNC] 動画長比較: 旧={old_dur:.2f}s, 新={new_dur:.2f}s, 差={dur_diff:.2f}s")
+                        if dur_diff > 1.0:
+                            self.log(f"[SYNC] 警告: 動画の長さが {dur_diff:.2f}秒 異なります。同期位置が不正確になる可能性があります。")
+                    
                     # === フェーズ2: 新ストリーマーのSpout送信を無効化 ===
                     # シーク完了まで、新ストリーマーからのフレーム送信を抑制
                     new_streamer.set_spout_enabled(False)
                     
-                    # === フェーズ3: 未来の目標PTSを設定（待ち伏せ戦略） ===
+                    # === フェーズ3: 画像マッチングによる同期ズレ補正 ===
+                    sync_offset = 0.0
+                    try:
+                        # 旧ストリーマーの現在の画像とPTSを取得
+                        target_img = None
+                        base_pts = 0.0
+                        with old_streamer.frame_lock:
+                            if old_streamer.latest_frame_bgr is not None:
+                                target_img = old_streamer.latest_frame_bgr.copy()
+                        with old_streamer.pts_lock:
+                            base_pts = old_streamer.current_frame_pts
+                            
+                        if target_img is not None:
+                             self.log(f"[SYNC] 画像マッチング開始: 基準PTS={base_pts:.3f}秒")
+                             # 探索範囲4秒でベストマッチを探す
+                             best_pts, score, _ = new_streamer.find_best_match_pts(target_img, base_pts, search_range=4.0)
+                             
+                             # スコア（画素値の平均絶対差）が小さいほど似ている
+                             # 圧縮ノイズ等を考慮して閾値を緩和 (30.0 -> 60.0)
+                             if score < 60.0: 
+                                 sync_offset = best_pts - base_pts
+                                 self.log(f"[SYNC] マッチング成功: 検出PTS={best_pts:.3f}秒 (スコア={score:.1f}), オフセット={sync_offset:+.3f}秒")
+                             else:
+                                 # マッチング失敗時も参考情報を出す
+                                 temp_offset = best_pts - base_pts
+                                 self.log(f"[SYNC] マッチング信頼度低 (スコア={score:.1f} > 60.0) - オフセット補正なし (参考オフセット={temp_offset:+.3f}秒)")
+                    except Exception as e:
+                        self.log(f"[SYNC] 画像マッチング失敗: {e}")
+
+                    # === フェーズ4: 未来の目標PTSを設定（待ち伏せ戦略） ===
                     with old_streamer.pts_lock:
                         current_old_pts = old_streamer.current_frame_pts
                     
-                    # 旧ストリーマーの現在力 + 5秒先で待ち伏せ
-                    # ※シーク時間やバッファリング時間を考慮して余裕を持つ
-                    target_switch_pts = current_old_pts + 5.0
+                    # 旧ストリーマー基準の目標切り替え時間（現在 + 5秒）
+                    switch_trigger_pts = current_old_pts + 5.0
                     
-                    self.log(f"[SYNC] 待ち伏せ目標PTS: {target_switch_pts:.3f}秒 (現在: {current_old_pts:.3f}秒)")
+                    # 新ストリーマーがシークすべき時間（オフセット適用）
+                    seek_target_pts = switch_trigger_pts + sync_offset
                     
-                    # === フェーズ4: 新ストリーマーを目標PTSにシーク＆一時停止予約 ===
+                    self.log(f"[SYNC] 目標: 旧到達={switch_trigger_pts:.3f}秒, 新シーク={seek_target_pts:.3f}秒 (オフセット={sync_offset:+.3f}秒)")
+                    
+                    # === フェーズ5: 新ストリーマーを目標PTSにシーク＆一時停止予約 ===
                     # 指定PTSで自動的に一時停止するように設定
-                    new_streamer.pause_at_pts(target_switch_pts)
+                    new_streamer.pause_at_pts(seek_target_pts)
                     
-                    # self.log(f"[SYNC] 新ストリーマーを{target_switch_pts:.3f}秒にシーク...")
-                    new_streamer.seek(target_switch_pts)
+                    # new_streamer.seek(seek_target_pts)
+                    new_streamer.seek(seek_target_pts)
                     
-                    # === フェーズ5: 新ストリーマーが目標PTSに到達（一時停止）するまで待機 ===
+                    # === フェーズ6: 新ストリーマーが目標PTSに到達（一時停止）するまで待機 ===
                     # self.log("[SYNC] 新ストリーマーの準備（シーク＆プリロード）を待機中...")
                     
                     # タイムアウト10秒で待機
-                    if new_streamer.wait_for_pts(target_switch_pts, timeout=10.0):
+                    if new_streamer.wait_for_pts(seek_target_pts, timeout=10.0):
                         # self.log("[SYNC] 新ストリーマー準備完了（一時停止中）")
                         pass
                     else:
                         self.log("[SYNC] 警告: 新ストリーマーの準備がタイムアウトしました")
                     
-                    # === フェーズ6: 旧ストリーマーが目標PTSに到達するのを監視 ===
-                    # self.log(f"[SYNC] 旧ストリーマーが目標PTS({target_switch_pts:.3f}秒)に到達するのを待機中...")
+                    # 一時停止が実際に完了するまで待機（デコードループが停止していることを確認）
+                    pause_wait_start = time.time()
+                    while (time.time() - pause_wait_start) < 2.0:
+                        with new_streamer.pause_lock:
+                            if new_streamer.is_paused:
+                                break
+                        time.sleep(0.005)
                     
+                    # 一時停止完了後のPTSを取得（これが実際の切り替え位置）
+                    with new_streamer.pts_lock:
+                        actual_new_pts = new_streamer.current_frame_pts
+                    
+                    # 新ストリーマーの実際の停止位置から、オフセットを逆算して旧ストリーマーのトリガー位置を再調整
+                    # seek_target_pts (目標) -> actual_new_pts (実際) のズレもここで吸収
+                    # 旧トリガー = 新実際PTS - オフセット
+                    switch_trigger_pts = actual_new_pts - sync_offset
+                    self.log(f"[SYNC] 最終調整: 旧トリガー={switch_trigger_pts:.3f}秒 (新実PTS={actual_new_pts:.3f} - オフセット)")
+                    
+                    # === フェーズ7: 旧ストリーマーがトリガーPTSに到達するのを監視 ===
                     wait_start = time.time()
-                    while (time.time() - wait_start) < 10.0:
+                    switch_pts = switch_trigger_pts  # 実際の切り替えPTS
+                    while (time.time() - wait_start) < 10.0 and not self._switching_cancelled:
                         with old_streamer.pts_lock:
                             current_old = old_streamer.current_frame_pts
                         
-                        # 目標PTSに到達（または通過）したら切り替え
-                        if current_old >= target_switch_pts - 0.05:
-                            # self.log(f"[SYNC] 到達確認: 旧PTS={current_old:.3f}秒")
+                        # 目標PTSに到達（または通過）したら即切り替え
+                        if current_old >= switch_trigger_pts:
+                            switch_pts = current_old  # 実際の切り替えPTSを記録
+                            self.log(f"[SYNC] 到達確認: 旧PTS={current_old:.3f}秒 (目標={switch_trigger_pts:.3f}秒)")
                             break
                         
-                        time.sleep(0.01)
+                        time.sleep(0.005)  # より高頻度でチェック（5ms間隔）
                     
+                    # キャンセルチェック
+                    if self._switching_cancelled:
+                        self.log("切り替え処理が直前でキャンセルされました")
+                        new_streamer.stop()
+                        return
+
                     # === フェーズ7: 切り替え実行 ===
-                    # 1. 新ストリーマーのSpout送信を有効化
+                    # 順序重要: 旧ストリーマーを先に停止してから新ストリーマーを再開
+                    # これにより、新ストリーマーがフレームを進める前に旧を止められる
+                    
+                    # 1. 旧ストリーマーを即座に停止（フレーム送信を止める）
+                    old_streamer.stop()
+                    
+                    # 2. 新ストリーマーのSpout送信を有効化
                     new_streamer.set_spout_enabled(True)
                     
-                    # 2. 新ストリーマーの一時停止を解除
+                    # 3. 新ストリーマーの一時停止を解除
                     new_streamer.resume()
-                    
-                    # 3. 旧ストリーマーを停止（即座に）
-                    old_streamer.stop()
                     
                     self.log("[SYNC] 切り替え実行完了")
                     
@@ -1178,9 +1039,9 @@ class App:
                     with new_streamer.pts_lock:
                         final_new_pts = new_streamer.current_frame_pts
                     
-                    # self.log(f"[SYNC] 最終状態: 目標={target_switch_pts:.3f}秒, 実際={final_new_pts:.3f}秒")
+                    self.log(f"[SYNC] 最終状態: トリガー={switch_trigger_pts:.3f}秒, 旧最終={switch_pts:.3f}秒, 新開始={final_new_pts:.3f}秒")
                     
-                    # === フェーズ8: 完了処理 ===
+                    # === フェーズ9: 完了処理 ===
                     # 最終キャンセルチェック
                     if self._switching_cancelled:
                         self.log("切り替え処理がキャンセルされました（完了直前）")
@@ -1192,10 +1053,13 @@ class App:
                     self._new_streamer = None  # 参照をクリア
                     
                     # 同期精度計算（参考）
-                    pts_diff = abs(current_old - final_new_pts)
+                    # 補正後理想 = switch_pts + sync_offset
+                    # 実際 = final_new_pts
+                    expected_new_pts = switch_pts + sync_offset
+                    pts_diff = abs(expected_new_pts - final_new_pts)
                     frame_diff = pts_diff * fps
                     
-                    self.log(f"[SYNC] 同期切替完了 (精度: {frame_diff:.2f}フレーム)")
+                    self.log(f"[SYNC] 同期切替完了 (推定精度: {frame_diff:.2f}フレーム, オフセット適用済)")
                     
                     # ステータス更新
                     original_url_display = self.original_url if self.original_url else "不明"
@@ -1274,6 +1138,26 @@ class App:
                 
         except Exception:
             self.log_processing = False
+
+    def get_shared_spout_sender(self, sender_name: str):
+        """共有SpoutSenderを取得または作成する"""
+        if self.spout_sender is None:
+            try:
+                self.spout_sender = SpoutGL.SpoutSender()
+                self.spout_sender.createOpenGL()
+                self.spout_sender.setSenderName(sender_name)
+                self.log(f"共有SpoutSenderを作成しました: {sender_name}")
+            except Exception as e:
+                self.log(f"SpoutSender作成エラー: {e}")
+                return None
+        else:
+            try:
+                # 名前を更新（既に同じなら変化なし、だが念のため呼ぶ）
+                self.spout_sender.setSenderName(sender_name)
+            except Exception as e:
+                self.log(f"Sender名更新エラー: {e}")
+        
+        return self.spout_sender
     
     def format_time(self, seconds: float) -> str:
         """秒を HH:MM:SS 形式の文字列に変換"""
@@ -1484,7 +1368,8 @@ class App:
                 verbose=True,
                 log_cb=self._log_direct,
                 stop_cb=self.on_auto_stop,
-                init_ok_cb=self.on_stream_start_success
+                init_ok_cb=self.on_stream_start_success,
+                external_spout_sender=self.get_shared_spout_sender(sender)
             )
             self.streamer.start()
             self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_LOCAL)
@@ -1508,7 +1393,8 @@ class App:
                     loop_vod=self.vod_loop.get(),
                     log_cb=lambda m: self.root.after(0, self.log, m),
                     stop_cb=lambda: self.root.after(0, self.on_auto_stop),
-                    init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success)
+                    init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
+                    external_spout_sender=self.get_shared_spout_sender(sender)
                 )
                 self.streamer.start()
                 self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING))
@@ -1822,32 +1708,59 @@ class App:
 
     def on_stop(self, delete_local_file: bool = True, skip_ui_reset: bool = False) -> None:
         """ストリーミング停止処理"""
-        # ダウンロード中のサブプロセスをキャンセル
-        self._cancel_download()
-        
-        # 切り替え処理をキャンセル
-        self._cancel_switching()
-        
-        # 現在のStreamerを停止
-        if self.streamer:
-            self.streamer.stop()
-            self.streamer = None
-        
-        # 進捗バーを非表示にする
-        self.hide_download_progress()
-        
-        # UIリセット
-        if not skip_ui_reset:
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
-            self.info_label.configure(text="停止しました")
-            self.seek_slider.configure(state="disabled")
-            self.time_label.configure(text="--:-- / --:--")
-            self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_STANDBY)
-        
-        # ローカルファイルを削除（明示的な停止時のみ）
-        if delete_local_file:
-            self._delete_local_file_with_retry()
+        try:
+            # ダウンロード中のサブプロセスをキャンセル
+            try:
+                self._cancel_download()
+            except Exception as e:
+                self.log(f"ダウンロードキャンセル警告: {e}")
+            
+            # 切り替え処理をキャンセル
+            try:
+                self._cancel_switching()
+            except Exception as e:
+                self.log(f"切り替えキャンセル警告: {e}")
+            
+            # 現在のStreamerを停止
+            if self.streamer:
+                try:
+                    self.streamer.stop()
+                except Exception as e:
+                    self.log(f"ストリーマー停止警告: {e}")
+                finally:
+                    self.streamer = None
+            
+            # 進捗バーを非表示にする
+            self.hide_download_progress()
+            
+        finally:
+            # 共有SpoutSenderを解放（再生セッション終了のため確実に実行）
+            if self.spout_sender:
+                try:
+                    self.spout_sender.releaseSender()
+                    self.log("SpoutSenderを解放しました")
+                    del self.spout_sender
+                except Exception as e:
+                    self.log(f"Spout解放警告: {e}")
+                finally:
+                    self.spout_sender = None
+            
+            # UIリセット
+            if not skip_ui_reset:
+                self.btn_start.configure(state="normal")
+                self.btn_stop.configure(state="disabled")
+                self.info_label.configure(text="停止しました")
+                self.seek_slider.configure(state="disabled")
+                self.time_label.configure(text="--:-- / --:--")
+                self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_STANDBY)
+            
+            # ローカルファイルを削除（明示的な停止時のみ）
+            if delete_local_file:
+                self._delete_local_file_with_retry()
+            
+            # ゾンビSender防止のためGCを強制実行
+            import gc
+            gc.collect()
     
     def _delete_local_file_with_retry(self) -> None:
         """ローカルファイルを遅延リトライ付きで削除する"""
@@ -1916,6 +1829,12 @@ class App:
         """ウィンドウを閉じる時の処理"""
         try:
             self.on_stop()
+            # 共有Sender解放
+            if self.spout_sender:
+                try:
+                    self.spout_sender.releaseSender()
+                except Exception:
+                    pass
         finally:
             self.root.destroy()
 

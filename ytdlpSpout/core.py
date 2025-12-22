@@ -1,17 +1,37 @@
+"""ytdlpSpout Streamer コアモジュール"""
 
+import os
+import ssl
 import subprocess
+import sys
 import threading
 import time
-import os
-import sys
-import ssl
-import cv2
+from typing import Callable, Optional
+
 import av
+import cv2
 import numpy as np
 import SpoutGL
 import yt_dlp
-import json
-from typing import Optional, Tuple, Callable, Dict, Any
+
+# 共通モジュールからのインポート
+from .constants import (
+    DEFAULT_FPS,
+    DEFAULT_HEIGHT,
+    DEFAULT_SENDER_NAME,
+    DEFAULT_VIDEO_URL,
+    DEFAULT_WIDTH,
+    MAX_FPS,
+    MIN_FPS,
+)
+from .ffmpeg import (
+    build_ffmpeg_header_args,
+    check_av1_support,
+    find_ffmpeg_path,
+    get_executable_dir,
+    get_optimal_format_string,
+)
+from .video_info import detect_fps, detect_max_resolution
 
 # SSL証明書の設定（Windows環境での証明書問題を回避）
 try:
@@ -19,176 +39,24 @@ try:
 except Exception:
     pass
 
-# デフォルト設定
-DEFAULT_VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-DEFAULT_SENDER_NAME = "ytdlpSpoutSender"
-DEFAULT_WIDTH = 1920
-DEFAULT_HEIGHT = 1080
-DEFAULT_FPS = 30
-MAX_CONSECUTIVE_FAILURES = 3
-MIN_FPS, MAX_FPS = 15, 120
-
-def get_executable_dir() -> str:
-    """実行ファイルのディレクトリを取得"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    else:
-        # __file__ がない場合（インタラクティブモードなど）を考慮
-        try:
-            return os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            return os.getcwd()
-
-def find_ffmpeg_path(tool: str = 'ffmpeg') -> str:
-    """ffmpegまたはffprobeのパスを検索"""
-    exe_dir = get_executable_dir()
-    tool_name = f"{tool}.exe" if sys.platform == "win32" else tool
-
-    # 1. exe同階層のbinディレクトリを確認
-    bin_dir = os.path.join(exe_dir, 'bin')
-    tool_in_bin = os.path.join(bin_dir, tool_name)
-    if os.path.exists(tool_in_bin):
-        return tool_in_bin
-    
-    # 2. exe同階層を確認
-    tool_in_exe_dir = os.path.join(exe_dir, tool_name)
-    if os.path.exists(tool_in_exe_dir):
-        return tool_in_exe_dir
-    
-    # 3. システムPATHから検索
-    return tool # 見つからなければ名前だけ返す
-
-def check_av1_support() -> Tuple[bool, list[str]]:
-    """ffmpegでAV1デコードがサポートされているかチェック"""
-    try:
-        ffmpeg_path = find_ffmpeg_path('ffmpeg')
-        result = subprocess.run(
-            [ffmpeg_path, '-decoders'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        
-        if result.returncode == 0:
-            decoders_output = result.stdout.lower()
-            av1_decoders = ['libdav1d', 'libaom-av1', 'av1']
-            supported_decoders = [decoder for decoder in av1_decoders if decoder in decoders_output]
-            
-            if supported_decoders:
-                return True, supported_decoders
-            else:
-                return False, []
-        else:
-            return False, []
-            
-    except Exception:
-        return False, []
-
-def get_optimal_format_string() -> Tuple[str, str]:
-    """環境に応じた最適なフォーマット文字列を生成"""
-    av1_supported, av1_decoders = check_av1_support()
-    
-    fallback_formats = 'bestvideo+bestaudio/best'
-
-    if av1_supported:
-        format_str = (
-            # 映像のみmp4最優先
-            'bestvideo[height<=2160][height>=720][ext=mp4][acodec=none]/'
-            'bestvideo[ext=mp4][acodec=none]/'
-            # 映像のみ（他コンテナ）
-            'bestvideo[height<=2160][height>=720][acodec=none]/'
-            'bestvideo[acodec=none]/'
-            # 映像+音声mp4
-            'bestvideo[height<=2160][height>=720][ext=mp4]+bestaudio[ext=m4a]/'
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
-            # 既存の映像+音声
-            'bestvideo[height<=2160][height>=720]+bestaudio/'
-            'bestvideo[vcodec!*=av01][height<=1440][height>=720]+bestaudio/'  # AV1が重い場合のフォールバック
-            'best[height<=2160][height>=720]/'
-            'bestvideo[height>=720]+bestaudio/'
-            f'{fallback_formats}'
-        )
-        codec_info = f"AV1 supported (decoders: {', '.join(av1_decoders)}, up to 2160p)"
-    else:
-        format_str = (
-            # 映像のみmp4最優先
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720][ext=mp4][acodec=none]/'
-            'bestvideo[vcodec!*=av01][ext=mp4][acodec=none]/'
-            # 映像のみ（他コンテナ）
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720][acodec=none]/'
-            'bestvideo[vcodec!*=av01][acodec=none]/'
-            # 映像+音声mp4
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720][ext=mp4]+bestaudio[ext=m4a]/'
-            'bestvideo[vcodec!*=av01][ext=mp4]+bestaudio[ext=m4a]/'
-            # 既存の映像+音声
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720]+bestaudio/'
-            'bestvideo[vcodec!*=av01][height>=720]+bestaudio/'
-            'best[vcodec!*=av01][height>=720]/'
-            'bestvideo[height>=720]+bestaudio/'
-            f'{fallback_formats}'
-        )
-        codec_info = "AV1 not supported (H.264/VP9 preferred, up to 2160p)"
-    
-    return format_str, codec_info
-
-def build_ffmpeg_header_args(headers: dict) -> list[str]:
-    """ffmpegに渡すHTTPヘッダーを構築する"""
-    if not headers:
-        return []
-    
-    header_lines = [f"{k}: {v}" for k, v in headers.items()]
-    header_string = "\r\n".join(header_lines) + "\r\n"
-    
-    return ["-headers", header_string]
-
-def detect_fps(info: Dict[str, Any]) -> Optional[int]:
-    """yt-dlpの情報からFPSを検出する"""
-    rf = info.get("requested_formats")
-    if isinstance(rf, list):
-        for f in rf:
-            if f and f.get("vcodec") not in (None, "none") and f.get("fps"):
-                return int(round(f["fps"]))
-    if info.get("fps"):
-        return int(round(info["fps"]))
-    fmts = info.get("formats")
-    if isinstance(fmts, list):
-        fps_vals = [f.get("fps") for f in fmts if f and f.get("fps") ]
-        if fps_vals:
-            return int(round(max(fps_vals)))
-    return None
-
-def detect_max_resolution(info: Dict[str, Any]) -> Optional[Tuple[int, int]]:
-    """yt-dlpの情報から最大解像度を検出する"""
-    rf = info.get("requested_formats")
-    if isinstance(rf, list):
-        best = None
-        for f in rf:
-            if not f or f.get("vcodec") in (None, "none"):
-                continue
-            w, h = f.get("width"), f.get("height")
-            if w and h:
-                wh = (int(w), int(h))
-                if best is None or (wh[0] * wh[1]) > (best[0] * best[1]):
-                    best = wh
-        if best:
-            return best
-    if info.get("width") and info.get("height"):
-        return int(info["width"]), int(info["height"])
-    fmts = info.get("formats")
-    if isinstance(fmts, list):
-        best = None
-        for f in fmts:
-            if not f or f.get("vcodec") in (None, "none"):
-                continue
-            w, h = f.get("width"), f.get("height")
-            if w and h:
-                wh = (int(w), int(h))
-                if best is None or (wh[0] * wh[1]) > (best[0] * best[1]):
-                    best = wh
-        if best:
-            return best
-    return None
+# 後方互換性のためのエイリアス（既存コードのインポート互換）
+__all__ = [
+    "Streamer",
+    "DEFAULT_VIDEO_URL",
+    "DEFAULT_SENDER_NAME",
+    "DEFAULT_WIDTH",
+    "DEFAULT_HEIGHT", 
+    "DEFAULT_FPS",
+    "MIN_FPS",
+    "MAX_FPS",
+    "get_executable_dir",
+    "find_ffmpeg_path",
+    "check_av1_support",
+    "get_optimal_format_string",
+    "build_ffmpeg_header_args",
+    "detect_fps",
+    "detect_max_resolution",
+]
 
 
 class Streamer:
@@ -198,7 +66,8 @@ class Streamer:
                  loop_vod=False, verbose=True, 
                  log_cb=None, 
                  stop_cb=None,
-                 init_ok_cb=None):
+                 init_ok_cb=None,
+                 external_spout_sender=None):
         self.video_url = video_url
         self.sender_name = sender_name
         self.proc = None
@@ -235,21 +104,23 @@ class Streamer:
         self.frames_sent = 0
         self.first_frame_sent_time = None
         self.is_sending_frames = False
-        self.spout = None
+        self.spout = external_spout_sender
+        self.owns_spout = (external_spout_sender is None) # 外部から渡された場合は所有しない
+        
         
         # フレーム同期用（PTS: Presentation Timestamp）
         self.current_frame_pts: float = 0.0  # 現在フレームのPTS（秒）
         self.pts_lock = threading.Lock()  # PTSアクセス用ロック
         
-        # Spout送信制御（dry-run用）
+        # フレーム送信制御（dry-run用）
         self.spout_enabled: bool = True  # FalseならSpout送信をスキップ
         self.spout_enabled_lock = threading.Lock()
-        
+
         # 一時停止制御（待ち伏せ同期用）
         self.pause_request_pts: Optional[float] = None
         self.is_paused = False
         self.pause_lock = threading.Lock()
-    
+
     def set_spout_enabled(self, enabled: bool):
         """Spout送信の有効/無効を切り替える"""
         with self.spout_enabled_lock:
@@ -585,9 +456,10 @@ class Streamer:
                 if self._stop_cb:
                     self._stop_cb()
                 return False
-            self.spout = SpoutGL.SpoutSender()
-            self.spout.createOpenGL()
-            self.spout.setSenderName(self.sender_name)
+            if self.owns_spout:
+                self.spout = SpoutGL.SpoutSender()
+                self.spout.createOpenGL()
+                self.spout.setSenderName(self.sender_name)
             self.log(f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
             if self._init_ok_cb: self._init_ok_cb()
             self.log(f"VOD を検出しました。{'ループ再生' if self.loop_vod else '1回再生'}します。")
@@ -685,10 +557,12 @@ class Streamer:
                                 continue
                             except Exception as e:
                                 self.log(f"PyAVループ失敗: {e}")
-                                if self._stop_cb: self._stop_cb()
+                                if not self.stop_event.is_set() and self._stop_cb: 
+                                    self._stop_cb()
                                 break
                         else:
-                            if self._stop_cb: self._stop_cb()
+                            if not self.stop_event.is_set() and self._stop_cb: 
+                                self._stop_cb()
                             break
                     img = frame.to_ndarray(format='bgr24')
                     if img.shape[1] != self.width or img.shape[0] != self.height:
@@ -759,10 +633,12 @@ class Streamer:
                     except Exception: pass
                 if self._stop_cb: self._stop_cb()
                 return False
+                return False
             # Spout init
-            self.spout = SpoutGL.SpoutSender()
-            self.spout.createOpenGL()
-            self.spout.setSenderName(self.sender_name)
+            if self.owns_spout:
+                self.spout = SpoutGL.SpoutSender()
+                self.spout.createOpenGL()
+                self.spout.setSenderName(self.sender_name)
             self.log(f"{self.sender_name} で送信を開始しました。({self.width}x{self.height}) @ {self.detected_fps}fps")
             if self._init_ok_cb: self._init_ok_cb()
             if self.is_live:
@@ -804,6 +680,8 @@ class Streamer:
                             continue # ループの先頭に戻る
                     data = self.proc.stdout.read(frame_size)
                     if not data or len(data) < frame_size:
+                        if self.stop_event.is_set():
+                            break # ユーザー停止時はコールバックしない
                         self.log("ストリームが終了または中断しました。")
                         if not self.is_live and not self.loop_vod:
                             if self._stop_cb: self._stop_cb()
@@ -864,7 +742,80 @@ class Streamer:
         self.video_stream = None
         self.av_frame_gen = None
         if self.spout:
-            try:
-                self.spout.releaseSender()
-            except Exception as e:
-                self.log(f"Spoutの解放に失敗: {e}")
+            if self.owns_spout:
+                try:
+                    self.spout.releaseSender()
+                except Exception as e:
+                    self.log(f"Spoutの解放に失敗: {e}")
+            self.spout = None  # 参照を確実に切る
+
+    def find_best_match_pts(self, target_img_bgr, center_pts: float, search_range: float = 3.0) -> tuple[float, float, object]:
+        """
+        指定された画像に最も近いフレームを周辺から探索し、そのPTSを返す。
+        
+        Args:
+            target_img_bgr: ターゲット画像 (BGR numpy array)
+            center_pts: 探索の中心となるPTS (秒)
+            search_range: 前後の探索範囲 (秒)
+            
+        Returns:
+            (best_pts, min_score, best_frame_img)
+            - best_pts: 最も類似度が高いフレームのPTS (秒)
+            - min_score: 類似度スコア (小さいほど似ている, 0-255)
+            - best_frame_img: マッチしたフレームの画像 (確認用)
+        """
+        if not self.is_vod or not self.is_local_file or target_img_bgr is None:
+            return center_pts, float('inf'), None
+            
+        try:
+            import av
+            # 比較用にターゲット画像を縮小・グレースケール化
+            # 64x36程度あれば十分特徴を捉えられる
+            h, w = target_img_bgr.shape[:2]
+            chk_w, chk_h = 64, 36
+            target_small = cv2.resize(target_img_bgr, (chk_w, chk_h))
+            target_gray = cv2.cvtColor(target_small, cv2.COLOR_BGR2GRAY)
+            
+            best_score = float('inf')
+            best_pts = center_pts
+            best_img = None
+            
+            # 一時的にコンテナを開く (メイン再生用とは別)
+            with av.open(self.video_url) as container:
+                video_stream = next((s for s in container.streams if s.type == 'video'), None)
+                if not video_stream:
+                    return center_pts, float('inf'), None
+                
+                # 探索開始位置 (少し手前から)
+                start_time = max(0, center_pts - (search_range / 2))
+                end_time = center_pts + (search_range / 2)
+                
+                # シーク
+                pts = int(start_time / float(video_stream.time_base))
+                container.seek(pts, any_frame=False, backward=True, stream=video_stream)
+                
+                for frame in container.decode(video_stream):
+                    # 時間チェック
+                    if frame.time is None: continue
+                    if frame.time > end_time: break # 範囲外に出たら終了
+                    if frame.time < start_time: continue # シーク位置が手前すぎる場合はスキップ
+                    
+                    # 画像比較
+                    img = frame.to_ndarray(format='bgr24')
+                    small = cv2.resize(img, (chk_w, chk_h))
+                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                    
+                    # 差分計算 (Mean Absolute Difference)
+                    diff = cv2.absdiff(target_gray, gray)
+                    score = np.mean(diff)
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_pts = frame.time
+                        best_img = img
+            
+            return best_pts, best_score, best_img
+            
+        except Exception as e:
+            self.log(f"画像マッチング探索エラー: {e}")
+            return center_pts, float('inf'), None
