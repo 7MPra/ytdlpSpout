@@ -11,7 +11,8 @@ from typing import Callable, Optional
 import av
 import cv2
 import numpy as np
-import SpoutGL
+# SpoutGLは使用時に遅延インポート（C++ DLLと競合回避）
+# import SpoutGL
 import yt_dlp
 
 # 共通モジュールからのインポート
@@ -338,7 +339,11 @@ class Streamer:
         if wh:
             w, h = wh
             if self.max_resolution:
-                maxw, maxh = self.max_resolution
+                # max_resolutionが整数の場合はタプルに変換
+                if isinstance(self.max_resolution, int):
+                    maxw = maxh = self.max_resolution
+                else:
+                    maxw, maxh = self.max_resolution
                 if w > maxw or h > maxh:
                     scale = min(maxw / w, maxh / h)
                     w, h = int(w * scale), int(h * scale)
@@ -457,6 +462,7 @@ class Streamer:
                     self._stop_cb()
                 return False
             if self.owns_spout:
+                import SpoutGL  # 遅延インポート（C++ DLLとの競合回避）
                 self.spout = SpoutGL.SpoutSender()
                 self.spout.createOpenGL()
                 self.spout.setSenderName(self.sender_name)
@@ -534,6 +540,7 @@ class Streamer:
                                 # Spout送信（有効時のみ）
                                 with self.spout_enabled_lock:
                                     if self.spout_enabled:
+                                        import SpoutGL  # 遅延インポート
                                         self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                                 last_frame_time = time.perf_counter()
                                 continue  # ループ先頭に戻る（以降の通常再生へ）
@@ -602,6 +609,7 @@ class Streamer:
                     # Spout送信（有効時のみ）
                     with self.spout_enabled_lock:
                         if self.spout_enabled:
+                            import SpoutGL  # 遅延インポート
                             self.spout.sendImage(img.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                     elapsed = time.perf_counter() - last_frame_time
                     sleep_time = frame_interval - elapsed
@@ -636,6 +644,7 @@ class Streamer:
                 return False
             # Spout init
             if self.owns_spout:
+                import SpoutGL  # 遅延インポート（C++ DLLとの競合回避）
                 self.spout = SpoutGL.SpoutSender()
                 self.spout.createOpenGL()
                 self.spout.setSenderName(self.sender_name)
@@ -708,6 +717,7 @@ class Streamer:
                     # Spout送信（有効時のみ）
                     with self.spout_enabled_lock:
                         if self.spout_enabled:
+                            import SpoutGL  # 遅延インポート
                             self.spout.sendImage(frame.tobytes(), self.width, self.height, SpoutGL.enums.GL_BGR_EXT, False, 3)
                     elapsed = time.perf_counter() - last_frame_time
                     sleep_time = frame_interval - elapsed

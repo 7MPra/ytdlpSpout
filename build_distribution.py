@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 配布用パッケージを作成するスクリプト
+- C++ DLLをビルド（オプション）
 - PyInstallerでexeをビルド
 - ffmpegバイナリをダウンロード・配置
 - 配布用フォルダを作成
@@ -22,6 +23,44 @@ FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffm
 YT_DLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 DIST_DIR = "dist_package"
 BIN_DIR = "bin"
+CPP_BUILD_DIR = Path("cpp/build")
+PYTHON_DIR = Path("python")
+
+
+def build_cpp_dll(skip_if_exists=False):
+    """C++ DLL (ytdlpspout.dll) をビルド"""
+    print("C++ DLLをビルド中...")
+    
+    dll_path = CPP_BUILD_DIR / "bin" / "Release" / "ytdlpspout.dll"
+    
+    if skip_if_exists and dll_path.exists():
+        print(f"C++ DLLは既に存在します: {dll_path}")
+    else:
+        # CMakeビルド
+        if not CPP_BUILD_DIR.exists():
+            print("エラー: C++ビルドディレクトリが存在しません。先にCMakeを実行してください。")
+            print("  cd cpp && mkdir build && cd build && cmake .. && cmake --build . --config Release")
+            return False
+        
+        cmd = ["cmake", "--build", str(CPP_BUILD_DIR), "--config", "Release", "--target", "ytdlpspout"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"C++ DLLビルドエラー: {result.stderr}")
+            return False
+        
+        print("C++ DLLビルド完了")
+    
+    # DLLをpythonディレクトリにコピー
+    if dll_path.exists():
+        PYTHON_DIR.mkdir(exist_ok=True)
+        shutil.copy2(dll_path, PYTHON_DIR / "ytdlpspout.dll")
+        print(f"DLLをコピー: {PYTHON_DIR / 'ytdlpspout.dll'}")
+    else:
+        print(f"警告: DLLが見つかりません: {dll_path}")
+        return False
+    
+    return True
+
 
 def download_ffmpeg():
     """ffmpegをダウンロードして展開"""
@@ -174,6 +213,12 @@ def create_distribution():
 - bin/*.dll (ffmpeg依存ライブラリ)
 - LICENSE.txt (MITライセンス)
 
+## 特徴
+- C++ ネイティブバックエンドによる高速な動画処理
+- D3D11 ハードウェアアクセラレーションによる4K対応
+- GPUベースのNV12→RGBA変換による低遅延処理
+- スライスローディングによる効率的なストリーミング
+
 ## GUI版の使用方法
 1. ytdlpSpoutGUI.exe を実行
 2. YouTube URLを入力
@@ -197,6 +242,11 @@ ytdlpSpoutCLI.exe --help
 このソフトウェアはMITライセンスの下で配布されています。
 詳細はLICENSE.txtファイルをご確認ください。
 
+## システム要件
+- Windows 10/11 64bit
+- DirectX 11対応GPU（ハードウェアアクセラレーション用）
+- Visual C++ Redistributable 2019以降
+
 ## 注意事項
 - binフォルダとexeは同じディレクトリに配置してください
 - Spout対応アプリケーション（OBS Studio等）で受信できます
@@ -205,6 +255,7 @@ ytdlpSpoutCLI.exe --help
 ## トラブルシューティング
 - ffmpegやyt-dlpが見つからない場合は、binフォルダの配置を確認してください
 - システムにffmpegやyt-dlpがインストールされている場合は、そちらが使用されることがあります
+- 4K動画の再生が遅い場合は、GPU性能を確認してください
 
 ## 再配布について
 このソフトウェアはMITライセンスの下で配布されており、自由に再配布できます。
@@ -262,6 +313,12 @@ def main():
     print("=== ytdlpSpout 配布パッケージ作成 ===")
     
     try:
+        # 0. C++ DLLをビルド
+        if not build_cpp_dll(skip_if_exists=True):
+            print("C++ DLLビルドに失敗しました")
+            print("既存のDLLを使用するか、手動でビルドしてください")
+            # DLLがなくてもPythonバックエンドで動作可能なので続行
+        
         # 1. exeをビルド
         if not build_exe():
             print("exeビルドに失敗しました")
