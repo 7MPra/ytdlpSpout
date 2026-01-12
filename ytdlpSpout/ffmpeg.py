@@ -66,8 +66,12 @@ def check_av1_support() -> Tuple[bool, list[str]]:
         return False, []
 
 
-def get_optimal_format_string() -> Tuple[str, str]:
-    """環境に応じた最適なフォーマット文字列を生成"""
+def get_optimal_format_string(max_height: int = 2160) -> Tuple[str, str]:
+    """環境に応じた最適なフォーマット文字列を生成
+    
+    Args:
+        max_height: 最大解像度の高さ（デフォルト2160=4K、1440=WQHD、1080=FHD）
+    """
     av1_supported, av1_decoders = check_av1_support()
     
     fallback_formats = 'bestvideo+bestaudio/best'
@@ -75,41 +79,41 @@ def get_optimal_format_string() -> Tuple[str, str]:
     if av1_supported:
         format_str = (
             # 映像のみmp4最優先
-            'bestvideo[height<=2160][height>=720][ext=mp4][acodec=none]/'
+            f'bestvideo[height<={max_height}][height>=720][ext=mp4][acodec=none]/'
             'bestvideo[ext=mp4][acodec=none]/'
             # 映像のみ（他コンテナ）
-            'bestvideo[height<=2160][height>=720][acodec=none]/'
+            f'bestvideo[height<={max_height}][height>=720][acodec=none]/'
             'bestvideo[acodec=none]/'
             # 映像+音声mp4
-            'bestvideo[height<=2160][height>=720][ext=mp4]+bestaudio[ext=m4a]/'
+            f'bestvideo[height<={max_height}][height>=720][ext=mp4]+bestaudio[ext=m4a]/'
             'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
             # 既存の映像+音声
-            'bestvideo[height<=2160][height>=720]+bestaudio/'
-            'bestvideo[vcodec!*=av01][height<=1440][height>=720]+bestaudio/'  # AV1が重い場合のフォールバック
-            'best[height<=2160][height>=720]/'
+            f'bestvideo[height<={max_height}][height>=720]+bestaudio/'
+            f'bestvideo[vcodec!*=av01][height<={min(max_height, 1440)}][height>=720]+bestaudio/'  # AV1が重い場合のフォールバック
+            f'best[height<={max_height}][height>=720]/'
             'bestvideo[height>=720]+bestaudio/'
             f'{fallback_formats}'
         )
-        codec_info = f"AV1 supported (decoders: {', '.join(av1_decoders)}, up to 2160p)"
+        codec_info = f"AV1 supported (decoders: {', '.join(av1_decoders)}, up to {max_height}p)"
     else:
         format_str = (
             # 映像のみmp4最優先
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720][ext=mp4][acodec=none]/'
+            f'bestvideo[vcodec!*=av01][height<={max_height}][height>=720][ext=mp4][acodec=none]/'
             'bestvideo[vcodec!*=av01][ext=mp4][acodec=none]/'
             # 映像のみ（他コンテナ）
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720][acodec=none]/'
+            f'bestvideo[vcodec!*=av01][height<={max_height}][height>=720][acodec=none]/'
             'bestvideo[vcodec!*=av01][acodec=none]/'
             # 映像+音声mp4
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720][ext=mp4]+bestaudio[ext=m4a]/'
+            f'bestvideo[vcodec!*=av01][height<={max_height}][height>=720][ext=mp4]+bestaudio[ext=m4a]/'
             'bestvideo[vcodec!*=av01][ext=mp4]+bestaudio[ext=m4a]/'
             # 既存の映像+音声
-            'bestvideo[vcodec!*=av01][height<=2160][height>=720]+bestaudio/'
+            f'bestvideo[vcodec!*=av01][height<={max_height}][height>=720]+bestaudio/'
             'bestvideo[vcodec!*=av01][height>=720]+bestaudio/'
-            'best[vcodec!*=av01][height>=720]/'
+            f'best[vcodec!*=av01][height>=720]/'
             'bestvideo[height>=720]+bestaudio/'
             f'{fallback_formats}'
         )
-        codec_info = "AV1 not supported (H.264/VP9 preferred, up to 2160p)"
+        codec_info = f"AV1 not supported (H.264/VP9 preferred, up to {max_height}p)"
     
     return format_str, codec_info
 

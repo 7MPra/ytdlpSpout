@@ -14,7 +14,8 @@ import cv2
 import customtkinter as ctk
 import tkinter as tk
 import yt_dlp
-import SpoutGL
+# SpoutGLは使用しない（C++ DLLがSpout送信を担当）
+# import SpoutGL
 from PIL import Image
 
 from ytdlpSpout.core import (
@@ -33,6 +34,34 @@ from ytdlpSpout_gui.constants import (
 from ytdlpSpout_gui.fonts import get_best_japanese_font, get_best_monospace_font
 from ytdlpSpout_gui.logger import YtdlpLogger
 from ytdlpSpout_gui.utils import clean_playlist_url
+
+# =============================================================================
+# C++ DLLバックエンド切り替え設定
+# =============================================================================
+# True: C++ DLLを使用（高パフォーマンス、要ビルド済みDLL）
+# False: Python Streamerを使用（従来の動作）
+USE_NATIVE_BACKEND = True
+
+# NativeStreamerWrapper のインポート
+NATIVE_BACKEND_AVAILABLE = False
+if USE_NATIVE_BACKEND:
+    try:
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+        NATIVE_BACKEND_AVAILABLE = True
+        print("[INFO] C++ DLLバックエンドが利用可能です")
+    except ImportError as e:
+        print(f"[WARNING] NativeStreamerWrapper import failed: {e}")
+        print("[WARNING] Falling back to Python Streamer")
+        USE_NATIVE_BACKEND = False
+
+# YtDlpAsyncResolver のインポート（非同期URL解決用）
+YTDLP_RESOLVER_AVAILABLE = False
+try:
+    from python.ytdlp_resolver import YtDlpAsyncResolver, ResolvedInfo
+    YTDLP_RESOLVER_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARNING] YtDlpAsyncResolver import failed: {e}")
+# =============================================================================
 
 if TYPE_CHECKING:
     import numpy as np
@@ -84,11 +113,9 @@ class App:
         self._download_cancelled = False  # ダウンロードキャンセルフラグ
         self.current_seekbar_knob_color = UIConfig.SEEKBAR_KNOB_STANDBY  # 現在のシークバーノブ色
         
-        # 切り替え処理管理用
-        self._switching_in_progress = False  # 切り替え処理中フラグ
-        self._switching_cancelled = False  # 切り替えキャンセルフラグ
-        self._switching_thread: threading.Thread | None = None  # 切り替えスレッド
-        self._new_streamer: Streamer | None = None  # 切り替え中の新Streamer
+        # yt-dlp非同期リゾルバー（URL解決中のインスタンス保持）
+        self._ytdlp_resolver: YtDlpAsyncResolver | None = None
+        self._url_resolving = False  # URL解決中フラグ
         
         # プログレスデータ初期化
         self.download_progress: dict[str, Any] = self._create_empty_progress()
@@ -522,33 +549,6 @@ class App:
         except Exception:
             pass
     
-    def _cancel_switching(self) -> None:
-        """切り替え処理をキャンセルする"""
-        if not self._switching_in_progress:
-            return
-        
-        self.log("切り替え処理をキャンセル中...")
-        self._switching_cancelled = True
-        
-        # 新しいStreamerが作成されていれば停止
-        if self._new_streamer is not None:
-            try:
-                self._new_streamer.stop()
-                self.log("新しいStreamerを停止しました")
-            except Exception as e:
-                self.log(f"新Streamer停止エラー: {e}")
-            finally:
-                self._new_streamer = None
-        
-        # 切り替えスレッドの完了を待機（最大1秒）
-        if self._switching_thread and self._switching_thread.is_alive():
-            self._switching_thread.join(timeout=1.0)
-            if self._switching_thread.is_alive():
-                self.log("警告: 切り替えスレッドがタイムアウトしました")
-        
-        self._switching_in_progress = False
-        self._switching_thread = None
-
     def _find_yt_dlp_executable(self) -> str:
         """yt-dlp実行ファイルのパスを検索（exe環境対応）"""
         from ytdlpSpout.core import get_executable_dir
@@ -625,8 +625,17 @@ class App:
                 yt_dlp_path = self._find_yt_dlp_executable()
                 self.root.after(0, self.log, f"yt-dlp パス: {yt_dlp_path}")
                 
+                # ストリーミング時の解像度を取得してダウンロード解像度を制限
+                # （4Kデコードは重いので、ストリーミング時と同じ解像度でダウンロード）
+                max_download_height = 1440  # デフォルト
+                if self.streamer and hasattr(self.streamer, 'height'):
+                    streaming_height = self.streamer.height
+                    if streaming_height > 0:
+                        max_download_height = streaming_height
+                        self.root.after(0, self.log, f"ダウンロード解像度制限: {max_download_height}p (ストリーミング解像度に合わせる)")
+                
                 # フォーマット文字列を取得
-                format_str, codec_info = get_optimal_format_string()
+                format_str, codec_info = get_optimal_format_string(max_height=max_download_height)
                 self.root.after(0, self.log, f"フォーマット設定: {codec_info}")
                 
                 # yt-dlp コマンドを構築（CLIモード、進捗出力付き）
@@ -811,297 +820,78 @@ class App:
         threading.Thread(target=run_subprocess, daemon=True).start()
     
     def switch_to_local_file(self, file_path: str):
-        """ダウンロード完了後にローカルファイルへシームレスに切り替え（フレーム同期版）"""
+        """ダウンロード完了後にローカルファイルへ切り替え（簡略版）
+        
+        C++ DLLバックエンドではスライスローディングにより
+        シームレス切り替えが不要になったため、単純な切り替えを行う。
+        """
         try:
-            # 切り替え中フラグをセット
-            self._switching_in_progress = True
-            self._switching_cancelled = False
-            
-            # シークバーを無効化（切り替え中の操作を防ぐ）
-            self.root.after(0, lambda: self.seek_slider.configure(state="disabled"))
-            
-            self.log(f"シームレス切り替え開始: {file_path}")
+            self.log(f"ローカルファイルへの切り替え開始: {file_path}")
             
             if not os.path.exists(file_path):
                 self.log(f"エラー: ローカルファイルが見つかりません: {file_path}")
                 return
             
-            # ファイルの絶対パスを取得（ログ省略）
             abs_file_path = os.path.abspath(file_path)
-            # self.log(f"絶対パス: {abs_file_path}")
-            
-            # 旧ストリーマーの参照を保持
-            old_streamer = self.streamer
-            if not old_streamer:
-                self.log("エラー: 現在アクティブなストリーマーがありません")
-                return
-            
-            # 現在のPTSを取得
-            with old_streamer.pts_lock:
-                current_pts = old_streamer.current_frame_pts
-            
-            # 詳細ログ省略
-            # self.log(f"[SYNC] 旧ストリーマーPTS取得: {current_pts:.3f}秒")
-            
-            # ローカルファイルパスを設定
             self.local_video_path = abs_file_path
             
-            # 同期目標PTSを計算
-            buffer_frames = 15
-            fps = old_streamer.detected_fps if old_streamer.detected_fps > 0 else 30
-            buffer_time = buffer_frames / fps
-            sync_target_pts = current_pts + buffer_time
-            
-            # self.log(f"[SYNC] 同期目標PTS: {sync_target_pts:.3f}秒 ({buffer_frames}フレームバッファ, FPS={fps})")
-            
-            # フレーム同期による切り替え処理
-            def prepare_and_switch():
+            # 旧ストリーマーの現在位置を取得
+            current_position = 0.0
+            old_streamer = self.streamer
+            if old_streamer:
                 try:
-                    # キャンセルチェック
-                    if self._switching_cancelled:
-                        self.log("切り替え処理がキャンセルされました")
-                        return
-                    
-                    # === フェーズ1: 新ストリーマーを先に準備 ===
-                    self.log("新しいローカルストリーマーを準備中...")
-                    
-                    # 旧ストリーマーの解像度を引き継ぐ（ログ省略）
-                    old_resolution = None
-                    if old_streamer and hasattr(old_streamer, 'width') and hasattr(old_streamer, 'height'):
-                        old_resolution = (old_streamer.width, old_streamer.height)
-                        # self.log(f"[SYNC] 旧ストリーマーの解像度を引き継ぎ: {old_resolution[0]}x{old_resolution[1]}")
-                    
-                    max_res, manual_res = self._get_resolution_settings()
-                    
-                    # 旧ストリーマーの解像度を優先
-                    if old_resolution:
-                        manual_res = old_resolution
-                    
-                    from ytdlpSpout.core import Streamer
-                    new_streamer = Streamer(
-                        abs_file_path,
-                        self.sender_var.get(),
-                        max_resolution=max_res,
-                        manual_resolution=manual_res,
-                        loop_vod=self.vod_loop.get(),
-                        log_cb=lambda m: self.root.after(0, self.log, m),
-                        stop_cb=None,
-                        init_ok_cb=None,
-                        external_spout_sender=self.get_shared_spout_sender(self.sender_var.get())
-                    )
-                    
-                    # 新Streamerを保持（キャンセル用）
-                    self._new_streamer = new_streamer
-                    
-                    # キャンセルチェック
-                    if self._switching_cancelled:
-                        self.log("切り替え処理がキャンセルされました（新Streamer作成後）")
-                        new_streamer.stop()
-                        return
-                    
-                    self.log("新しいストリーマーを開始中...")
-                    new_streamer.start()
-                    
-                    # Spout初期化待ち
-                    init_wait_start = time.time()
-                    while (time.time() - init_wait_start) < 3.0:
-                        if (hasattr(new_streamer, 'spout') and new_streamer.spout is not None and
-                            hasattr(new_streamer, 'detected_fps') and new_streamer.detected_fps > 0):
-                            break
-                        time.sleep(0.05)
-                    
-                    # 動画長チェック
-                    old_dur = getattr(old_streamer, 'duration', 0.0)
-                    new_dur = getattr(new_streamer, 'duration', 0.0)
-                    if old_dur > 0 and new_dur > 0:
-                        dur_diff = abs(old_dur - new_dur)
-                        self.log(f"[SYNC] 動画長比較: 旧={old_dur:.2f}s, 新={new_dur:.2f}s, 差={dur_diff:.2f}s")
-                        if dur_diff > 1.0:
-                            self.log(f"[SYNC] 警告: 動画の長さが {dur_diff:.2f}秒 異なります。同期位置が不正確になる可能性があります。")
-                    
-                    # === フェーズ2: 新ストリーマーのSpout送信を無効化 ===
-                    # シーク完了まで、新ストリーマーからのフレーム送信を抑制
-                    new_streamer.set_spout_enabled(False)
-                    
-                    # === フェーズ3: 画像マッチングによる同期ズレ補正 ===
-                    sync_offset = 0.0
-                    try:
-                        # 旧ストリーマーの現在の画像とPTSを取得
-                        target_img = None
-                        base_pts = 0.0
-                        with old_streamer.frame_lock:
-                            if old_streamer.latest_frame_bgr is not None:
-                                target_img = old_streamer.latest_frame_bgr.copy()
-                        with old_streamer.pts_lock:
-                            base_pts = old_streamer.current_frame_pts
-                            
-                        if target_img is not None:
-                             self.log(f"[SYNC] 画像マッチング開始: 基準PTS={base_pts:.3f}秒")
-                             # 探索範囲4秒でベストマッチを探す
-                             best_pts, score, _ = new_streamer.find_best_match_pts(target_img, base_pts, search_range=4.0)
-                             
-                             # スコア（画素値の平均絶対差）が小さいほど似ている
-                             # 圧縮ノイズ等を考慮して閾値を緩和 (30.0 -> 60.0)
-                             if score < 60.0: 
-                                 sync_offset = best_pts - base_pts
-                                 self.log(f"[SYNC] マッチング成功: 検出PTS={best_pts:.3f}秒 (スコア={score:.1f}), オフセット={sync_offset:+.3f}秒")
-                             else:
-                                 # マッチング失敗時も参考情報を出す
-                                 temp_offset = best_pts - base_pts
-                                 self.log(f"[SYNC] マッチング信頼度低 (スコア={score:.1f} > 60.0) - オフセット補正なし (参考オフセット={temp_offset:+.3f}秒)")
-                    except Exception as e:
-                        self.log(f"[SYNC] 画像マッチング失敗: {e}")
-
-                    # === フェーズ4: 未来の目標PTSを設定（待ち伏せ戦略） ===
-                    with old_streamer.pts_lock:
-                        current_old_pts = old_streamer.current_frame_pts
-                    
-                    # 旧ストリーマー基準の目標切り替え時間（現在 + 5秒）
-                    switch_trigger_pts = current_old_pts + 5.0
-                    
-                    # 新ストリーマーがシークすべき時間（オフセット適用）
-                    seek_target_pts = switch_trigger_pts + sync_offset
-                    
-                    self.log(f"[SYNC] 目標: 旧到達={switch_trigger_pts:.3f}秒, 新シーク={seek_target_pts:.3f}秒 (オフセット={sync_offset:+.3f}秒)")
-                    
-                    # === フェーズ5: 新ストリーマーを目標PTSにシーク＆一時停止予約 ===
-                    # 指定PTSで自動的に一時停止するように設定
-                    new_streamer.pause_at_pts(seek_target_pts)
-                    
-                    # new_streamer.seek(seek_target_pts)
-                    new_streamer.seek(seek_target_pts)
-                    
-                    # === フェーズ6: 新ストリーマーが目標PTSに到達（一時停止）するまで待機 ===
-                    # self.log("[SYNC] 新ストリーマーの準備（シーク＆プリロード）を待機中...")
-                    
-                    # タイムアウト10秒で待機
-                    if new_streamer.wait_for_pts(seek_target_pts, timeout=10.0):
-                        # self.log("[SYNC] 新ストリーマー準備完了（一時停止中）")
-                        pass
-                    else:
-                        self.log("[SYNC] 警告: 新ストリーマーの準備がタイムアウトしました")
-                    
-                    # 一時停止が実際に完了するまで待機（デコードループが停止していることを確認）
-                    pause_wait_start = time.time()
-                    while (time.time() - pause_wait_start) < 2.0:
-                        with new_streamer.pause_lock:
-                            if new_streamer.is_paused:
-                                break
-                        time.sleep(0.005)
-                    
-                    # 一時停止完了後のPTSを取得（これが実際の切り替え位置）
-                    with new_streamer.pts_lock:
-                        actual_new_pts = new_streamer.current_frame_pts
-                    
-                    # 新ストリーマーの実際の停止位置から、オフセットを逆算して旧ストリーマーのトリガー位置を再調整
-                    # seek_target_pts (目標) -> actual_new_pts (実際) のズレもここで吸収
-                    # 旧トリガー = 新実際PTS - オフセット
-                    switch_trigger_pts = actual_new_pts - sync_offset
-                    self.log(f"[SYNC] 最終調整: 旧トリガー={switch_trigger_pts:.3f}秒 (新実PTS={actual_new_pts:.3f} - オフセット)")
-                    
-                    # === フェーズ7: 旧ストリーマーがトリガーPTSに到達するのを監視 ===
-                    wait_start = time.time()
-                    switch_pts = switch_trigger_pts  # 実際の切り替えPTS
-                    while (time.time() - wait_start) < 10.0 and not self._switching_cancelled:
-                        with old_streamer.pts_lock:
-                            current_old = old_streamer.current_frame_pts
-                        
-                        # 目標PTSに到達（または通過）したら即切り替え
-                        if current_old >= switch_trigger_pts:
-                            switch_pts = current_old  # 実際の切り替えPTSを記録
-                            self.log(f"[SYNC] 到達確認: 旧PTS={current_old:.3f}秒 (目標={switch_trigger_pts:.3f}秒)")
-                            break
-                        
-                        time.sleep(0.005)  # より高頻度でチェック（5ms間隔）
-                    
-                    # キャンセルチェック
-                    if self._switching_cancelled:
-                        self.log("切り替え処理が直前でキャンセルされました")
-                        new_streamer.stop()
-                        return
-
-                    # === フェーズ7: 切り替え実行 ===
-                    # 順序重要: 旧ストリーマーを先に停止してから新ストリーマーを再開
-                    # これにより、新ストリーマーがフレームを進める前に旧を止められる
-                    
-                    # 1. 旧ストリーマーを即座に停止（フレーム送信を止める）
+                    current_position = old_streamer.playback_time
+                except Exception:
+                    pass
+                
+                # 旧ストリーマーのstop_cbを無効化（新ストリーマーを誤って停止しないため）
+                old_streamer._stop_cb = None
+                
+                # 旧ストリーマーを停止
+                try:
                     old_streamer.stop()
-                    
-                    # 2. 新ストリーマーのSpout送信を有効化
-                    new_streamer.set_spout_enabled(True)
-                    
-                    # 3. 新ストリーマーの一時停止を解除
-                    new_streamer.resume()
-                    
-                    self.log("[SYNC] 切り替え実行完了")
-                    
-                    # 精度確認用の記録
-                    with new_streamer.pts_lock:
-                        final_new_pts = new_streamer.current_frame_pts
-                    
-                    self.log(f"[SYNC] 最終状態: トリガー={switch_trigger_pts:.3f}秒, 旧最終={switch_pts:.3f}秒, 新開始={final_new_pts:.3f}秒")
-                    
-                    # === フェーズ9: 完了処理 ===
-                    # 最終キャンセルチェック
-                    if self._switching_cancelled:
-                        self.log("切り替え処理がキャンセルされました（完了直前）")
-                        new_streamer.stop()
-                        return
-                    
-                    # GUIのストリーマー参照を更新
-                    self.streamer = new_streamer
-                    self._new_streamer = None  # 参照をクリア
-                    
-                    # 同期精度計算（参考）
-                    # 補正後理想 = switch_pts + sync_offset
-                    # 実際 = final_new_pts
-                    expected_new_pts = switch_pts + sync_offset
-                    pts_diff = abs(expected_new_pts - final_new_pts)
-                    frame_diff = pts_diff * fps
-                    
-                    self.log(f"[SYNC] 同期切替完了 (推定精度: {frame_diff:.2f}フレーム, オフセット適用済)")
-                    
-                    # ステータス更新
-                    original_url_display = self.original_url if self.original_url else "不明"
-                    self.root.after(0, lambda: self.info_label.configure(
-                        text=f"ローカルファイル再生中（{original_url_display} からダウンロード済み）"
-                    ))
-                    self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_LOCAL))
-                    
-                    self.log(f"[SYNC] シームレス切り替え完了: 同期精度={frame_diff:.2f}フレーム")
-                    
-                    # 進捗バーを非表示
-                    self.root.after(0, lambda: self.progress_bar.stop())  # アニメーション停止
-                    self.root.after(0, lambda: self.progress_bar.configure(mode="determinate"))  # 通常モードに戻す
-                    self.root.after(0, self.hide_download_progress)
-                    self.root.after(500, self.hide_download_progress)
-                    
-                    # 切り替え完了フラグをリセット
-                    self._switching_in_progress = False
-                    
-                    # シークバーを再有効化
-                    self.root.after(0, lambda: self.seek_slider.configure(state="normal"))
-                        
                 except Exception as e:
-                    self.log(f"シームレス切り替え準備エラー: {e}")
-                    import traceback
-                    self.log(traceback.format_exc())
-                    # エラー時もアニメーションを停止
-                    self.root.after(0, lambda: self.progress_bar.stop())
-                    self.root.after(0, lambda: self.progress_bar.configure(mode="determinate"))
-                    if 'new_streamer' in locals():
-                        new_streamer.stop()
-                    self._new_streamer = None
-                    self._switching_in_progress = False
-                    # エラー時もシークバーを再有効化
-                    self.root.after(0, lambda: self.seek_slider.configure(state="normal"))
+                    self.log(f"旧ストリーマー停止エラー: {e}")
             
-            # バックグラウンドで並行準備
-            self._switching_thread = threading.Thread(target=prepare_and_switch, daemon=True)
-            self._switching_thread.start()
+            # 新しいストリーマーを作成・開始
+            max_res, manual_res = self._get_resolution_settings()
+            
+            new_streamer = self._create_streamer(
+                abs_file_path,
+                self.sender_var.get(),
+                max_resolution=max_res,
+                manual_resolution=manual_res,
+                loop_vod=self.vod_loop.get(),
+                log_cb=lambda m: self.root.after(0, self.log, m),
+                stop_cb=self.on_auto_stop,
+                init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
+                external_spout_sender=None
+            )
+            
+            self.streamer = new_streamer
+            new_streamer.start()
+            
+            # 前の再生位置にシーク
+            if current_position > 0:
+                new_streamer.seek(current_position)
+                self.log(f"再生位置を復元: {self.format_time(current_position)}")
+            
+            # ステータス更新
+            original_url_display = self.original_url if self.original_url else "不明"
+            self.info_label.configure(
+                text=f"ローカルファイル再生中（{original_url_display} からダウンロード済み）"
+            )
+            self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_LOCAL)
+            
+            # 進捗バーを非表示
+            self.hide_download_progress()
+            
+            self.log(f"ローカルファイルへの切り替え完了: {file_path}")
             
         except Exception as e:
-            self.log(f"シームレス切り替えエラー: {e}")
+            self.log(f"ローカルファイル切り替えエラー: {e}")
+            import traceback
+            self.log(traceback.format_exc())
 
     
     def _log_direct(self, msg: str) -> None:
@@ -1140,24 +930,14 @@ class App:
             self.log_processing = False
 
     def get_shared_spout_sender(self, sender_name: str):
-        """共有SpoutSenderを取得または作成する"""
-        if self.spout_sender is None:
-            try:
-                self.spout_sender = SpoutGL.SpoutSender()
-                self.spout_sender.createOpenGL()
-                self.spout_sender.setSenderName(sender_name)
-                self.log(f"共有SpoutSenderを作成しました: {sender_name}")
-            except Exception as e:
-                self.log(f"SpoutSender作成エラー: {e}")
-                return None
-        else:
-            try:
-                # 名前を更新（既に同じなら変化なし、だが念のため呼ぶ）
-                self.spout_sender.setSenderName(sender_name)
-            except Exception as e:
-                self.log(f"Sender名更新エラー: {e}")
+        """共有SpoutSenderを取得または作成する
         
-        return self.spout_sender
+        注意: C++ DLLがSpout送信を担当するため、このメソッドは何もしない。
+        互換性のためにNoneを返す。
+        """
+        # C++ DLL (Spout有効ビルド) がSpout送信を担当
+        # Python側のSpoutGLは使用しない（競合回避）
+        return None
     
     def format_time(self, seconds: float) -> str:
         """秒を HH:MM:SS 形式の文字列に変換"""
@@ -1182,11 +962,6 @@ class App:
 
     def on_seek_press(self, event: tk.Event) -> None:
         """シークバー押下時の処理"""
-        # 切り替え中はシークを無効化
-        if self._switching_in_progress:
-            self.log("切り替え中のためシークは無効です")
-            return
-        
         if self.streamer and self.streamer.is_vod:
             self._seeking = True
             # マウスのクリック位置からスライダーの値を計算して設定
@@ -1208,12 +983,6 @@ class App:
 
     def on_seek_release(self, event: tk.Event) -> None:
         """シークバーリリース時の処理"""
-        # 切り替え中はシークを無効化
-        if self._switching_in_progress:
-            self._seeking = False
-            self.log("切り替え中のためシークは無効です")
-            return
-        
         if self.streamer and self.streamer.is_vod and self._seeking:
             self._seeking = False
             # マウスリリース時の最終的な値を元にシーク
@@ -1355,12 +1124,71 @@ class App:
         
         return max_res, manual_res
     
+    def _create_streamer(
+        self,
+        video_source: str,
+        sender: str,
+        max_resolution=None,
+        manual_resolution=None,
+        loop_vod: bool = False,
+        verbose: bool = True,
+        log_cb=None,
+        stop_cb=None,
+        init_ok_cb=None,
+        external_spout_sender=None
+    ):
+        """
+        ストリーマーを作成するファクトリメソッド
+        
+        設計案準拠: すべてC++ DLLを使用（Spout送信もC++側）
+        - ローカルファイル: C++ DLL
+        - URL: C++ DLL（YtDlpResolver + CustomIOContext経由）
+        
+        SpoutGLは使用しない（競合回避）
+        """
+        import os
+        is_local_file = os.path.exists(video_source) and os.path.isfile(video_source)
+        
+        # C++ DLLが利用可能な場合は常にNativeStreamerWrapperを使用
+        if NATIVE_BACKEND_AVAILABLE:
+            if is_local_file:
+                self.log(f"[Backend] C++ DLL（ローカルファイル）")
+            else:
+                self.log(f"[Backend] C++ DLL（URL/ストリーミング）")
+            return NativeStreamerWrapper(
+                video_url=video_source,
+                sender_name=sender,
+                max_resolution=max_resolution,
+                manual_resolution=manual_resolution,
+                loop_vod=loop_vod,
+                verbose=verbose,
+                log_cb=log_cb,
+                stop_cb=stop_cb,
+                init_ok_cb=init_ok_cb,
+                external_spout_sender=None  # C++ DLLがSpout送信を担当
+            )
+        else:
+            # C++ DLLが利用できない場合のみPython Streamerにフォールバック
+            self.log(f"[Backend] Python Streamer (fallback)")
+            return Streamer(
+                video_source,
+                sender,
+                max_resolution=max_resolution,
+                manual_resolution=manual_resolution,
+                loop_vod=loop_vod,
+                verbose=verbose,
+                log_cb=log_cb,
+                stop_cb=stop_cb,
+                init_ok_cb=init_ok_cb,
+                external_spout_sender=external_spout_sender
+            )
+    
     def _start_local_file_stream(self, file_path: str) -> None:
         """ローカルファイルからのストリーミングを開始"""
         try:
             sender = self.sender_var.get().strip() or DEFAULT_SENDER_NAME
             
-            self.streamer = Streamer(
+            self.streamer = self._create_streamer(
                 file_path, sender,
                 max_resolution=None,
                 manual_resolution=None,
@@ -1369,7 +1197,7 @@ class App:
                 log_cb=self._log_direct,
                 stop_cb=self.on_auto_stop,
                 init_ok_cb=self.on_stream_start_success,
-                external_spout_sender=self.get_shared_spout_sender(sender)
+                external_spout_sender=None  # C++ DLLがSpout送信を担当
             )
             self.streamer.start()
             self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_LOCAL)
@@ -1379,13 +1207,123 @@ class App:
             self.on_auto_stop()
     
     def _start_url_stream(self, video_source_url: str) -> None:
-        """URLからのストリーミングを開始（従来の処理）"""
+        """URLからのストリーミングを開始（非同期URL解決対応）"""
         sender = self.sender_var.get().strip() or DEFAULT_SENDER_NAME
         max_res, manual_res = self._get_resolution_settings()
         
+        # yt-dlp対応URLかどうか判定
+        needs_ytdlp = False
+        if YTDLP_RESOLVER_AVAILABLE:
+            needs_ytdlp = YtDlpAsyncResolver.is_ytdlp_url(video_source_url)
+        
+        if needs_ytdlp and NATIVE_BACKEND_AVAILABLE:
+            # yt-dlp URLの場合: 非同期でURL解決を開始
+            self._start_url_stream_with_resolver(video_source_url, sender, max_res, manual_res)
+        else:
+            # 直接URL/ローカルファイルの場合: 即座にストリーマー作成
+            self._start_url_stream_direct(video_source_url, sender, max_res, manual_res)
+    
+    def _start_url_stream_with_resolver(
+        self, 
+        video_source_url: str, 
+        sender: str, 
+        max_res, 
+        manual_res
+    ) -> None:
+        """yt-dlp URL解決を行ってからストリーミングを開始"""
+        self.log("URL解決中...")
+        self._url_resolving = True
+        
+        # Cookie ファイルのパスを取得
+        cookie_file = None
+        try:
+            import os
+            from pathlib import Path
+            for candidate in [
+                Path(__file__).parent / "data" / "cookies.txt",
+                Path(__file__).parent / "cookies.txt",
+            ]:
+                if candidate.exists():
+                    cookie_file = str(candidate)
+                    break
+        except Exception:
+            pass
+        
+        # 新しいリゾルバーを作成
+        self._ytdlp_resolver = YtDlpAsyncResolver(
+            log_cb=lambda m: self.root.after(0, self.log, m),
+            cookie_file=cookie_file,
+            verbose=False
+        )
+        
+        # 非同期でURL解決を開始
+        future = self._ytdlp_resolver.resolve_async(video_source_url)
+        
+        def on_resolve_complete() -> None:
+            """URL解決完了時のコールバック"""
+            try:
+                result = future.result(timeout=0)  # 既に完了しているはず
+                self._url_resolving = False
+                
+                if result is None:
+                    self.log("[yt-dlp] URL解決に失敗しました。従来の方法で再生を試みます。")
+                    # フォールバック: 従来の方法で再生
+                    self._start_url_stream_direct(video_source_url, sender, max_res, manual_res)
+                    return
+                
+                self.log(f"[yt-dlp] URL解決完了: {result.title}")
+                
+                # 解決済みURLでストリーマーを作成
+                def start_resolved_stream() -> None:
+                    try:
+                        self.streamer = NativeStreamerWrapper(
+                            video_url=video_source_url,  # 元のURL（表示用）
+                            sender_name=sender,
+                            max_resolution=max_res,
+                            manual_resolution=manual_res,
+                            loop_vod=self.vod_loop.get(),
+                            verbose=True,
+                            log_cb=lambda m: self.root.after(0, self.log, m),
+                            stop_cb=lambda: self.root.after(0, self.on_auto_stop),
+                            init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
+                            external_spout_sender=None,
+                            pre_resolved_url=result.stream_url  # 解決済みURL
+                        )
+                        self.streamer.start()
+                        self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING))
+                    except Exception as e:
+                        self.root.after(0, self._handle_start_error, f"ストリーミング開始エラー: {e}")
+                
+                threading.Thread(target=start_resolved_stream, daemon=True).start()
+                
+            except Exception as e:
+                self._url_resolving = False
+                self.log(f"[yt-dlp] URL解決エラー: {e}")
+                # フォールバック
+                self._start_url_stream_direct(video_source_url, sender, max_res, manual_res)
+        
+        def poll_resolution() -> None:
+            """URL解決の完了をポーリング"""
+            if future.done():
+                on_resolve_complete()
+            else:
+                # まだ完了していない場合は100ms後に再チェック
+                self.root.after(100, poll_resolution)
+        
+        # ポーリング開始
+        self.root.after(50, poll_resolution)
+    
+    def _start_url_stream_direct(
+        self, 
+        video_source_url: str, 
+        sender: str, 
+        max_res, 
+        manual_res
+    ) -> None:
+        """直接URLでストリーミングを開始（従来の処理）"""
         def start_streaming_thread() -> None:
             try:
-                self.streamer = Streamer(
+                self.streamer = self._create_streamer(
                     video_source_url,
                     sender,
                     max_resolution=max_res,
@@ -1394,7 +1332,7 @@ class App:
                     log_cb=lambda m: self.root.after(0, self.log, m),
                     stop_cb=lambda: self.root.after(0, self.on_auto_stop),
                     init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
-                    external_spout_sender=self.get_shared_spout_sender(sender)
+                    external_spout_sender=None  # C++ DLLがSpout送信を担当
                 )
                 self.streamer.start()
                 self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING))
@@ -1404,7 +1342,12 @@ class App:
         threading.Thread(target=start_streaming_thread, daemon=True).start()
 
     def on_stream(self) -> None:
-        """「Stream」ボタン：VODならストリーミング再生＋バックグラウンドダウンロード"""
+        """「Stream」ボタン：スライスローディングでストリーミング再生
+        
+        スライスローディングにより、ダウンロード完了を待たずに即座に再生開始。
+        チャンクは自動的にキャッシュされ、全チャンクがダウンロードされたら
+        IsFullyCached() == true となる。ローカルファイルへの切り替えは不要。
+        """
         url = self.url_var.get().strip()
         if not url:
             self.log("エラー: ストリーミングするURLが入力されていません。")
@@ -1417,35 +1360,9 @@ class App:
         if not os.path.exists(url):
             self.original_url = url
 
-        # まずストリーミング再生
+        # スライスローディングでストリーミング再生
+        # C++ DLLがCustomIOContext経由でチャンク読み込み・キャッシュを行う
         self._start_spout_stream(url)
-
-        # VOD判定とダウンロード開始を非同期で行う（プチフリを防ぐ）
-        def check_and_start_download() -> None:
-            # ローカルファイルの場合はダウンロード処理をスキップ
-            if os.path.exists(url):
-                self.log("ローカルファイル再生中：ダウンロード処理はスキップします")
-                return
-                
-            # より短い間隔で効率的にチェック
-            for _ in range(50):  # 最大5秒間（0.1秒 × 50回）
-                time.sleep(0.1)
-                try:
-                    if self.streamer and hasattr(self.streamer, 'is_vod') and self.streamer.is_vod:
-                        if not self.download_in_progress:
-                            # 常にサブプロセスダウンロードを使用（プチフリーズを回避）
-                            self.root.after(0, self.log, "VOD検出: 別プロセスでバックグラウンドダウンロードを開始します")
-                            self.start_subprocess_download(url)
-                        return
-                except Exception:
-                    # streamerのアクセスでエラーが発生した場合は継続
-                    continue
-            
-            # タイムアウトした場合
-            self.root.after(0, self.log, "VOD判定がタイムアウトしました。ライブストリームまたは判定不可。")
-        
-        # バックグラウンドスレッドで実行
-        threading.Thread(target=check_and_start_download, daemon=True).start()
 
     def _start_background_download(self, url: str) -> None:
         """VOD用: ストリーミング再生中にバックグラウンドでダウンロード"""
@@ -1715,12 +1632,6 @@ class App:
             except Exception as e:
                 self.log(f"ダウンロードキャンセル警告: {e}")
             
-            # 切り替え処理をキャンセル
-            try:
-                self._cancel_switching()
-            except Exception as e:
-                self.log(f"切り替えキャンセル警告: {e}")
-            
             # 現在のStreamerを停止
             if self.streamer:
                 try:
@@ -1821,7 +1732,16 @@ class App:
         self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_STANDBY)
 
     def on_auto_stop(self) -> None:
-        """動画終了時の自動停止処理"""
+        """動画終了時の自動停止処理
+        
+        注意: ローカルファイル切り替え時に旧ストリーマーのstop_cbが呼ばれた場合、
+        この関数は実行されない（stop_cbがNoneに設定されるため）
+        """
+        # ストリーマーが存在しない場合は何もしない（切り替え中の誤動作防止）
+        if self.streamer is None:
+            self.log("動画の再生が完了しました。（ストリーマーなし）")
+            return
+        
         self.log("動画の再生が完了しました。")
         self.on_stop()
 
@@ -1862,6 +1782,9 @@ class App:
                     
             # ストリーマー情報更新（軽量処理のみ）
             if self.streamer:
+                # NativeStreamerWrapper（C++ DLLバックエンド）の進捗情報を取得・表示
+                self._update_native_progress()
+                
                 if self.streamer.is_vod:
                     if not self._seeking:
                         self.seek_slider.set(self.streamer.playback_time)
@@ -1885,6 +1808,62 @@ class App:
                 self.debug_log(f"プレビュー更新エラー: {e} (時間: {update_duration:.3f}秒)")
         finally:
             self.root.after(UIConfig.PREVIEW_UPDATE_INTERVAL, self.update_preview)
+    
+    def _update_native_progress(self) -> None:
+        """NativeStreamerWrapper（C++ DLLバックエンド）の進捗情報を更新・表示"""
+        if not self.streamer:
+            return
+        
+        # NativeStreamerWrapperのみ処理（download_progressプロパティを持つか確認）
+        if not hasattr(self.streamer, 'download_progress') or not hasattr(self.streamer, 'is_fully_cached'):
+            return
+        
+        try:
+            progress = self.streamer.download_progress  # 0.0〜1.0
+            is_cached = self.streamer.is_fully_cached
+            bandwidth = getattr(self.streamer, 'bandwidth', 0.0)  # bytes/sec
+            
+            # キャッシュ完了時は進捗バーを非表示
+            if is_cached:
+                if hasattr(self, '_native_progress_visible') and self._native_progress_visible:
+                    self.hide_download_progress()
+                    self._native_progress_visible = False
+                return
+            
+            # 進捗が0より大きい場合のみ表示
+            if progress > 0.0:
+                # 進捗バーを表示
+                if not hasattr(self, '_native_progress_visible') or not self._native_progress_visible:
+                    self.show_native_progress()
+                    self._native_progress_visible = True
+                
+                # 進捗バーを更新
+                self.progress_bar.set(progress)
+                
+                # 帯域幅をフォーマット
+                if bandwidth > 0:
+                    if bandwidth >= 1024 * 1024:
+                        speed_str = f"{bandwidth / (1024 * 1024):.1f} MB/s"
+                    elif bandwidth >= 1024:
+                        speed_str = f"{bandwidth / 1024:.1f} KB/s"
+                    else:
+                        speed_str = f"{bandwidth:.0f} B/s"
+                    self.progress_info.configure(
+                        text=f"キャッシュ進捗: {progress * 100:.1f}% | 速度: {speed_str}"
+                    )
+                else:
+                    self.progress_info.configure(text=f"キャッシュ進捗: {progress * 100:.1f}%")
+        except Exception:
+            pass  # 進捗取得エラーは無視
+    
+    def show_native_progress(self) -> None:
+        """C++ DLLバックエンドの進捗バーを表示"""
+        try:
+            # 進捗フレームの高さを設定して表示
+            self.progress_frame.configure(height=70)
+            self.progress_frame.pack_propagate(False)
+        except Exception:
+            pass
     
     def _update_preview_frame_async(self, frame: Any, start_time: float) -> None:
         """プレビューフレーム更新を非同期で処理"""

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "ytdlpspout-cpp",
+  "version": "0.1.0",
+  "description": "C++ backend for ytdlpSpout - Video streaming to Spout",
+  "license": "MIT",
+  "supports": "windows & x64",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swresample",
+        "swscale",
+        "nvcodec"
+      ]
+    },
+    {
+      "name": "spout2",
+      "default-features": true
+    },
+    "spdlog",
+    {
+      "name": "curl",
+      "default-features": false,
+      "features": [
+        "ssl"
+      ]
+    },
+    "nlohmann-json",
+    "doctest"
+  ],
+  "overrides": []
+}
