@@ -235,6 +235,18 @@ set(SOURCES
   src/audio/BeatDetector.h
   src/audio/BeatMapGenerator.cpp
   src/audio/BeatMapGenerator.h
+  
+  # HLS
+  src/hls/M3U8Parser.cpp
+  src/hls/M3U8Parser.h
+  src/hls/AesCbcDecryptor.cpp
+  src/hls/AesCbcDecryptor.h
+  src/hls/HlsSegmentCache.cpp
+  src/hls/HlsSegmentCache.h
+  src/hls/HlsCustomAVIOContext.cpp
+  src/hls/HlsCustomAVIOContext.h
+  src/hls/HlsSliceLoadingManager.cpp
+  src/hls/HlsSliceLoadingManager.h
 )
 
 # =============================================================================
@@ -294,6 +306,18 @@ set(LIB_SOURCES
   src/audio/BeatDetector.h
   src/audio/BeatMapGenerator.cpp
   src/audio/BeatMapGenerator.h
+  
+  # HLS
+  src/hls/M3U8Parser.cpp
+  src/hls/M3U8Parser.h
+  src/hls/AesCbcDecryptor.cpp
+  src/hls/AesCbcDecryptor.h
+  src/hls/HlsSegmentCache.cpp
+  src/hls/HlsSegmentCache.h
+  src/hls/HlsCustomAVIOContext.cpp
+  src/hls/HlsCustomAVIOContext.h
+  src/hls/HlsSliceLoadingManager.cpp
+  src/hls/HlsSliceLoadingManager.h
   
   # C APIバインディング
   src/bindings/c_api.cpp

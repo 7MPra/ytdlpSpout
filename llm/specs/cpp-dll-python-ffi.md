@@ -63,6 +63,36 @@ int ytdlpspout_seek(YtdlpSpoutHandle handle, double seconds);
 int ytdlpspout_process_frame(YtdlpSpoutHandle handle);
 ```
 
+### 拡張再生制御（HTTPヘッダー対応）
+
+```c
+// HTTPヘッダー構造体
+typedef struct YtdlpSpoutHttpHeader {
+    const char* key;    // ヘッダーキー（例: "Cookie"）
+    const char* value;  // ヘッダー値
+} YtdlpSpoutHttpHeader;
+
+// YtdlpSpoutConfigEx構造体に追加されたフィールド
+const YtdlpSpoutHttpHeader* httpHeaders;  // HTTPヘッダー配列
+int httpHeadersCount;                      // ヘッダー数
+
+// 拡張設定で再生開始（HTTPヘッダー対応）
+int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* config);
+
+// デフォルト設定で初期化
+void ytdlpspout_config_ex_init(YtdlpSpoutConfigEx* config);
+```
+
+**使用例（Python）**:
+```python
+# HTTPヘッダーを含む再生開始
+player.start_ex(
+    source="https://example.com/video.mp4",
+    sender_name="MySpout",
+    http_headers={"Cookie": "session=abc123", "User-Agent": "MyApp/1.0"}
+)
+```
+
 ### 状態取得
 
 ```c
@@ -143,6 +173,57 @@ if buffer_size > 0:
 const char* ytdlpspout_get_last_error(void);
 ```
 
+### HLSキャッシュ統計
+
+HLSストリーム再生時のキャッシュ状態を取得するAPI。
+
+```c
+/// @brief HLSキャッシュ統計
+typedef struct YtdlpSpoutHlsCacheStats {
+    int cachedSegments;         ///< キャッシュ済みセグメント数
+    int totalSegments;          ///< 総セグメント数
+    double downloadProgress;    ///< ダウンロード進捗 (0.0〜1.0)
+    double bandwidth;           ///< 推定帯域幅 (bytes/sec)
+    int isFullyCached;          ///< 完全キャッシュ済み (1=true, 0=false)
+    int isHlsMode;              ///< HLSモードで再生中 (1=true, 0=false)
+} YtdlpSpoutHlsCacheStats;
+
+/// @brief HLSキャッシュ統計を取得
+/// @param handle インスタンスハンドル
+/// @param stats 統計情報の出力先
+/// @return 成功時0、失敗時-1
+YTDLPSPOUT_API int ytdlpspout_get_hls_cache_stats(
+    YtdlpSpoutHandle handle,
+    YtdlpSpoutHlsCacheStats* stats
+);
+```
+
+**使用例（Python）**:
+```python
+player = YtdlpSpoutNative()
+player.start_ex("https://example.com/playlist.m3u8")
+
+# HLS統計を取得
+stats = player.get_hls_cache_stats()
+if stats:
+    print(f"HLSモード: {stats['is_hls_mode']}")
+    print(f"キャッシュ済み: {stats['cached_segments']}/{stats['total_segments']}")
+    print(f"ダウンロード進捗: {stats['download_progress'] * 100:.1f}%")
+    print(f"帯域幅: {stats['bandwidth'] / 1024:.1f} KB/s")
+    print(f"完全キャッシュ済み: {stats['is_fully_cached']}")
+```
+
+**戻り値の説明**:
+- `cached_segments`: キャッシュに読み込まれたセグメント数（HLSモード）またはチャンク数（通常モード）
+- `total_segments`: プレイリスト内の総セグメント数またはファイル全体のチャンク数
+- `download_progress`: ダウンロード完了率（0.0〜1.0）
+- `bandwidth`: 推定ダウンロード帯域幅（bytes/sec）、HLSモードのみ有効
+- `is_fully_cached`: すべてのデータがキャッシュ済みかどうか
+- `is_hls_mode`: HLSスライス読み込みモードで再生中かどうか
+
+**未再生時の動作**:
+プレイヤーが再生開始前または停止後の場合、すべての値がデフォルト（0またはfalse）で返されます。
+
 ## Python バインディング使用例
 
 ### 基本的な使用
@@ -195,6 +276,100 @@ player.set_completion_callback(on_completion)
 player.start("video.mp4")
 ```
 
+### HTTPヘッダー対応（認証・Cookie等）
+
+ニコニコ動画など認証が必要なサービスでは、HTTPヘッダー（特にCookie）をDLLに渡す必要があります。
+
+#### 基本的な使い方
+
+```python
+# 直接start_ex()を使用
+player = YtdlpSpoutNative()
+player.start_ex(
+    source="https://example.com/video.mp4",
+    sender_name="MySpout",
+    http_headers={
+        "Cookie": "user_session=abcdef123456",
+        "User-Agent": "MyApp/1.0"
+    }
+)
+```
+
+#### NativeStreamerWrapperでの使用
+
+```python
+from python.native_streamer_wrapper import NativeStreamerWrapper
+
+# yt-dlpで取得したHTTPヘッダーを渡す
+wrapper = NativeStreamerWrapper(
+    video_url="resolved_stream_url",
+    sender_name="MySpout",
+    pre_resolved_headers={"Cookie": "user_session=xxx", "Referer": "https://example.com/"}
+)
+wrapper.start()
+```
+
+#### データフロー
+
+```
+Python dict                 C struct array               C++ std::map
+{"Cookie": "xxx"}  ──────>  YtdlpSpoutHttpHeader[]  ──>  map<string,string>
+                            [0].key = "Cookie"           ["Cookie"] = "xxx"
+                            [0].value = "xxx"
+```
+
+#### C++ DLL内でのヘッダー適用箇所
+
+HTTPヘッダーはDLL内で以下の全HTTPリクエストに適用されます：
+
+| コンポーネント | リクエスト種別 | 用途 |
+|---------------|---------------|------|
+| CustomIOContext | HEAD | ファイルサイズ（Content-Length）取得 |
+| ChunkDownloader | GET (Range) | 動画データのチャンクダウンロード |
+| VideoDecoder (HLS) | GET | HLSマニフェスト、キーファイル、セグメント |
+
+これにより、ニコニコ動画等のCookie認証が必要なサービスでも、すべてのHTTPリクエストで認証が機能します。
+
+#### HLSストリーム対応
+
+**重要**: HLSストリーム（`.m3u8`）では、CustomIOContextを使用せず、FFmpegのネイティブHTTPハンドラを使用します。
+
+```
+HLS URL判定（.m3u8, format=m3u8, /hls/）
+    ↓ YES
+FFmpegネイティブHTTPで直接オープン
+    ↓
+AVDictionaryでHTTPヘッダーを設定
+    ↓
+FFmpeg HLSデマクサが内部リクエストにヘッダーを継承
+    ↓
+キーファイル、セグメント取得時にもCookie認証が機能
+```
+
+**理由**: CustomIOContext使用時、FFmpegのHLSデマクサが実行する内部HTTPリクエスト（キーファイル、セグメント）にAVDictionaryのヘッダーオプションが継承されないため。
+
+**判定ロジック（C++）**:
+```cpp
+static bool IsHlsUrl(const std::string& url) {
+    std::string lower = url;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return (lower.find(".m3u8") != std::string::npos) ||
+           (lower.find("format=m3u8") != std::string::npos) ||
+           (lower.find("/hls/") != std::string::npos);
+}
+```
+
+**protocol_whitelist**: 暗号化HLS対応のため`crypto`プロトコルを追加：
+```cpp
+av_dict_set(&opts, "protocol_whitelist", "file,http,https,tcp,tls,crypto,data", 0);
+```
+
+#### セキュリティ注意事項
+
+1. **ログ出力**: Cookieなどの機密情報は値をログに出力しない。ヘッダー数のみログ出力可
+2. **メモリ管理**: Python側で文字列への参照を保持し、DLL呼び出し中にGCされないようにする
+3. **配布禁止**: Cookie値を含むログファイルや設定ファイルは配布・公開しないこと
+
 ## ビルド手順
 
 ### DLLのビルド
@@ -224,6 +399,38 @@ DLLを配布する場合、以下のファイルが必要です：
 
 1. `ytdlpspout.dll` - メインDLL
 2. 依存DLL（FFmpeg、Spout2など）
+
+### DLL検索パス
+
+`YtdlpSpoutNative`クラスは以下の順序でDLLを検索します（優先度順）：
+
+1. **CMakeビルド出力（優先、Debug優先）**:
+   - `cpp/build/bin/Debug/ytdlpspout.dll`
+   - `cpp/build/bin/Release/ytdlpspout.dll`
+
+2. **ローカルpythonフォルダ**:
+   - `python/ytdlpspout.dll`
+
+3. **レガシーパス（VS2022）**:
+   - `cpp/build/vs2022/bin/Release/ytdlpspout.dll`
+   - `cpp/build/vs2022/bin/Debug/ytdlpspout.dll`
+
+4. **Presetビルドパス**:
+   - `cpp/build/windows-x64-release/bin/ytdlpspout.dll`
+   - `cpp/build/windows-x64-debug/bin/ytdlpspout.dll`
+
+5. **環境変数**: `YTDLPSPOUT_DLL`
+
+DLLがロードされると、パスがログに出力されます（INFOレベル）。
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+
+from python.ytdlpspout_native import YtdlpSpoutNative
+player = YtdlpSpoutNative()
+# INFO - DLL loaded from: F:\ytdlpSpout\cpp\build\bin\Release\ytdlpspout.dll
+```
 
 ### 依存DLLの確認
 

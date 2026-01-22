@@ -80,6 +80,12 @@ typedef struct YtdlpSpoutYtDlpConfig {
     int preferredHeight;              ///< 希望解像度（デフォルト: 1080）
 } YtdlpSpoutYtDlpConfig;
 
+/// @brief HTTPヘッダー
+typedef struct YtdlpSpoutHttpHeader {
+    const char* key;                  ///< ヘッダーキー（例: "Cookie"）
+    const char* value;                ///< ヘッダー値（例: "session_id=abc123"）
+} YtdlpSpoutHttpHeader;
+
 /// @brief 拡張設定
 typedef struct YtdlpSpoutConfigEx {
     const char* source;               ///< ファイルパスまたはURL
@@ -91,6 +97,8 @@ typedef struct YtdlpSpoutConfigEx {
     int verbose;                      ///< 詳細ログ（1=有効）
     YtdlpSpoutSliceConfig slice;      ///< スライス読み込み設定
     YtdlpSpoutYtDlpConfig ytdlp;      ///< yt-dlp設定
+    const YtdlpSpoutHttpHeader* httpHeaders;  ///< HTTPヘッダー配列（NULL=なし）
+    int httpHeadersCount;             ///< HTTPヘッダー数
 } YtdlpSpoutConfigEx;
 
 /// @brief 再生状態
@@ -109,6 +117,16 @@ typedef struct YtdlpSpoutVideoInfo {
     double duration;            ///< 再生時間（秒）
     int64_t totalFrames;        ///< 総フレーム数
 } YtdlpSpoutVideoInfo;
+
+/// @brief HLSキャッシュ統計
+typedef struct YtdlpSpoutHlsCacheStats {
+    int cachedSegments;         ///< キャッシュ済みセグメント数
+    int totalSegments;          ///< 総セグメント数
+    double downloadProgress;    ///< ダウンロード進捗 (0.0〜1.0)
+    double bandwidth;           ///< 推定帯域幅 (bytes/sec)
+    int isFullyCached;          ///< 完全キャッシュ済み (1=true, 0=false)
+    int isHlsMode;              ///< HLSモードで再生中 (1=true, 0=false)
+} YtdlpSpoutHlsCacheStats;
 
 // =============================================================================
 // API関数
@@ -270,6 +288,15 @@ YTDLPSPOUT_API void ytdlpspout_get_cache_stats(
     YtdlpSpoutHandle handle,
     size_t* cachedChunks,
     size_t* totalChunks
+);
+
+/// @brief HLSキャッシュ統計を取得
+/// @param handle インスタンスハンドル
+/// @param stats 統計情報の出力先
+/// @return 成功時0、失敗時-1
+YTDLPSPOUT_API int ytdlpspout_get_hls_cache_stats(
+    YtdlpSpoutHandle handle,
+    YtdlpSpoutHlsCacheStats* stats
 );
 
 // =============================================================================

@@ -20,7 +20,6 @@ Python側でyt-dlp URL解決を先行実行し、解決済みURLをC++ DLLに渡
 """
 
 import re
-import ssl
 import concurrent.futures
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List
@@ -63,7 +62,7 @@ class YtDlpAsyncResolver:
         # 動画サイト
         'youtube.com', 'youtu.be', 'youtube-nocookie.com',
         'twitch.tv',
-        'nicovideo.jp', 'nico.ms',
+        'nicovideo.jp', 'nico.ms', 'live.nicovideo.jp',
         'vimeo.com',
         'dailymotion.com',
         'bilibili.com', 'bilibili.tv',
@@ -87,6 +86,20 @@ class YtDlpAsyncResolver:
         '.m3u8', '.mpd', '.ts',
         '.mp3', '.ogg', '.wav', '.flac', '.m4a',
     ]
+    
+    # フォールバックフォーマットのリスト（優先順）
+    # ニコニコ動画等のAAC音声対応、汎用フォールバックを含む
+    FALLBACK_FORMATS: List[str] = [
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]',  # YouTube向け優先
+        'bestvideo[ext=mp4]+bestaudio[ext=aac]',  # ニコニコ動画等のaac音声対応
+        'bestvideo+bestaudio',  # 一般的なフォーマット
+        'bv*+ba',  # yt-dlp推奨の汎用フォーマット
+        'b',  # best shorthand
+        'best',  # 最終フォールバック
+    ]
+    
+    # ニコニコ動画対応のフォーマット文字列（FALLBACK_FORMATS から自動生成）
+    FORMAT_STRING = '/'.join(FALLBACK_FORMATS)
     
     def __init__(
         self,
@@ -120,6 +133,38 @@ class YtDlpAsyncResolver:
         """ログメッセージを出力"""
         if self._log_cb:
             self._log_cb(msg)
+    
+    def _get_ydl_opts(self) -> dict:
+        """
+        yt-dlpオプションを取得
+        
+        Returns:
+            yt-dlpオプション辞書
+        """
+        return {
+            'format': self.FORMAT_STRING,
+            'noplaylist': True,
+            'quiet': not self._verbose,
+            'nocheckcertificate': True,
+            'socket_timeout': 30,
+            'retries': 3,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'cookiefile': self._cookie_file,
+        }
+    
+    def _log_cookie_info(self) -> None:
+        """
+        Cookieファイル使用状況をログ出力（内容は含めない）
+        
+        セキュリティ上、Cookie値自体はログに出力しない
+        """
+        if self._cookie_file:
+            import os
+            if os.path.exists(self._cookie_file):
+                file_size = os.path.getsize(self._cookie_file)
+                self.log(f"[yt-dlp] Cookieファイルを使用: {self._cookie_file} ({file_size} bytes)")
+            else:
+                self.log(f"[yt-dlp] Cookieファイルが見つかりません: {self._cookie_file}")
     
     @staticmethod
     def is_ytdlp_url(url: str) -> bool:
@@ -198,6 +243,9 @@ class YtDlpAsyncResolver:
         
         self.log(f"[yt-dlp] URL解決開始: {url}")
         
+        # Cookie情報をログ出力
+        self._log_cookie_info()
+        
         # yt-dlpオプションを設定
         class YtDlpLogger:
             def __init__(self, log_func, verbose):
@@ -219,17 +267,9 @@ class YtDlpAsyncResolver:
         
         logger = YtDlpLogger(self.log, self._verbose)
         
-        ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'noplaylist': True,
-            'logger': logger,
-            'quiet': not self._verbose,
-            'nocheckcertificate': True,
-            'socket_timeout': 30,
-            'retries': 3,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'cookiefile': self._cookie_file,
-        }
+        # 共通オプションを取得
+        ydl_opts = self._get_ydl_opts()
+        ydl_opts['logger'] = logger
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:

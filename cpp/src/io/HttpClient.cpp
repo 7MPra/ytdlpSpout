@@ -271,7 +271,7 @@ HttpResponse HttpClient::Head(const std::string& url) {
         return response;
     }
     
-    LOG_DEBUG("HEAD request: {}", url);
+    LOG_TRACE("HEAD request: {}", url);
     
     m_impl->Reset();
     m_impl->ApplyConfig();
@@ -308,7 +308,7 @@ HttpResponse HttpClient::Head(const std::string& url) {
             response.acceptsRanges = (rangesIt->second == "bytes");
         }
         
-        LOG_DEBUG("HEAD response: {} (Content-Length: {})", response.statusCode, response.contentLength);
+        LOG_TRACE("HEAD response: {} (Content-Length: {})", response.statusCode, response.contentLength);
     } else {
         response.errorMessage = curl_easy_strerror(result);
         LOG_ERROR("HEAD request failed: {}", response.errorMessage);
@@ -325,7 +325,7 @@ HttpResponse HttpClient::Get(const std::string& url) {
         return response;
     }
     
-    LOG_DEBUG("GET request: {}", url);
+    LOG_TRACE("GET request: {}", url);
     
     m_impl->Reset();
     m_impl->ApplyConfig();
@@ -347,7 +347,7 @@ HttpResponse HttpClient::Get(const std::string& url) {
         response.data = std::move(m_impl->callbackData.responseData);
         response.success = (httpCode >= 200 && httpCode < 300);
         
-        LOG_DEBUG("GET response: {} ({} bytes)", response.statusCode, response.data.size());
+        LOG_TRACE("GET response: {} ({} bytes)", response.statusCode, response.data.size());
     } else {
         response.errorMessage = curl_easy_strerror(result);
         LOG_ERROR("GET request failed: {}", response.errorMessage);
@@ -364,7 +364,7 @@ HttpResponse HttpClient::GetRange(const std::string& url, int64_t startByte, int
         return response;
     }
     
-    LOG_DEBUG("GET Range request: {} (bytes={}-{})", url, startByte, endByte);
+    LOG_TRACE("GET Range request: {} (bytes={}-{})", url, startByte, endByte);
     
     m_impl->Reset();
     m_impl->ApplyConfig();
@@ -391,7 +391,7 @@ HttpResponse HttpClient::GetRange(const std::string& url, int64_t startByte, int
         response.data = std::move(m_impl->callbackData.responseData);
         response.success = (httpCode >= 200 && httpCode < 300);
         
-        LOG_DEBUG("GET Range response: {} ({} bytes)", response.statusCode, response.data.size());
+        LOG_TRACE("GET Range response: {} ({} bytes)", response.statusCode, response.data.size());
     } else {
         response.errorMessage = curl_easy_strerror(result);
         LOG_ERROR("GET Range request failed: {}", response.errorMessage);
@@ -414,7 +414,7 @@ HttpResponse HttpClient::GetRangeStreaming(
         return response;
     }
     
-    LOG_DEBUG("GET Range Streaming request: {} (bytes={}-{})", url, startByte, endByte);
+    LOG_TRACE("GET Range Streaming request: {} (bytes={}-{})", url, startByte, endByte);
     
     m_impl->Reset();
     m_impl->ApplyConfig();
@@ -454,7 +454,7 @@ HttpResponse HttpClient::GetRangeStreaming(
             response.success = false;
         }
         
-        LOG_DEBUG("GET Range Streaming response: {} (downloaded: {} bytes)", 
+        LOG_TRACE("GET Range Streaming response: {} (downloaded: {} bytes)", 
                   response.statusCode, m_impl->callbackData.downloadedBytes);
     } else {
         response.errorMessage = curl_easy_strerror(result);

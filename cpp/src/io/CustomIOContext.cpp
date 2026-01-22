@@ -131,9 +131,19 @@ bool CustomIOContext::InitializeHttp() {
     HttpClientConfig httpConfig;
     httpConfig.connectTimeoutMs = 10000;
     httpConfig.readTimeoutMs = m_impl->config.readTimeoutMs;
+    
+    // HTTPヘッダーを設定（Cookie等） - HEADリクエストにも適用
+    if (!m_impl->config.httpHeaders.empty()) {
+        for (const auto& [key, value] : m_impl->config.httpHeaders) {
+            httpConfig.headers[key] = value;
+        }
+        // セキュリティ: ヘッダー数のみログ出力（値は出力しない）
+        LOG_INFO("HTTP headers set for HttpClient: count={}", m_impl->config.httpHeaders.size());
+    }
+    
     m_impl->httpClient->Configure(httpConfig);
     
-    // HEADリクエストでContent-Lengthを取得
+    // HEADリクエストでContent-Lengthを取得（ヘッダー付き）
     LOG_DEBUG("Fetching content info via HEAD request...");
     HttpResponse headResponse = m_impl->httpClient->Head(m_impl->url);
     
@@ -167,6 +177,14 @@ bool CustomIOContext::InitializeHttp() {
         m_impl->config.maxConcurrentDownloads
     );
     m_impl->downloader->SetUrl(m_impl->url);
+    
+    // HTTPヘッダーを設定（Cookie等）
+    if (!m_impl->config.httpHeaders.empty()) {
+        m_impl->downloader->SetHeaders(m_impl->config.httpHeaders);
+        // セキュリティ: ヘッダー数のみログ出力（値は出力しない）
+        LOG_INFO("HTTP headers set for ChunkDownloader: count={}", m_impl->config.httpHeaders.size());
+    }
+    
     m_impl->downloader->Start();
     
     // PrefetchSchedulerを初期化

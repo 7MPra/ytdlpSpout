@@ -16,10 +16,12 @@
 #include <memory>
 #include <functional>
 #include <cstdint>
+#include <map>
 
 // 前方宣言
 struct ID3D11Device;
 struct AVFrame;
+struct AVIOContext;
 
 namespace ytdlpspout {
 
@@ -61,14 +63,28 @@ public:
     /// @brief 動画ファイルを開く
     /// @param filePath ファイルパス
     /// @param d3dDevice D3D11デバイス（ハードウェアデコード用、nullptrでソフトウェア）
+    /// @param httpHeaders HTTPヘッダー（Cookie等、HLSの内部リクエストにも適用）
     /// @return 成功した場合true
-    bool Open(const std::string& filePath, ID3D11Device* d3dDevice = nullptr);
+    bool Open(const std::string& filePath, ID3D11Device* d3dDevice = nullptr,
+              const std::map<std::string, std::string>& httpHeaders = {});
 
     /// @brief カスタムIOContextで動画を開く
     /// @param ioContext 事前に初期化されたCustomIOContext（外部所有）
     /// @param d3dDevice D3D11デバイス（ハードウェアデコード用、nullptrでソフトウェア）
+    /// @param httpHeaders HTTPヘッダー（Cookie等、HLSの内部リクエストにも適用）
     /// @return 成功した場合true
-    bool OpenWithCustomIO(io::CustomIOContext* ioContext, ID3D11Device* d3dDevice = nullptr);
+    bool OpenWithCustomIO(io::CustomIOContext* ioContext, ID3D11Device* d3dDevice = nullptr,
+                          const std::map<std::string, std::string>& httpHeaders = {});
+
+    /// @brief FFmpeg AVIOContextで動画を開く（HLS用）
+    /// @param avioContext 事前に初期化されたAVIOContext（外部所有）
+    /// @param formatHint フォーマットヒント（例: "mpegts"、空で自動検出）
+    /// @param d3dDevice D3D11デバイス（ハードウェアデコード用、nullptrでソフトウェア）
+    /// @param httpHeaders HTTPヘッダー（Cookie等、HLSの内部リクエストにも適用）
+    /// @return 成功した場合true
+    bool OpenWithAVIOContext(AVIOContext* avioContext, const std::string& formatHint = "",
+                             ID3D11Device* d3dDevice = nullptr,
+                             const std::map<std::string, std::string>& httpHeaders = {});
 
     /// @brief 動画を閉じる
     void Close();

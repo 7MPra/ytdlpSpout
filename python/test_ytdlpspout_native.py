@@ -17,9 +17,15 @@ sys.path.insert(0, str(project_root))
 def find_dll():
     """テスト用にDLLを探す"""
     search_paths = [
+        # CMakeビルド出力（Debug優先、開発中はDebugが最新の可能性が高い）
+        project_root / "cpp" / "build" / "bin" / "Debug" / "ytdlpspout.dll",
+        project_root / "cpp" / "build" / "bin" / "Release" / "ytdlpspout.dll",
+        # ローカルpythonフォルダ
         project_root / "python" / "ytdlpspout.dll",
+        # レガシーパス（VS2022）
         project_root / "cpp" / "build" / "vs2022" / "bin" / "Release" / "ytdlpspout.dll",
         project_root / "cpp" / "build" / "vs2022" / "bin" / "Debug" / "ytdlpspout.dll",
+        # Presetビルドパス
         project_root / "cpp" / "build" / "windows-x64-release" / "bin" / "ytdlpspout.dll",
         project_root / "cpp" / "build" / "windows-x64-debug" / "bin" / "ytdlpspout.dll",
     ]
@@ -273,6 +279,83 @@ class TestSliceLoadingAPI:
         assert len(stats) == 2
         assert stats[0] == 0
         assert stats[1] == 0
+
+
+@pytest.mark.skipif(DLL_PATH is None, reason=SKIP_REASON)
+class TestHlsCacheStatsAPI:
+    """HLSキャッシュ統計API関連のテスト"""
+    
+    def test_hls_cache_stats_structure_exists(self):
+        """YtdlpSpoutHlsCacheStats 構造体が存在することを確認"""
+        from python.ytdlpspout_native import YtdlpSpoutHlsCacheStats
+        
+        stats = YtdlpSpoutHlsCacheStats()
+        assert hasattr(stats, 'cachedSegments')
+        assert hasattr(stats, 'totalSegments')
+        assert hasattr(stats, 'downloadProgress')
+        assert hasattr(stats, 'bandwidth')
+        assert hasattr(stats, 'isFullyCached')
+        assert hasattr(stats, 'isHlsMode')
+    
+    def test_hls_cache_stats_structure_fields(self):
+        """YtdlpSpoutHlsCacheStats 構造体のフィールド型を確認"""
+        from python.ytdlpspout_native import YtdlpSpoutHlsCacheStats
+        
+        stats = YtdlpSpoutHlsCacheStats()
+        # 初期値を確認（全てゼロ）
+        assert stats.cachedSegments == 0
+        assert stats.totalSegments == 0
+        assert stats.downloadProgress == 0.0
+        assert stats.bandwidth == 0.0
+        assert stats.isFullyCached == 0
+        assert stats.isHlsMode == 0
+    
+    def test_get_hls_cache_stats_method_exists(self):
+        """get_hls_cache_stats メソッドが存在することを確認"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+        
+        player = YtdlpSpoutNative(DLL_PATH)
+        assert hasattr(player, 'get_hls_cache_stats')
+        assert callable(getattr(player, 'get_hls_cache_stats'))
+    
+    def test_get_hls_cache_stats_without_playback(self):
+        """未再生時のget_hls_cache_stats呼び出し"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+        
+        player = YtdlpSpoutNative(DLL_PATH)
+        stats = player.get_hls_cache_stats()
+        
+        # 未再生時は辞書形式でデフォルト値を返す
+        assert stats is not None
+        assert isinstance(stats, dict)
+        assert 'cached_segments' in stats
+        assert 'total_segments' in stats
+        assert 'download_progress' in stats
+        assert 'bandwidth' in stats
+        assert 'is_fully_cached' in stats
+        assert 'is_hls_mode' in stats
+        
+        # デフォルト値の確認
+        assert stats['cached_segments'] == 0
+        assert stats['total_segments'] == 0
+        assert stats['download_progress'] == 0.0
+        assert stats['bandwidth'] == 0.0
+        assert stats['is_fully_cached'] is False
+        assert stats['is_hls_mode'] is False
+    
+    def test_get_hls_cache_stats_return_types(self):
+        """get_hls_cache_stats の戻り値の型を確認"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+        
+        player = YtdlpSpoutNative(DLL_PATH)
+        stats = player.get_hls_cache_stats()
+        
+        assert isinstance(stats['cached_segments'], int)
+        assert isinstance(stats['total_segments'], int)
+        assert isinstance(stats['download_progress'], float)
+        assert isinstance(stats['bandwidth'], float)
+        assert isinstance(stats['is_fully_cached'], bool)
+        assert isinstance(stats['is_hls_mode'], bool)
 
 
 @pytest.mark.skipif(DLL_PATH is None, reason=SKIP_REASON)

@@ -42,6 +42,26 @@ struct ChunkRequest {
     }
 };
 
+/// @brief HLSセグメントリクエスト（内部用）
+struct SegmentRequest {
+    std::string url;
+    int64_t segmentIndex = 0;
+    ChunkPriority priority = ChunkPriority::Medium;
+    std::chrono::steady_clock::time_point requestTime;
+    int64_t byteRangeStart = -1;
+    int64_t byteRangeLength = 0;
+    
+    /// @brief 優先度キュー用の比較演算子
+    bool operator<(const SegmentRequest& other) const {
+        // priority_queueはmax-heapなので、小さい値を優先するには逆にする
+        if (priority != other.priority) {
+            return static_cast<int>(priority) > static_cast<int>(other.priority);
+        }
+        // 同じ優先度なら早いリクエストを優先
+        return requestTime > other.requestTime;
+    }
+};
+
 /// @brief 帯域幅サンプル
 struct BandwidthSample {
     int64_t bytes = 0;
@@ -73,6 +93,15 @@ struct ChunkDownloader::Impl {
     std::set<int64_t> cancelledOffsets;     // キャンセルされたオフセット
     mutable std::mutex queueMutex;
     std::condition_variable queueCv;
+    
+    // -------------------------------------------------------------------------
+    // セグメントリクエストキュー（HLS用）
+    // -------------------------------------------------------------------------
+    std::priority_queue<SegmentRequest> segmentQueue;
+    std::set<int64_t> pendingSegments;      // キューに入っているセグメントインデックス
+    std::set<int64_t> activeSegments;       // 現在ダウンロード中のセグメント
+    SegmentDownloadCallback segmentCallback;
+    mutable std::mutex segmentMutex;
     
     // -------------------------------------------------------------------------
     // 帯域幅推定
@@ -110,48 +139,94 @@ struct ChunkDownloader::Impl {
         HttpClient httpClient(clientConfig);
         
         while (!stopRequested.load()) {
-            ChunkRequest request;
+            ChunkRequest chunkRequest;
+            SegmentRequest segmentRequest;
+            bool hasChunkRequest = false;
+            bool hasSegmentRequest = false;
             
-            // リクエストを取得
+            // リクエストを取得（チャンクまたはセグメント）
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
                 queueCv.wait(lock, [this] {
-                    return stopRequested.load() || !requestQueue.empty();
+                    std::lock_guard<std::mutex> segLock(segmentMutex);
+                    return stopRequested.load() || 
+                           !requestQueue.empty() || 
+                           !segmentQueue.empty();
                 });
                 
                 if (stopRequested.load()) {
                     break;
                 }
                 
-                if (requestQueue.empty()) {
-                    continue;
+                // セグメントとチャンクの優先度を比較
+                bool segmentHigherPriority = false;
+                {
+                    std::lock_guard<std::mutex> segLock(segmentMutex);
+                    if (!segmentQueue.empty() && !requestQueue.empty()) {
+                        // 両方にリクエストがある場合、優先度を比較
+                        segmentHigherPriority = 
+                            static_cast<int>(segmentQueue.top().priority) <
+                            static_cast<int>(requestQueue.top().priority);
+                    } else if (!segmentQueue.empty()) {
+                        segmentHigherPriority = true;
+                    }
                 }
                 
-                request = requestQueue.top();
-                requestQueue.pop();
-                pendingOffsets.erase(request.offset);
-                
-                // キャンセルされていたらスキップ
-                if (cancelledOffsets.count(request.offset) > 0) {
-                    cancelledOffsets.erase(request.offset);
-                    continue;
+                // セグメントリクエストを優先的に処理
+                if (segmentHigherPriority) {
+                    std::lock_guard<std::mutex> segLock(segmentMutex);
+                    if (!segmentQueue.empty()) {
+                        segmentRequest = segmentQueue.top();
+                        segmentQueue.pop();
+                        pendingSegments.erase(segmentRequest.segmentIndex);
+                        activeSegments.insert(segmentRequest.segmentIndex);
+                        hasSegmentRequest = true;
+                    }
                 }
                 
-                activeOffsets.insert(request.offset);
+                // チャンクリクエストを処理
+                if (!hasSegmentRequest && !requestQueue.empty()) {
+                    chunkRequest = requestQueue.top();
+                    requestQueue.pop();
+                    pendingOffsets.erase(chunkRequest.offset);
+                    
+                    // キャンセルされていたらスキップ
+                    if (cancelledOffsets.count(chunkRequest.offset) > 0) {
+                        cancelledOffsets.erase(chunkRequest.offset);
+                        continue;
+                    }
+                    
+                    activeOffsets.insert(chunkRequest.offset);
+                    hasChunkRequest = true;
+                }
             }
             
-            // ダウンロード実行
-            bool success = DownloadChunk(httpClient, request.offset);
-            
-            // アクティブリストから削除
-            {
-                std::lock_guard<std::mutex> lock(queueMutex);
-                activeOffsets.erase(request.offset);
+            // セグメントダウンロード実行
+            if (hasSegmentRequest) {
+                DownloadSegment(httpClient, segmentRequest);
+                
+                // アクティブリストから削除
+                {
+                    std::lock_guard<std::mutex> segLock(segmentMutex);
+                    activeSegments.erase(segmentRequest.segmentIndex);
+                }
+                continue;
             }
             
-            if (!success) {
-                Logger::Warn("ChunkDownloader: Failed to download chunk at offset {}",
-                                    request.offset);
+            // チャンクダウンロード実行
+            if (hasChunkRequest) {
+                bool success = DownloadChunk(httpClient, chunkRequest.offset);
+                
+                // アクティブリストから削除
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex);
+                    activeOffsets.erase(chunkRequest.offset);
+                }
+                
+                if (!success) {
+                    Logger::Warn("ChunkDownloader: Failed to download chunk at offset {}",
+                                        chunkRequest.offset);
+                }
             }
         }
         
@@ -165,6 +240,18 @@ struct ChunkDownloader::Impl {
     bool DownloadChunk(HttpClient& client, int64_t offset) {
         if (!cache || url.empty()) {
             return false;
+        }
+        
+        // HTTPヘッダーを設定（SetHeaders()で更新された最新の値を使用）
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (!headers.empty()) {
+                HttpClientConfig config;
+                config.headers = headers;
+                config.connectTimeoutMs = 10000;
+                config.readTimeoutMs = 30000;
+                client.Configure(config);
+            }
         }
         
         // チャンクインデックスとサイズを計算
@@ -252,6 +339,96 @@ struct ChunkDownloader::Impl {
             currentBandwidth.store((totalBytes / totalMs) * 1000.0);
         }
     }
+    
+    /// @brief HLSセグメントをダウンロード
+    /// @param client HttpClient
+    /// @param request セグメントリクエスト
+    void DownloadSegment(HttpClient& client, const SegmentRequest& request) {
+        Logger::Debug("ChunkDownloader: Starting download of segment {} from {}...",
+                            request.segmentIndex, request.url.substr(0, std::min(request.url.length(), size_t(80))));
+        
+        // HTTPヘッダーを設定（SetHttpHeaders()で更新された最新の値を使用）
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            Logger::Trace("ChunkDownloader: Configuring HTTP headers for segment {} ({} headers available)",
+                         request.segmentIndex, headers.size());
+            if (!headers.empty()) {
+                HttpClientConfig config;
+                config.headers = headers;
+                config.connectTimeoutMs = 30000;
+                config.readTimeoutMs = 60000;
+                client.Configure(config);
+                Logger::Debug("ChunkDownloader: Configured HTTP headers for segment {} ({} headers)",
+                              request.segmentIndex, headers.size());
+            } else {
+                Logger::Warn("ChunkDownloader: No HTTP headers available for segment {}", request.segmentIndex);
+            }
+        }
+        
+        // ダウンロード時間計測開始
+        auto startTime = std::chrono::steady_clock::now();
+        Logger::Debug("ChunkDownloader: Sending HTTP request for segment {} (Range: {}-{})", 
+                     request.segmentIndex, request.byteRangeStart, 
+                     request.byteRangeLength > 0 ? request.byteRangeStart + request.byteRangeLength - 1 : -1);
+        
+        HttpResponse response;
+        if (request.byteRangeLength > 0 && request.byteRangeStart >= 0) {
+            // Range Request
+            response = client.GetRange(request.url, request.byteRangeStart, 
+                                     request.byteRangeStart + request.byteRangeLength - 1);
+        } else {
+            // セグメント全体をダウンロード
+            response = client.Get(request.url);
+        }
+        
+        // ダウンロード時間計測終了
+        auto endTime = std::chrono::steady_clock::now();
+        double durationMs = std::chrono::duration<double, std::milli>(
+            endTime - startTime).count();
+        
+        Logger::Debug("ChunkDownloader: HTTP response for segment {}: status={}, success={}, size={}, duration={:.0f}ms",
+                     request.segmentIndex, response.statusCode, response.success, response.data.size(), durationMs);
+        
+        bool success = response.success && !response.data.empty();
+        
+        if (!success) {
+            Logger::Error("ChunkDownloader: FAILED to download segment {} - status={}, success={}, errorMessage={}",
+                          request.segmentIndex, response.statusCode, response.success, response.errorMessage);
+        }
+        
+        if (success) {
+            // 帯域幅サンプルを記録
+            {
+                std::lock_guard<std::mutex> lock(bandwidthMutex);
+                bandwidthSamples.push_back({
+                    static_cast<int64_t>(response.data.size()),
+                    durationMs
+                });
+                if (bandwidthSamples.size() > MAX_BANDWIDTH_SAMPLES) {
+                    bandwidthSamples.pop_front();
+                }
+                UpdateBandwidth();
+            }
+            
+            Logger::Debug("ChunkDownloader: Segment {} downloaded successfully ({} bytes in {:.0f}ms, {:.1f} KB/s)",
+                                request.segmentIndex, response.data.size(), durationMs,
+                                (response.data.size() / durationMs) * 1000.0 / 1024.0);
+        } else {
+            Logger::Error("ChunkDownloader: Failed to download segment {} (status {}): {}",
+                               request.segmentIndex, response.statusCode, response.errorMessage);
+        }
+        
+        // コールバックを呼び出し
+        SegmentDownloadCallback cb;
+        {
+            std::lock_guard<std::mutex> segLock(segmentMutex);
+            cb = segmentCallback;
+        }
+        
+        if (cb) {
+            cb(request.segmentIndex, std::move(response.data), success);
+        }
+    }
 };
 
 // =============================================================================
@@ -290,6 +467,11 @@ void ChunkDownloader::SetHeaders(const std::map<std::string, std::string>& heade
     std::lock_guard<std::mutex> lock(m_impl->queueMutex);
     m_impl->headers = headers;
     Logger::Debug("ChunkDownloader: Headers updated ({} entries)", headers.size());
+}
+
+void ChunkDownloader::SetHttpHeaders(const std::map<std::string, std::string>& headers) {
+    // SetHeadersと同じ実装（HLS用のエイリアス）
+    SetHeaders(headers);
 }
 
 // =============================================================================
@@ -339,6 +521,16 @@ void ChunkDownloader::Stop() {
         m_impl->pendingOffsets.clear();
         m_impl->activeOffsets.clear();
         m_impl->cancelledOffsets.clear();
+    }
+    
+    // セグメントキューをクリア
+    {
+        std::lock_guard<std::mutex> segLock(m_impl->segmentMutex);
+        while (!m_impl->segmentQueue.empty()) {
+            m_impl->segmentQueue.pop();
+        }
+        m_impl->pendingSegments.clear();
+        m_impl->activeSegments.clear();
     }
     
     m_impl->running.store(false);
@@ -392,6 +584,85 @@ double ChunkDownloader::GetBandwidth() const {
 
 bool ChunkDownloader::IsRunning() const {
     return m_impl->running.load();
+}
+
+// =============================================================================
+// HLSセグメントダウンロード
+// =============================================================================
+
+void ChunkDownloader::SetSegmentDownloadCallback(SegmentDownloadCallback callback) {
+    std::lock_guard<std::mutex> lock(m_impl->segmentMutex);
+    m_impl->segmentCallback = std::move(callback);
+    Logger::Debug("ChunkDownloader: Segment download callback set");
+}
+
+void ChunkDownloader::RequestSegment(const std::string& url, int64_t segmentIndex, ChunkPriority priority,
+                                     int64_t byteRangeStart, int64_t byteRangeLength) {
+    if (url.empty()) {
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(m_impl->segmentMutex);
+    
+    // 既に完了済み、または処理中の場合はスキップするか検討
+    // -> HLSの場合はリトライなどで再リクエストされることがあるので許可する
+    
+    SegmentRequest request;
+    request.url = url;
+    request.segmentIndex = segmentIndex;
+    request.priority = priority;
+    request.requestTime = std::chrono::steady_clock::now();
+    request.byteRangeStart = byteRangeStart;
+    request.byteRangeLength = byteRangeLength;
+    
+    m_impl->segmentQueue.push(request);
+    m_impl->pendingSegments.insert(segmentIndex);
+    
+    Logger::Debug("ChunkDownloader: Requested segment {} (priority {}, range {}-{})",
+                  segmentIndex, static_cast<int>(priority), byteRangeStart, byteRangeLength);
+    
+    m_impl->queueCv.notify_one();
+}
+
+void ChunkDownloader::ReprioritizeSegment(int64_t segmentIndex, ChunkPriority newPriority) {
+    std::lock_guard<std::mutex> segLock(m_impl->segmentMutex);
+    
+    // キューに入っている場合のみ変更可能（現在ダウンロード中のものは変更できない）
+    if (m_impl->pendingSegments.count(segmentIndex) == 0) {
+        return;
+    }
+    
+    // priority_queueから全要素を取り出して再構築
+    std::vector<SegmentRequest> requests;
+    while (!m_impl->segmentQueue.empty()) {
+        SegmentRequest req = m_impl->segmentQueue.top();
+        m_impl->segmentQueue.pop();
+        
+        if (req.segmentIndex == segmentIndex) {
+            req.priority = newPriority;
+        }
+        requests.push_back(req);
+    }
+    
+    // 再構築
+    for (auto& req : requests) {
+        m_impl->segmentQueue.push(req);
+    }
+    
+    Logger::Debug("ChunkDownloader: Reprioritized segment {} to priority {}",
+                        segmentIndex, static_cast<int>(newPriority));
+}
+
+void ChunkDownloader::ClearSegmentQueue() {
+    std::lock_guard<std::mutex> segLock(m_impl->segmentMutex);
+    
+    while (!m_impl->segmentQueue.empty()) {
+        m_impl->segmentQueue.pop();
+    }
+    m_impl->pendingSegments.clear();
+    // activeSegmentsはクリアしない（現在ダウンロード中のものは継続）
+    
+    Logger::Debug("ChunkDownloader: Segment queue cleared");
 }
 
 } // namespace io

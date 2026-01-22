@@ -15,6 +15,7 @@
 #include <string>
 #include <memory>
 #include <cstdint>
+#include <map>
 
 struct AVIOContext;
 
@@ -35,6 +36,7 @@ struct SliceLoadingConfig {
     std::string cachePath;                        // ファイルキャッシュパス（空=メモリのみ）
     std::string ytdlpPath;                        // yt-dlpパス（空=自動検出）
     int preferredHeight = 1080;                   // 希望解像度
+    std::map<std::string, std::string> httpHeaders;  // HTTPヘッダー（Cookie等）
 };
 
 /// @brief ソースタイプ

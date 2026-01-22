@@ -15,12 +15,31 @@
 #include "audio/BeatMapGenerator.h"
 #include "io/SliceLoadingManager.h"
 #include "io/CustomIOContext.h"
+#include "hls/HlsSliceLoadingManager.h"
 #include "utils/Logger.h"
 #include "utils/ErrorHandling.h"
 
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <algorithm>
+#include <cctype>
+
+// =============================================================================
+// ヘルパー関数
+// =============================================================================
+
+/// @brief URLがHLSストリームかどうかを判定
+/// @param url 判定するURL
+/// @return HLSストリームの場合true
+static bool IsHlsUrl(const std::string& url) {
+    std::string lower = url;
+    std::transform(lower.begin(), lower.end(), lower.begin(), 
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return (lower.find(".m3u8") != std::string::npos) ||
+           (lower.find("format=m3u8") != std::string::npos) ||
+           (lower.find("/hls/") != std::string::npos);
+}
 
 namespace ytdlpspout {
 
@@ -39,6 +58,7 @@ struct VideoPlayer::Impl {
     std::unique_ptr<TexturePool> texturePool;
     std::unique_ptr<FrameTimer> frameTimer;
     std::unique_ptr<io::SliceLoadingManager> sliceManager;  // スライス読み込みマネージャー
+    std::unique_ptr<hls::HlsSliceLoadingManager> hlsManager;  // HLSスライス読み込みマネージャー
 
     // 設定
     PlayerConfig config;
@@ -63,6 +83,12 @@ struct VideoPlayer::Impl {
     BeatJumpController beatJump;
     VideoPlayer::BeatCallback beatCallback;
     int lastBeatIndex = -1;  // 最後に発火したビートのインデックス
+
+    // HLSモードフラグ（HLSスライスローディング使用時はtrue）
+    bool isHlsMode = false;
+    
+    // HLSストリームフラグ（シーク処理の最適化に使用、FFmpegネイティブHLS含む）
+    bool isHlsStream = false;
 
     // スレッド同期
     std::mutex mutex;
@@ -126,9 +152,77 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
     
     ID3D11Device* device = config.useHardwareAccel ? m_impl->d3dContext->GetDevice() : nullptr;
     
+    // HLS判定
+    bool isHls = IsHlsUrl(source) || hls::HlsSliceLoadingManager::IsHlsUrl(source);
+    LOG_INFO("HLS detection - IsHlsUrl: {}, HlsSliceLoadingManager::IsHlsUrl: {}, final: {}",
+             IsHlsUrl(source), hls::HlsSliceLoadingManager::IsHlsUrl(source), isHls);
+    LOG_INFO("Source URL preview: {}...", source.substr(0, std::min(source.length(), size_t(80))));
+    LOG_INFO("Slice loading enabled in config: {}", config.slice.enabled);
+    LOG_INFO("HTTP headers count: {}", config.httpHeaders.size());
+    
+    // スライスローディング使用判定
+    bool useHlsSliceLoading = config.slice.enabled && isHls;
+    bool useSliceLoading = config.slice.enabled && !isHls;
+    
+    // HLSフラグを保存（シーク処理の最適化に使用）
+    m_impl->isHlsStream = isHls;
+    m_impl->isHlsMode = false;
+    
     // スライス読み込みの有効/無効に応じて初期化方法を切り替え
-    if (config.slice.enabled) {
-        // スライス読み込みを使用
+    if (useHlsSliceLoading) {
+        // HLSスライスローディングを使用
+        LOG_INFO("HLS slice loading mode enabled for: {}", source);
+        
+        // HLS設定を構築
+        hls::HlsSliceConfig hlsConfig;
+        hlsConfig.maxCacheMemory = config.slice.maxCacheMemory;
+        hlsConfig.maxConcurrentDownloads = config.slice.maxConcurrentDownloads;
+        hlsConfig.prefetchSegmentsAhead = 5;  // デフォルト
+        hlsConfig.readTimeoutMs = 30000;
+        
+        // HTTPヘッダーをコピー
+        hlsConfig.httpHeaders = config.httpHeaders;
+        
+        // HLSマネージャーを開く
+        m_impl->hlsManager = std::make_unique<hls::HlsSliceLoadingManager>();
+        if (!m_impl->hlsManager->Open(source, hlsConfig)) {
+            // HLSスライスローディングに失敗した場合、FFmpegネイティブにフォールバック
+            LOG_WARN("HLS slice loading failed, falling back to FFmpeg native HLS");
+            m_impl->hlsManager.reset();
+            
+            if (!m_impl->decoder->Open(source, device, config.httpHeaders)) {
+                m_impl->ReportError("Failed to open HLS source: " + source);
+                return false;
+            }
+        } else {
+            // HLSマネージャーのAVIOContextでデコーダーを開く
+            AVIOContext* avioCtx = m_impl->hlsManager->GetAVIOContext();
+            if (!avioCtx) {
+                m_impl->ReportError("Failed to get AVIO context from HLS manager");
+                m_impl->hlsManager.reset();
+                return false;
+            }
+            
+            // mpegtsフォーマットヒントを削除し自動検出させる（fmp4の場合があるため）
+            if (!m_impl->decoder->OpenWithAVIOContext(avioCtx, "", device, config.httpHeaders)) {
+                m_impl->ReportError("Failed to open decoder with HLS AVIO");
+                m_impl->hlsManager.reset();
+                return false;
+            }
+            
+            m_impl->isHlsMode = true;
+            LOG_INFO("Using HLS slice loading with AVIOContext for: {}", source);
+            
+            // HLSの総時間をVideoInfoに設定
+            double hlsDuration = m_impl->hlsManager->GetDuration();
+            if (hlsDuration > 0) {
+                m_impl->videoInfo = m_impl->decoder->GetVideoInfo();
+                // 注: VideoInfoはコピーなので直接変更できない
+                // HLS durationはGetDuration()で別途取得可能
+            }
+        }
+    } else if (useSliceLoading) {
+        // スライス読み込みを使用（非HLSの場合のみ）
         m_impl->sliceManager = std::make_unique<io::SliceLoadingManager>();
         
         io::SliceLoadingConfig sliceConfig;
@@ -139,12 +233,13 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
         sliceConfig.cachePath = config.slice.cachePath;
         sliceConfig.ytdlpPath = config.ytdlp.path;
         sliceConfig.preferredHeight = config.ytdlp.preferredHeight;
+        sliceConfig.httpHeaders = config.httpHeaders;  // HTTPヘッダーを渡す
         
         if (!m_impl->sliceManager->Open(source, sliceConfig)) {
             // スライス読み込みに失敗した場合、従来の方法にフォールバック
             LOG_WARN("Slice loading failed, falling back to direct open");
             m_impl->sliceManager.reset();
-            if (!m_impl->decoder->Open(source, device)) {
+            if (!m_impl->decoder->Open(source, device, config.httpHeaders)) {
                 m_impl->ReportError("Failed to open video source: " + source);
                 return false;
             }
@@ -152,8 +247,8 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
             // スライス読み込み成功 - CustomIOContext経由でオープン
             io::CustomIOContext* ioContext = m_impl->sliceManager->GetCustomIOContext();
             if (ioContext && ioContext->IsInitialized()) {
-                // CustomIOContext経由でデコーダーを開く（チャンクベース読み込み）
-                if (!m_impl->decoder->OpenWithCustomIO(ioContext, device)) {
+                // CustomIOContext経由でデコーダーを開く（チャンクベース読み込み）+ HTTPヘッダー
+                if (!m_impl->decoder->OpenWithCustomIO(ioContext, device, config.httpHeaders)) {
                     m_impl->ReportError("Failed to open decoder with custom IO");
                     return false;
                 }
@@ -161,7 +256,7 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
             } else {
                 // フォールバック: 解決したURLで従来の方法
                 const std::string& resolvedUrl = m_impl->sliceManager->GetResolvedUrl();
-                if (!m_impl->decoder->Open(resolvedUrl, device)) {
+                if (!m_impl->decoder->Open(resolvedUrl, device, config.httpHeaders)) {
                     m_impl->ReportError("Failed to open video source: " + resolvedUrl);
                     return false;
                 }
@@ -169,9 +264,11 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
             }
         }
     } else {
-        // 従来の方法でオープン
-        if (!m_impl->decoder->Open(source, device)) {
-            m_impl->ReportError("Failed to open video file: " + source);
+        // 従来の方法でオープン + HTTPヘッダー
+        // HLSの場合: FFmpegネイティブHTTPハンドラが内部リクエストにヘッダーを継承
+        // 非HLSの場合: スライスローディングが無効
+        if (!m_impl->decoder->Open(source, device, config.httpHeaders)) {
+            m_impl->ReportError("Failed to open video source: " + source);
             return false;
         }
     }
@@ -251,6 +348,14 @@ void VideoPlayer::Stop() {
     m_impl->converter.reset();
     m_impl->decoder.reset();
     m_impl->sliceManager.reset();  // スライス読み込みマネージャーを解放
+    
+    // HLSマネージャーをクローズ
+    if (m_impl->hlsManager) {
+        m_impl->hlsManager->Close();
+        m_impl->hlsManager.reset();
+    }
+    m_impl->isHlsMode = false;
+    
     m_impl->frameTimer.reset();
     m_impl->d3dContext.reset();
 
@@ -302,6 +407,16 @@ bool VideoPlayer::Seek(double seconds) {
     }
 
     LOG_DEBUG("Seeking to {:.2f}s", seconds);
+    
+    // HLSストリームの場合、シーク後にバッファリング安定化のためログ出力
+    if (m_impl->isHlsStream) {
+        LOG_INFO("HLS stream: performing seek with enhanced buffer flush");
+    }
+    
+    // HLSスライス読み込みマネージャーにシークを通知
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        m_impl->hlsManager->NotifySeek(seconds);
+    }
     
     // スライス読み込みマネージャーにシークを通知
     if (m_impl->sliceManager) {
@@ -458,6 +573,11 @@ bool VideoPlayer::ProcessFrame() {
     m_impl->currentTime = m_impl->decoder->GetCurrentPTS();
     m_impl->currentFrame = m_impl->decoder->GetCurrentFrameNumber();
 
+    // HLSスライス読み込みマネージャーに再生位置を通知（プリフェッチ最適化用）
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        m_impl->hlsManager->UpdatePlaybackPosition(m_impl->currentTime);
+    }
+    
     // スライス読み込みマネージャーに再生位置を通知（プリフェッチ最適化用）
     if (m_impl->sliceManager) {
         m_impl->sliceManager->UpdatePlaybackPosition(m_impl->currentTime);
@@ -552,24 +672,78 @@ uint64_t VideoPlayer::GetSentFrameCount() const {
 
 double VideoPlayer::GetDownloadProgress() const {
     // 動画が読み込まれていない場合は0.0を返す
-    if (m_impl->state == PlayerState::Stopped && !m_impl->sliceManager) {
+    if (m_impl->state == PlayerState::Stopped && !m_impl->sliceManager && !m_impl->hlsManager) {
         return 0.0;
     }
-    if (!m_impl->sliceManager) {
-        return 1.0;  // スライス読み込み無効時は100%
+    
+    // HLSスライス読み込みモード
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        return m_impl->hlsManager->GetDownloadProgress();
     }
-    return m_impl->sliceManager->GetDownloadProgress();
+    
+    // 通常スライス読み込み
+    if (m_impl->sliceManager) {
+        return m_impl->sliceManager->GetDownloadProgress();
+    }
+    
+    return 1.0;  // スライス読み込み無効時は100%
 }
 
 bool VideoPlayer::IsFullyCached() const {
     // 動画が読み込まれていない場合はfalseを返す
-    if (m_impl->state == PlayerState::Stopped && !m_impl->sliceManager) {
+    if (m_impl->state == PlayerState::Stopped && !m_impl->sliceManager && !m_impl->hlsManager) {
         return false;
     }
-    if (!m_impl->sliceManager) {
-        return true;  // スライス読み込み無効時は常にtrue
+    
+    // HLSスライス読み込みモード
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        return m_impl->hlsManager->IsFullyCached();
     }
-    return m_impl->sliceManager->IsFullyCached();
+    
+    // 通常スライス読み込み
+    if (m_impl->sliceManager) {
+        return m_impl->sliceManager->IsFullyCached();
+    }
+    
+    return true;  // スライス読み込み無効時は常にtrue
+}
+
+bool VideoPlayer::IsHlsMode() const {
+    return m_impl->isHlsMode;
+}
+
+VideoPlayer::HlsCacheStats VideoPlayer::GetHlsCacheStats() const {
+    HlsCacheStats stats;
+    
+    // HLSモードの場合
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        stats.cachedSegments = static_cast<int>(m_impl->hlsManager->GetCachedSegmentCount());
+        stats.totalSegments = static_cast<int>(m_impl->hlsManager->GetTotalSegmentCount());
+        stats.downloadProgress = m_impl->hlsManager->GetDownloadProgress();
+        stats.bandwidth = m_impl->hlsManager->GetBandwidth();
+        stats.isFullyCached = m_impl->hlsManager->IsFullyCached();
+        stats.isHlsMode = true;
+    }
+    // 通常スライス読み込みの場合
+    else if (m_impl->sliceManager) {
+        stats.cachedSegments = static_cast<int>(m_impl->sliceManager->GetCachedChunkCount());
+        stats.totalSegments = static_cast<int>(m_impl->sliceManager->GetTotalChunkCount());
+        stats.downloadProgress = m_impl->sliceManager->GetDownloadProgress();
+        stats.bandwidth = m_impl->sliceManager->GetBandwidth();
+        stats.isFullyCached = m_impl->sliceManager->IsFullyCached();
+        stats.isHlsMode = false;
+    }
+    // スライス読み込み無効の場合
+    else {
+        stats.cachedSegments = 0;
+        stats.totalSegments = 0;
+        stats.downloadProgress = (m_impl->state != PlayerState::Stopped) ? 1.0 : 0.0;
+        stats.bandwidth = 0.0;
+        stats.isFullyCached = (m_impl->state != PlayerState::Stopped);
+        stats.isHlsMode = false;
+    }
+    
+    return stats;
 }
 
 // =============================================================================

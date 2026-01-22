@@ -30,7 +30,8 @@
       ]
     },
     "nlohmann-json",
-    "doctest"
+    "doctest",
+    "gtest"
   ],
   "overrides": []
 }

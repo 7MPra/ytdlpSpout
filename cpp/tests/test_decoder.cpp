@@ -14,6 +14,7 @@
 #include <iostream>
 #include <cassert>
 #include <string>
+#include <map>
 
 // Windows
 #include <Windows.h>
@@ -30,6 +31,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/dict.h>
 }
 
 // =============================================================================
@@ -236,6 +238,81 @@ bool Test_NV12Format() {
 }
 
 // =============================================================================
+// テストケース: FFmpeg AVDictionaryヘッダー設定
+// =============================================================================
+
+bool Test_AVDictionaryHeaders() {
+    // HTTPヘッダーをAVDictionaryに設定するテスト
+    std::map<std::string, std::string> headers = {
+        {"Cookie", "session_id=abc123"},
+        {"User-Agent", "ytdlpSpout/1.0"},
+        {"Referer", "https://example.com/"}
+    };
+    
+    AVDictionary* opts = nullptr;
+    
+    // ヘッダーを改行区切りで連結
+    std::string headersStr;
+    for (const auto& [key, value] : headers) {
+        headersStr += key + ": " + value + "\r\n";
+    }
+    
+    int ret = av_dict_set(&opts, "headers", headersStr.c_str(), 0);
+    TEST_ASSERT(ret >= 0, "av_dict_set should succeed");
+    
+    // 設定値を確認
+    AVDictionaryEntry* entry = av_dict_get(opts, "headers", nullptr, 0);
+    TEST_ASSERT(entry != nullptr, "headers entry should exist");
+    TEST_ASSERT(entry->value != nullptr, "headers value should not be null");
+    
+    std::string retrievedHeaders(entry->value);
+    TEST_ASSERT(retrievedHeaders.find("Cookie: session_id=abc123") != std::string::npos, 
+                "Cookie header should be present");
+    TEST_ASSERT(retrievedHeaders.find("User-Agent: ytdlpSpout/1.0") != std::string::npos,
+                "User-Agent header should be present");
+    TEST_ASSERT(retrievedHeaders.find("Referer: https://example.com/") != std::string::npos,
+                "Referer header should be present");
+    TEST_ASSERT(retrievedHeaders.find("\r\n") != std::string::npos,
+                "Headers should be CRLF separated");
+    
+    std::cout << "  Headers string length: " << headersStr.size() << std::endl;
+    std::cout << "  Headers count: " << headers.size() << std::endl;
+    
+    av_dict_free(&opts);
+    TEST_ASSERT(opts == nullptr, "opts should be null after free");
+    
+    return true;
+}
+
+// =============================================================================
+// テストケース: 空のHTTPヘッダー処理
+// =============================================================================
+
+bool Test_EmptyHeaders() {
+    // 空のヘッダーマップでもエラーにならないことを確認
+    std::map<std::string, std::string> emptyHeaders;
+    
+    AVDictionary* opts = nullptr;
+    
+    // 空の場合は設定しない
+    if (!emptyHeaders.empty()) {
+        std::string headersStr;
+        for (const auto& [key, value] : emptyHeaders) {
+            headersStr += key + ": " + value + "\r\n";
+        }
+        av_dict_set(&opts, "headers", headersStr.c_str(), 0);
+    }
+    
+    // optsはnullのまま
+    TEST_ASSERT(opts == nullptr, "opts should remain null for empty headers");
+    
+    // nullでもav_dict_freeは安全
+    av_dict_free(&opts);
+    
+    return true;
+}
+
+// =============================================================================
 // メイン
 // =============================================================================
 
@@ -261,6 +338,8 @@ int main() {
     RUN_TEST(Test_FFmpegInitialization);
     RUN_TEST(Test_HardwareDecoders);
     RUN_TEST(Test_NV12Format);
+    RUN_TEST(Test_AVDictionaryHeaders);
+    RUN_TEST(Test_EmptyHeaders);
 
     // 結果表示
     std::cout << "\n========================================" << std::endl;

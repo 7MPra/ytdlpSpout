@@ -15,6 +15,7 @@
 #include <memory>
 #include <cstdint>
 #include <functional>
+#include <map>
 
 // FFmpeg前方宣言
 struct AVIOContext;
@@ -39,6 +40,7 @@ struct CustomIOContextConfig {
     int prefetchChunksAhead = 24;              // 先読みチャンク数
     int criticalChunksAhead = 6;               // 最優先チャンク数（即座にダウンロード）
     bool enableContinuousDownload = true;      // ファイル全体を継続ダウンロードするか
+    std::map<std::string, std::string> httpHeaders;  // HTTPヘッダー（Cookie等）
 };
 
 /// @brief IOソースタイプ

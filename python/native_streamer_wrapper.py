@@ -27,6 +27,7 @@ except ImportError:
     HAS_NUMPY = False
 
 from .ytdlpspout_native import YtdlpSpoutNative, YtdlpSpoutState
+from .ytdlp_resolver import YtDlpAsyncResolver
 
 
 class NativeStreamerWrapper:
@@ -57,6 +58,7 @@ class NativeStreamerWrapper:
         init_ok_cb: Optional[Callable[[], None]] = None,
         external_spout_sender: Any = None,  # C++ DLLでは無視
         pre_resolved_url: Optional[str] = None,  # 事前解決済みの直接ストリームURL
+        pre_resolved_headers: Optional[dict] = None,  # 事前解決済みのHTTPヘッダー
     ):
         """
         NativeStreamerWrapperを初期化
@@ -73,9 +75,11 @@ class NativeStreamerWrapper:
             init_ok_cb: 初期化成功時コールバック関数
             external_spout_sender: 外部SpoutSender（C++ DLLでは無視）
             pre_resolved_url: 事前にyt-dlpで解決済みの直接ストリームURL（オプション）
+            pre_resolved_headers: 事前解決済みのHTTPヘッダー（Cookie等）
         """
         self.video_url = video_url
         self._pre_resolved_url = pre_resolved_url  # 事前解決済みURL
+        self._pre_resolved_headers = pre_resolved_headers  # 事前解決済みHTTPヘッダー
         self.sender_name = sender_name
         self.loop_vod = loop_vod
         self._verbose = verbose
@@ -201,6 +205,18 @@ class NativeStreamerWrapper:
         """ログメッセージを出力"""
         if self._log_cb:
             self._log_cb(msg)
+    
+    def _get_fallback_formats(self) -> list:
+        """
+        フォールバックフォーマットのリストを取得
+        
+        ニコニコ動画等のAAC音声対応を含む
+        ytdlp_resolver.FALLBACK_FORMATS を共通定義として使用
+        
+        Returns:
+            フォーマット文字列のリスト
+        """
+        return list(YtDlpAsyncResolver.FALLBACK_FORMATS)
     
     # === シームレス切り替え対応メソッド ===
     
@@ -434,28 +450,59 @@ class NativeStreamerWrapper:
     
     def _run(self):
         """再生スレッドのメイン処理"""
+        # デバッグログ用関数
+        def debug_log(msg):
+            try:
+                with open("F:/ytdlpSpout/python_debug.log", "a", encoding="utf-8") as f:
+                    import datetime
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                    f.write(f"[{ts}] {msg}\n")
+            except:
+                pass
+
+        debug_log("--- _run thread started ---")
         try:
             # スレッド内でDLLディレクトリを設定（Windowsのスレッドセーフティ対策）
             import os
             from pathlib import Path
+            import sys
+            
+            debug_log(f"CWD: {os.getcwd()}")
+            
             dll_search_paths = [
                 Path(__file__).parent / "ytdlpspout.dll",
+                Path("F:/ytdlpSpout/python/ytdlpspout.dll"), # 絶対パスも追加
+                Path(__file__).parent.parent / "cpp" / "build" / "bin" / "Release", # 正しいReleaseパス
                 Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Release",
                 Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Debug",
             ]
+            
             for dll_dir in dll_search_paths:
-                if dll_dir.is_dir():
-                    dll_dir_str = str(dll_dir.resolve())
+                dll_dir_str = str(dll_dir.parent.resolve()) if dll_dir.is_file() else str(dll_dir.resolve())
+                debug_log(f"Checking DLL dir: {dll_dir_str}")
+                
+                if os.path.isdir(dll_dir_str):
                     if dll_dir_str not in os.environ.get("PATH", ""):
                         os.environ["PATH"] = dll_dir_str + os.pathsep + os.environ.get("PATH", "")
+                        debug_log("Added to PATH")
+                    
                     if hasattr(os, 'add_dll_directory'):
                         try:
                             os.add_dll_directory(dll_dir_str)
-                        except (OSError, AttributeError):
-                            pass
-                    break
+                            debug_log("Added to add_dll_directory")
+                        except (OSError, AttributeError) as e:
+                            debug_log(f"Failed to add_dll_directory: {e}")
             
-            self._native = YtdlpSpoutNative()
+            debug_log("Initializing YtdlpSpoutNative...")
+            try:
+                self._native = YtdlpSpoutNative()
+                debug_log("YtdlpSpoutNative initialized successfully")
+            except Exception as e:
+                debug_log(f"Failed to initialize YtdlpSpoutNative: {e}")
+                import traceback
+                debug_log(traceback.format_exc())
+                return
+
             self.log(f"[Native] C++ DLLバックエンドを初期化中...")
             
             # 事前解決済みURLがある場合はそれを使用
@@ -464,11 +511,24 @@ class NativeStreamerWrapper:
             if self._pre_resolved_url:
                 self.log(f"[Native] 事前解決済みURLを使用: 直接ストリームURL")
             
-            self._native.start(
-                input_file=input_url,
+            # HTTPヘッダーがある場合はログに数を記録（セキュリティ: 値は出力しない）
+            if self._pre_resolved_headers:
+                header_count = len(self._pre_resolved_headers)
+                self.log(f"[Native] HTTPヘッダー数: {header_count}")
+            
+            # デバッグ: URLの概要をログ（セキュリティのため完全なURLは出さない）
+            url_preview = input_url[:80] + "..." if len(input_url) > 80 else input_url
+            is_m3u8 = ".m3u8" in input_url.lower()
+            self.log(f"[Native] URL概要: {url_preview}")
+            self.log(f"[Native] HLS判定: {is_m3u8}")
+            
+            # start_ex()を使用してHTTPヘッダーを渡す
+            self._native.start_ex(
+                source=input_url,
                 sender_name=self.sender_name,
                 loop=self.loop_vod,
-                verbose=self._verbose
+                verbose=self._verbose,
+                http_headers=self._pre_resolved_headers
             )
             
             # 動画情報取得

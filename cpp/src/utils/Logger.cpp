@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <filesystem>
+#include <iostream>
 
 namespace ytdlpspout {
 
@@ -36,33 +37,36 @@ void Logger::Initialize(bool logToFile, const std::string& logFilePath, LogLevel
         consoleSink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
         sinks.push_back(consoleSink);
 
-        // ファイル出力シンク（オプション）
-        if (logToFile) {
-            std::string filePath = logFilePath.empty() ? "ytdlpspout.log" : logFilePath;
-            
-            // ローテーティングファイルシンク（5MB x 3ファイル）
-            auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-                filePath, 
-                5 * 1024 * 1024,  // 5MB
-                3                  // 3ファイル保持
-            );
-            fileSink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%s:%#] %v");
-            sinks.push_back(fileSink);
+        // ファイル出力設定
+        if (logToFile && !logFilePath.empty()) {
+            try {
+                // ファイルシンクを作成 (truncate=true: 毎回上書き)
+                auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath, true);
+                file_sink->set_level(spdlog::level::trace);
+                sinks.push_back(file_sink);
+            } catch (const spdlog::spdlog_ex& ex) {
+                 std::cerr << "Log initialization failed: " << ex.what() << std::endl;
+            }
         }
 
-        // マルチシンクロガーを作成
-        s_logger = std::make_shared<spdlog::logger>("ytdlpspout", sinks.begin(), sinks.end());
+        // ロガー作成
+        auto logger = std::make_shared<spdlog::logger>("ytdlpspout", sinks.begin(), sinks.end());
+        
+        // パターン設定: 日時 [スレッドID] [レベル] メッセージ
+        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%t] [%l] %v");
         
         // ログレベル設定
-        SetLevel(level);
+        logger->set_level(static_cast<spdlog::level::level_enum>(level));
+        
+        // 即時フラッシュ設定（デバッグレベル以上でフラッシュ）
+        // これによりクラッシュ時でもログが保存される可能性が高まる
+        logger->flush_on(spdlog::level::debug);
+        
+        // グローバルロガーとして登録
+        spdlog::set_default_logger(logger);
 
-        // デフォルトロガーとして登録
-        spdlog::register_logger(s_logger);
-        spdlog::set_default_logger(s_logger);
-
-        // フラッシュポリシー設定（エラー以上で即座にフラッシュ）
-        s_logger->flush_on(spdlog::level::err);
-
+        // 静的メンバに設定
+        s_logger = logger;
         s_initialized = true;
 
         // 初期化完了メッセージ

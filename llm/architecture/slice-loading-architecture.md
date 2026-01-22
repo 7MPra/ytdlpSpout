@@ -96,6 +96,13 @@ URL解決 → スライス読み込み（CustomIOContext） → 単一再生パ�
 | VideoPlayer + SliceLoadingManager | `cpp/src/player/VideoPlayer.cpp` | **統合済み (Phase 2)** |
 | C API 拡張 | `cpp/src/bindings/c_api.cpp` | **統合済み (Phase 3)** |
 | Python GUI 統合 | `python/ytdlpspout_native.py` | **統合済み (Phase 4)** |
+| M3U8Parser | `cpp/src/hls/M3U8Parser.h/cpp` | 実装済み |
+| AesCbcDecryptor | `cpp/src/hls/AesCbcDecryptor.h/cpp` | 実装済み |
+| HlsSegmentCache | `cpp/src/hls/HlsSegmentCache.h/cpp` | 実装済み |
+| HlsCustomAVIOContext | `cpp/src/hls/HlsCustomAVIOContext.h/cpp` | 実装済み |
+| HlsSliceLoadingManager | `cpp/src/hls/HlsSliceLoadingManager.h/cpp` | 実装済み |
+| VideoPlayer + HlsSliceLoadingManager | `cpp/src/player/VideoPlayer.cpp` | **統合済み (Phase 6)** |
+| VideoDecoder + AVIOContext | `cpp/src/decoder/VideoDecoder.cpp` | **追加: OpenWithAVIOContext()** |
 
 ### 完了済み
 - ✅ 全フェーズ統合完了
@@ -440,6 +447,21 @@ YTDLPSPOUT_API int ytdlpspout_start_ex(
 YTDLPSPOUT_API double ytdlpspout_get_download_progress(ytdlpspout_handle handle);
 YTDLPSPOUT_API double ytdlpspout_get_bandwidth(ytdlpspout_handle handle);
 YTDLPSPOUT_API int ytdlpspout_is_fully_cached(ytdlpspout_handle handle);
+
+// HLS統計取得
+typedef struct YtdlpSpoutHlsCacheStats {
+    int cachedSegments;       // キャッシュ済みセグメント数
+    int totalSegments;        // 総セグメント数
+    double downloadProgress;  // ダウンロード進捗 (0.0〜1.0)
+    double bandwidth;         // 推定帯域幅 (bytes/sec)
+    int isFullyCached;        // 完全キャッシュ済み (1=true)
+    int isHlsMode;            // HLSモードで再生中 (1=true)
+} YtdlpSpoutHlsCacheStats;
+
+YTDLPSPOUT_API int ytdlpspout_get_hls_cache_stats(
+    ytdlpspout_handle handle,
+    YtdlpSpoutHlsCacheStats* stats
+);
 ```
 
 ---
@@ -465,6 +487,7 @@ YTDLPSPOUT_API int ytdlpspout_is_fully_cached(ytdlpspout_handle handle);
    - `ytdlpspout_get_bandwidth()` - 帯域幅
    - `ytdlpspout_is_fully_cached()` - 完全キャッシュ判定
    - `ytdlpspout_get_cache_stats()` - キャッシュ統計
+   - `ytdlpspout_get_hls_cache_stats()` - HLS統計情報（セグメント数、帯域幅、HLSモード判定等）
 4. ✅ ユニットテスト (`test_c_api.cpp` - 41テスト、73アサーション全て通過)
 
 #### 追加された構造体
@@ -576,6 +599,346 @@ YtdlpSpoutConfigEx {
     └── No: [直接URLでストリーマー作成]
               (従来の処理)
 ```
+
+### Phase 6: HLSスライス読み込みマネージャー ✅ 完了
+**目標**: HLSストリーム（m3u8）を統合管理するマネージャークラス
+
+1. `cpp/src/hls/HlsSliceLoadingManager.h/cpp` - HLSスライス読み込みマネージャー（新規作成）
+   - **HlsSliceConfig** 構造体:
+     - `maxCacheMemory`: キャッシュメモリサイズ（256MB）
+     - `maxConcurrentDownloads`: 並列ダウンロード数（4）
+     - `prefetchSegmentsAhead`: 先読みセグメント数（5）
+     - `readTimeoutMs`: 読み取りタイムアウト（30秒）
+     - `httpHeaders`: HTTPヘッダー（Cookie等）
+   - **HlsSliceLoadingManager** クラス:
+     - `Open(hlsUrl, config)`: HLS URLで開く
+       1. HTTPClientでm3u8をダウンロード
+       2. M3U8Parserでパース
+       3. 暗号化キーがある場合ダウンロード
+       4. HlsSegmentCache初期化
+       5. ChunkDownloader設定
+       6. HlsCustomAVIOContext初期化
+       7. 先頭セグメントのダウンロード開始
+     - `Close()`: クローズ
+     - `IsOpen()`: 開いているか
+     - `GetAVIOContext()`: FFmpeg AVIOContext取得
+     - `IsHlsUrl(url)`: HLS URLか判定（静的メソッド）
+     - `GetDuration()`: 総時間（秒）
+     - `GetDownloadProgress()`: ダウンロード進捗
+     - `GetBandwidth()`: 推定帯域幅
+     - `IsFullyCached()`: 完全キャッシュ済みか
+     - `GetCachedSegmentCount()`: キャッシュ済みセグメント数
+     - `GetTotalSegmentCount()`: 総セグメント数
+     - `UpdatePlaybackPosition(seconds)`: 再生位置更新（プリフェッチ）
+     - `NotifySeek(seconds)`: シーク通知（優先度再計算）
+
+2. 依存コンポーネント統合:
+   - `M3U8Parser`: m3u8プレイリストのパース
+   - `AesCbcDecryptor`: AES-128-CBC復号
+   - `HlsSegmentCache`: セグメントのメモリキャッシュ
+   - `HlsCustomAVIOContext`: FFmpegへのセグメント提供
+   - `ChunkDownloader`: 並列セグメントダウンロード
+   - `HttpClient`: HTTP通信
+
+3. プリフェッチロジック:
+   - 現在位置から `prefetchSegmentsAhead` 個先までリクエスト
+   - 優先度: Critical（現在）→ High（+1）→ Medium（+2以降）
+   - シーク時: ダウンロードキューをクリアして再スケジュール
+
+4. HTTPヘッダーの伝播（認証対応）:
+   - `HlsSliceConfig.httpHeaders` から `ChunkDownloader::SetHttpHeaders()` へ設定
+   - `ChunkDownloader::DownloadSegment()` で毎回最新のヘッダーを`HttpClient::Configure()`で適用
+   - ニコニコ動画等のCookie認証が必要なサービスに対応
+
+5. テスト追加:
+   - `cpp/tests/test_hls_slice_loading_manager.cpp` - 10テスト
+     - IsHlsUrl判定テスト
+     - 初期化テスト（無効入力）
+     - 統計情報テスト
+     - プリフェッチ動作テスト
+     - 設定テスト
+
+**HLS URL判定**:
+- `.m3u8` 拡張子: true
+- `.m3u` 拡張子: true
+- その他（.mp4, YouTube URL等）: false
+
+**処理フロー**:
+```
+[Open(hlsUrl)]
+    │
+    ▼
+[m3u8ダウンロード]
+    │
+    ▼
+[M3U8Parserでパース]
+    │
+    ▼
+[暗号化キーがある場合ダウンロード]
+    │
+    ▼
+[HlsSegmentCache初期化]
+    │
+    ▼
+[ChunkDownloader設定・開始]
+    │
+    ▼
+[HlsCustomAVIOContext初期化]
+    │
+    ▼
+[先頭セグメントのダウンロード開始]
+```
+
+### Phase 7: VideoPlayer HLS統合 ✅ 完了
+**目標**: VideoPlayerにHlsSliceLoadingManagerを統合
+
+1. `cpp/src/decoder/VideoDecoder.h/cpp` - AVIOContext直接受付の追加
+   - **OpenWithAVIOContext()**: 新規メソッド追加
+     - 生の `AVIOContext*` を直接受け取る
+     - フォーマットヒント（例: "mpegts"）サポート
+     - HLSセグメントのデコードに使用
+
+2. `cpp/src/player/VideoPlayer.h/cpp` - HLSスライスローディング統合
+   - **Impl構造体拡張**:
+     - `std::unique_ptr<hls::HlsSliceLoadingManager> hlsManager`
+     - `bool isHlsMode` フラグ
+   - **Start()変更**:
+     - `HlsSliceLoadingManager::IsHlsUrl()` でHLS判定
+     - HLSの場合: HlsSliceLoadingManager経由でオープン
+     - 非HLSの場合: 既存のSliceLoadingManager使用
+     - フォールバック: FFmpegネイティブHLS
+   - **Stop()変更**:
+     - hlsManagerのClose()とreset()
+     - isHlsModeのクリア
+   - **Seek()変更**:
+     - HLSモード時にhlsManager->NotifySeek()呼び出し
+   - **ProcessFrame()変更**:
+     - HLSモード時にhlsManager->UpdatePlaybackPosition()呼び出し
+   - **GetDownloadProgress()/IsFullyCached()**:
+     - HLSモード時はhlsManagerから取得
+
+3. テスト追加:
+   - `cpp/tests/test_video_player_hls.cpp` - 10テスト
+     - HLS URL判定テスト
+     - PlayerConfig設定テスト
+     - 無効入力テスト
+     - 状態テスト
+
+**HLS統合フロー**:
+```
+[VideoPlayer::Start(config)]
+    │
+    ▼
+[HLS URL判定] ──Yes──▶ [HlsSliceLoadingManager::Open()]
+    │                           │
+    No                          ▼
+    │                  [GetAVIOContext()]
+    ▼                           │
+[SliceLoadingManager]           ▼
+    │                  [VideoDecoder::OpenWithAVIOContext()]
+    ▼                           │
+[VideoDecoder::OpenWithCustomIO()]   │
+    │                           │
+    └───────────────────────────┴───────▶ [再生ループ]
+                                              │
+                                              ▼
+                                    [ProcessFrame()]
+                                              │
+                                              ▼
+                              [isHlsMode? → UpdatePlaybackPosition()]
+```
+
+---
+
+## スレッドセーフティとロック戦略
+
+### ロック階層とデッドロック回避
+
+HLSコンポーネントでは複数のコンポーネントがミューテックスを持つため、デッドロックを回避するための設計原則を定めています。
+
+#### 設計原則
+
+1. **ロック保持中の外部呼び出し禁止**
+   - ミューテックスを保持したまま、他コンポーネント（cache、downloader等）のメソッドを呼び出さない
+   - 必要な情報をロック内で収集し、ロック解除後に外部呼び出しを行う
+
+2. **読み取りと更新の分離**
+   - ロック内: 状態の読み取り/書き込み
+   - ロック外: I/O操作、他コンポーネント呼び出し
+
+#### HlsSliceLoadingManager のパターン
+
+```cpp
+// ✅ 良い例: UpdatePlaybackPosition
+void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
+    // リクエスト対象のセグメント情報を収集（ロック内）
+    std::vector<std::tuple<std::string, int64_t, ChunkPriority>> segmentsToRequest;
+    int64_t currentSegment;
+    int prefetchAhead;
+    
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        currentSegment = m_impl->cache->GetSegmentIndexFromTime(seconds);
+        // ... 情報収集 ...
+    }
+    
+    // ロック外でリクエスト発行
+    for (const auto& [url, index, priority] : segmentsToRequest) {
+        m_impl->downloader->RequestSegment(url, index, priority);
+    }
+    
+    // ロック外でキャッシュ最適化
+    m_impl->cache->OptimizeForPlayback(currentSegment, prefetchAhead);
+}
+```
+
+```cpp
+// ❌ 悪い例（修正前）: デッドロックリスク
+void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    // ロック保持中に外部メソッド呼び出し → デッドロックの可能性
+    m_impl->downloader->RequestSegment(...);
+    m_impl->cache->OptimizeForPlayback(...);
+}
+```
+
+#### HlsCustomAVIOContext のパターン
+
+```cpp
+// ✅ 良い例: ReadPacket
+int HlsCustomAVIOContext::ReadPacket(void* opaque, uint8_t* buf, int bufSize) {
+    while (totalBytesRead < bufSize) {
+        // 1. ロック内で情報取得
+        int64_t segmentToRead;
+        int timeout;
+        HlsSegmentCache* cache;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            segmentToRead = impl.currentSegmentIndex;
+            timeout = impl.readTimeoutMs;
+            cache = impl.cache;
+        }
+        
+        // 2. ロック外でデータ取得（待機可能）
+        auto segmentData = cache->ReadSegment(segmentToRead, timeout);
+        
+        // 3. 再度ロックして状態更新
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            if (impl.currentSegmentIndex != segmentToRead) {
+                continue;  // シーク発生 → やり直し
+            }
+            // データコピーと位置更新
+        }
+    }
+}
+```
+
+```cpp
+// ❌ 悪い例（修正前）: シーク不可
+int HlsCustomAVIOContext::ReadPacket(void* opaque, uint8_t* buf, int bufSize) {
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    // 待機中にシークできない
+    auto segmentData = impl.cache->ReadSegment(impl.currentSegmentIndex, impl.readTimeoutMs);
+}
+```
+
+### 正規表現の最適化
+
+M3U8Parser 内の正規表現は静的化してコンパイルコストを削減:
+
+```cpp
+std::optional<HlsEncryptionKey> M3U8Parser::ParseKeyTag(...) {
+    // 正規表現を静的化してコンパイルコストを削減
+    static const std::regex methodRegex("METHOD=([^,]+)", std::regex::icase);
+    static const std::regex uriRegex("URI=\"([^\"]+)\"", std::regex::icase);
+    static const std::regex ivRegex("IV=(0x[0-9a-fA-F]+)", std::regex::icase);
+    // ...
+}
+```
+
+### マジックナンバーの排除
+
+URL解決時のスキーム長は定数化:
+
+```cpp
+// "../" の解決
+constexpr size_t MIN_SCHEME_LENGTH = 8;  // "https://"
+if (slashPos == std::string::npos || slashPos < MIN_SCHEME_LENGTH) break;
+```
+
+### HLSスライスローディング初期化の待機
+
+HLSストリームを開く際、FFmpegが `avformat_find_stream_info()` でセグメントを読み込もうとする前に、最初のセグメントが利用可能になっている必要があります。`HlsSliceLoadingManager::Open()` は、条件変数を使用して最初のセグメントがダウンロードされるまで効率的に待機します：
+
+```cpp
+// HlsSliceLoadingManager.cpp - Open()内
+
+// 最初のセグメントをURGENT優先度でリクエスト
+const auto& firstSegment = m_impl->playlist.segments[0];
+m_impl->downloader->RequestSegment(firstSegment.url, 0, io::ChunkPriority::URGENT);
+
+// 条件変数で待機（ポーリングではなく即座に通知を受ける）
+const int waitTimeoutMs = config.readTimeoutMs > 0 ? config.readTimeoutMs : 30000;
+if (!m_impl->cache->WaitForSegment(0, waitTimeoutMs)) {
+    LOG_WARN("First segment not available within timeout");
+}
+
+// プリフェッチを開始（最初のセグメントがダウンロードされた後）
+UpdatePlaybackPosition(0.0);
+```
+
+`WaitForSegment()` は条件変数を使用し、セグメントがキャッシュに書き込まれた瞬間に即座に起床します。これにより、ポーリング（100ms間隔）と比較して、最大100ms近くの待機時間を削減できます。
+
+---
+
+## FFmpegの役割
+
+HLSスライス読み込みアーキテクチャでは、FFmpegは以下の役割を担います：
+
+1. **TSコンテナのデマックス**: HLSセグメント（.ts）からビデオ/オーディオストリームを分離
+2. **コーデックデコード**: H.264/H.265/AV1等のビデオデコード、AAC/MP3等のオーディオデコード
+3. **ハードウェアアクセラレーション**: D3D11VA/NVDEC等によるGPUデコード
+
+### データフロー
+```
+[yt-dlp URL解決] → [HLSプレイリスト(.m3u8)]
+                           ↓
+                   [ChunkDownloader]
+                   (並行ダウンロード)
+                           ↓
+                   [HlsSegmentCache]
+                   (LRU管理、AES復号)
+                           ↓
+                   [HlsCustomAVIOContext]
+                   (AVIOコールバック提供)
+                           ↓
+                   [FFmpeg AVIOContext]
+                           ↓
+                   [FFmpeg avformat]
+                   (TSデマックス)
+                           ↓
+                   [FFmpeg avcodec]
+                   (H.264/AACデコード)
+                           ↓
+                   [D3D11テクスチャ]
+                   (フレーム変換)
+                           ↓
+                   [Spout出力]
+```
+
+### 役割分担
+
+| コンポーネント | 担当 |
+|---------------|------|
+| yt-dlp | URL解決、フォーマット選択 |
+| ytdlpSpout | ダウンロード管理、キャッシュ、優先度制御、進捗表示 |
+| FFmpeg | ストリーム解析、デマックス、デコード |
+| D3D11 | フレーム変換、テクスチャ管理 |
+| Spout | 映像出力 |
+
+- **ytdlpSpout**がダウンロード管理とキャッシュを担当することで、LRUエビクション、優先度制御（Critical/High/Medium/Low）、プリフェッチ、進捗表示が可能
+- **FFmpeg**はセグメントの**解析とデコード**に専念し、ネットワーク処理は行わない
 
 ---
 

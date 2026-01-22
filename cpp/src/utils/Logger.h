@@ -56,6 +56,10 @@ public:
     /// @brief 現在のログレベルを取得
     /// @return 現在のログレベル
     static LogLevel GetLevel();
+    
+    /// @brief ロガーが初期化済みかどうかを確認
+    /// @return 初期化済みならtrue
+    static bool IsInitialized() { return s_initialized; }
 
     // ログ出力メソッド
     template<typename... Args>

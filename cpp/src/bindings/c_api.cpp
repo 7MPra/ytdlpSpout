@@ -86,12 +86,43 @@ const char* ytdlpspout_version(void) {
 }
 
 YtdlpSpoutHandle ytdlpspout_create(void) {
+    // デバッグ: ファイルに直接出力（stderrが見えない場合のため）
+    FILE* debugFile = fopen("F:/ytdlpSpout/dll_debug.txt", "a");
+    if (debugFile) {
+        fprintf(debugFile, "[ytdlpspout] ytdlpspout_create called at %s\n", __TIME__);
+        fflush(debugFile);
+    }
+    
     try {
+        // Loggerを初期化（まだ初期化されていない場合のみ）
+        // DLL API使用時にログ出力を有効化
+        // ファイル出力: DLLのstdoutはPythonプロセスでキャプチャされないため
+        // 絶対パスを使用して確実にログファイルを出力
+        if (!ytdlpspout::Logger::IsInitialized()) {
+            if (debugFile) {
+                fprintf(debugFile, "[ytdlpspout] Initializing Logger...\n");
+                fflush(debugFile);
+            }
+            ytdlpspout::Logger::Initialize(true, "F:/ytdlpSpout/ytdlpspout_debug.log", ytdlpspout::LogLevel::Debug);
+            if (debugFile) {
+                fprintf(debugFile, "[ytdlpspout] Logger initialized\n");
+                fflush(debugFile);
+            }
+        }
+        
         auto* ctx = new PlayerContext();
         ctx->player = std::make_unique<ytdlpspout::VideoPlayer>();
         SetLastError("");  // Clear error
+        if (debugFile) {
+            fprintf(debugFile, "[ytdlpspout] Player created successfully\n");
+            fclose(debugFile);
+        }
         return static_cast<YtdlpSpoutHandle>(ctx);
     } catch (const std::exception& e) {
+        if (debugFile) {
+            fprintf(debugFile, "[ytdlpspout] Exception: %s\n", e.what());
+            fclose(debugFile);
+        }
         SetLastError(std::string("Failed to create player: ") + e.what());
         return nullptr;
     }
@@ -462,6 +493,8 @@ void ytdlpspout_config_ex_init(YtdlpSpoutConfigEx* config) {
     config->slice.cachePath = nullptr;
     config->ytdlp.path = nullptr;
     config->ytdlp.preferredHeight = 1080;
+    config->httpHeaders = nullptr;
+    config->httpHeadersCount = 0;
 }
 
 int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* config) {
@@ -530,6 +563,18 @@ int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* confi
         }
         playerConfig.ytdlp.preferredHeight = config->ytdlp.preferredHeight > 0 
             ? config->ytdlp.preferredHeight : 1080;
+        
+        // HTTPヘッダーをPlayerConfigに反映
+        if (config->httpHeaders && config->httpHeadersCount > 0) {
+            for (int i = 0; i < config->httpHeadersCount; ++i) {
+                const auto& header = config->httpHeaders[i];
+                if (header.key && header.value) {
+                    playerConfig.httpHeaders[header.key] = header.value;
+                }
+            }
+            // セキュリティ: ヘッダー数のみログ出力（値は出力しない）
+            LOG_INFO("HTTP headers configured: count={}", config->httpHeadersCount);
+        }
         
         if (config->slice.enabled && config->verbose) {
             LOG_INFO("Slice loading enabled: chunkSize={}, maxCache={}MB, concurrent={}, prefetch={}",
@@ -624,6 +669,38 @@ void ytdlpspout_get_cache_stats(
         if (cachedChunks) *cachedChunks = 1;
         if (totalChunks) *totalChunks = 1;
     }
+}
+
+int ytdlpspout_get_hls_cache_stats(YtdlpSpoutHandle handle, YtdlpSpoutHlsCacheStats* stats) {
+    if (!stats) {
+        SetLastError("Invalid stats: nullptr");
+        return -1;
+    }
+    
+    // statsをゼロ初期化
+    memset(stats, 0, sizeof(*stats));
+    
+    if (!handle) {
+        // ハンドルがなくてもエラーではなく、デフォルト値を返す
+        return 0;
+    }
+    
+    auto* ctx = GetContext(handle);
+    if (!ctx || !ctx->player) {
+        // プレイヤーがなくてもエラーではなく、デフォルト値を返す
+        return 0;
+    }
+    
+    // VideoPlayerからHLS統計を取得
+    auto hlsStats = ctx->player->GetHlsCacheStats();
+    stats->cachedSegments = hlsStats.cachedSegments;
+    stats->totalSegments = hlsStats.totalSegments;
+    stats->downloadProgress = hlsStats.downloadProgress;
+    stats->bandwidth = hlsStats.bandwidth;
+    stats->isFullyCached = hlsStats.isFullyCached ? 1 : 0;
+    stats->isHlsMode = hlsStats.isHlsMode ? 1 : 0;
+    
+    return 0;
 }
 
 } // extern "C"

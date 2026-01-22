@@ -1287,7 +1287,8 @@ class App:
                             stop_cb=lambda: self.root.after(0, self.on_auto_stop),
                             init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
                             external_spout_sender=None,
-                            pre_resolved_url=result.stream_url  # 解決済みURL
+                            pre_resolved_url=result.stream_url,  # 解決済みURL
+                            pre_resolved_headers=result.http_headers  # HTTPヘッダー
                         )
                         self.streamer.start()
                         self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING))
@@ -1823,6 +1824,9 @@ class App:
             is_cached = self.streamer.is_fully_cached
             bandwidth = getattr(self.streamer, 'bandwidth', 0.0)  # bytes/sec
             
+            # 進捗値を0.0〜1.0にクリップ（推定サイズ誤差で102%等になることを防止）
+            progress = max(0.0, min(1.0, progress))
+            
             # キャッシュ完了時は進捗バーを非表示
             if is_cached:
                 if hasattr(self, '_native_progress_visible') and self._native_progress_visible:
@@ -1901,12 +1905,223 @@ class App:
                 self._no_signal_shown = False
                 
             # 処理時間測定（ログ出力は削除）
-                
+
         except Exception as e:
             self.debug_log(f"プレビュー最終処理エラー: {e}")
 
 
+# =============================================================================
+# CLI（ヘッドレス）モード対応
+# =============================================================================
+
+
+def parse_cli_args():
+    """コマンドライン引数を解析（GUI/CLIモード両対応）"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="YouTube動画をSpout経由でリアルタイム配信するツール（GUI/CLI両対応）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用例:
+  %(prog)s                                           # GUIモードで起動
+  %(prog)s --headless "https://youtu.be/xxx"         # ヘッドレス（CLI）モード
+  %(prog)s --headless -s "MySender" "https://youtu.be/xxx"
+  %(prog)s --headless --max-width 1920 --max-height 1080 --loop "https://youtu.be/xxx"
+  %(prog)s --headless --check-codecs                 # コーデック対応確認
+        """
+    )
+    
+    # モード選択
+    parser.add_argument("--headless", action="store_true",
+                       help="ヘッドレス（CLI）モードで起動（GUIなし）")
+    
+    # URL（位置引数、オプション）
+    parser.add_argument("url", nargs="?", default=DEFAULT_VIDEO_URL,
+                       help=f"YouTube URL (デフォルト: {DEFAULT_VIDEO_URL})")
+    
+    # Spout設定
+    parser.add_argument("-s", "--sender", default=DEFAULT_SENDER_NAME,
+                       help=f"Spout送信者名 (デフォルト: {DEFAULT_SENDER_NAME})")
+    
+    # 解像度設定
+    res_group = parser.add_argument_group("解像度設定")
+    res_group.add_argument("--max-width", type=int, metavar="W",
+                          help="最大幅制限 (自動検出解像度に上限を設定)")
+    res_group.add_argument("--max-height", type=int, metavar="H", 
+                          help="最大高さ制限 (自動検出解像度に上限を設定)")
+    res_group.add_argument("-w", "--width", type=int, metavar="W",
+                          help="手動幅設定 (自動検出を上書き)")
+    res_group.add_argument("--height", type=int, metavar="H",
+                          help="手動高さ設定 (自動検出を上書き)")
+    
+    # その他のオプション
+    parser.add_argument("--loop", action="store_true",
+                       help="VOD（録画）をループ再生する")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                       help="詳細ログを表示")
+    parser.add_argument("--check-codecs", action="store_true",
+                       help="対応コーデックを確認して終了")
+    parser.add_argument("--no-limit", action="store_true",
+                       help="解像度制限を無効にする（4K以上も許可）")
+    
+    return parser.parse_args()
+
+
+class HeadlessApp:
+    """ヘッドレス（CLI）モード用のアプリケーションクラス
+    
+    GUIを起動せず、コンソールでStreamerを実行する。
+    main.pyの機能を完全に内包。
+    """
+    
+    def __init__(self, args):
+        self.args = args
+        self.streamer = None
+        self.stop_event = threading.Event()
+        
+    def log(self, msg: str) -> None:
+        """ログ出力"""
+        if self.args.verbose:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        else:
+            print(msg)
+    
+    def run(self) -> int:
+        """メイン実行ループ"""
+        args = self.args
+        
+        # コーデック確認モード
+        if args.check_codecs:
+            return self._check_codecs()
+        
+        # 解像度設定の処理
+        max_resolution = self._get_max_resolution()
+        manual_resolution = self._get_manual_resolution()
+        
+        # Streamerを作成
+        self.streamer = self._create_streamer(
+            video_url=args.url,
+            sender_name=args.sender,
+            max_resolution=max_resolution,
+            manual_resolution=manual_resolution,
+            loop_vod=args.loop
+        )
+        
+        # Ctrl+Cハンドラ設定
+        import signal
+        def signal_handler(sig, frame):
+            self.log("\n停止シグナルを受信しました...")
+            self.stop_event.set()
+            if self.streamer:
+                self.streamer.stop()
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # ストリーミング開始
+        try:
+            self.log(f"ストリーミング開始: {args.url}")
+            self.log(f"Spout送信者名: {args.sender}")
+            self.streamer.start()
+            
+            # ストリーマーの終了を待機
+            while not self.stop_event.is_set():
+                if hasattr(self.streamer, 'is_running') and not self.streamer.is_running:
+                    break
+                time.sleep(0.1)
+            
+            return 0
+        except Exception as e:
+            self.log(f"エラー: {e}")
+            return 1
+        finally:
+            if self.streamer:
+                self.streamer.stop()
+    
+    def _check_codecs(self) -> int:
+        """コーデック対応確認"""
+        from ytdlpSpout.core import check_av1_support, find_ffmpeg_path
+        
+        print("=== コーデック対応状況確認 ===")
+        av1_supported, av1_decoders = check_av1_support()
+        format_str, codec_info = get_optimal_format_string()
+        
+        print(f"ffmpegパス: {find_ffmpeg_path()}")
+        print(f"AV1対応: {'✓' if av1_supported else '✗'}")
+        if av1_supported:
+            print(f"AV1デコーダー: {', '.join(av1_decoders)}")
+        print(f"使用フォーマット: {format_str}")
+        print(f"設定: {codec_info}")
+        return 0
+    
+    def _get_max_resolution(self):
+        """最大解像度設定を取得"""
+        args = self.args
+        if args.max_width and args.max_height:
+            return (args.max_width, args.max_height)
+        elif not args.no_limit:
+            # デフォルトで1080p制限を設定（安定性重視）
+            if args.verbose:
+                self.log("デフォルト解像度制限: 1080p (--no-limitで無効化可能)")
+            return (1920, 1080)
+        return None
+    
+    def _get_manual_resolution(self):
+        """手動解像度設定を取得"""
+        args = self.args
+        if args.width and args.height:
+            return (args.width, args.height)
+        return None
+    
+    def _create_streamer(self, video_url, sender_name, max_resolution, manual_resolution, loop_vod):
+        """Streamerを作成"""
+        # C++ DLLバックエンドが利用可能な場合
+        if NATIVE_BACKEND_AVAILABLE:
+            self.log("[Backend] C++ DLL")
+            return NativeStreamerWrapper(
+                video_url=video_url,
+                sender_name=sender_name,
+                max_resolution=max_resolution,
+                manual_resolution=manual_resolution,
+                loop_vod=loop_vod,
+                verbose=self.args.verbose,
+                log_cb=self.log,
+                stop_cb=lambda: self.stop_event.set(),
+                init_ok_cb=lambda: self.log("ストリーミング初期化完了"),
+                external_spout_sender=None
+            )
+        else:
+            # Python Streamerにフォールバック
+            self.log("[Backend] Python Streamer (fallback)")
+            return Streamer(
+                video_url,
+                sender_name,
+                max_resolution=max_resolution,
+                manual_resolution=manual_resolution,
+                loop_vod=loop_vod,
+                verbose=self.args.verbose,
+                log_cb=self.log,
+                stop_cb=lambda: self.stop_event.set(),
+                init_ok_cb=lambda: self.log("ストリーミング初期化完了"),
+                external_spout_sender=None
+            )
+
+
+def run_headless(args) -> int:
+    """ヘッドレスモードでアプリケーションを実行"""
+    app = HeadlessApp(args)
+    return app.run()
+
+
 if __name__ == "__main__":
-    root = ctk.CTk()
-    app = App(root)
-    root.mainloop()
+    args = parse_cli_args()
+    
+    if args.headless or args.check_codecs:
+        # ヘッドレス（CLI）モード
+        sys.exit(run_headless(args))
+    else:
+        # GUIモード
+        root = ctk.CTk()
+        app = App(root)
+        root.mainloop()

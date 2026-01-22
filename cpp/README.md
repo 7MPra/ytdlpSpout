@@ -224,7 +224,7 @@ with YtdlpSpoutNative() as player:
 # 自動的にstop()が呼ばれる
 ```
 
-詳細は [llm/cpp-dll-python-ffi.md](../llm/cpp-dll-python-ffi.md) を参照。
+詳細は [llm/specs/cpp-dll-python-ffi.md](../llm/specs/cpp-dll-python-ffi.md) を参照。
 
 ## 入力ソースの種類
 

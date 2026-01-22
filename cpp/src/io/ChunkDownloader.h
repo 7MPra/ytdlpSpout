@@ -7,6 +7,7 @@
 //   - 優先度付きリクエストキュー
 //   - SparseFileCacheへの自動書き込み
 //   - 帯域幅推定
+//   - HLSセグメントダウンロード（v2.0追加）
 //
 // 使用方法:
 //   SparseFileCache cache;
@@ -17,6 +18,12 @@
 //   downloader.Start();
 //   downloader.RequestChunk(0, ChunkPriority::Critical);
 //
+// HLSセグメントダウンロード:
+//   downloader.SetSegmentDownloadCallback([](int64_t idx, std::vector<uint8_t>&& data, bool ok) {
+//       // セグメントデータを処理
+//   });
+//   downloader.RequestSegment("http://example.com/seg0.ts", 0, ChunkPriority::High);
+//
 // =============================================================================
 
 #pragma once
@@ -25,6 +32,8 @@
 #include <map>
 #include <memory>
 #include <cstdint>
+#include <vector>
+#include <functional>
 
 namespace ytdlpspout {
 namespace io {
@@ -39,6 +48,12 @@ enum class ChunkPriority {
     Medium = 2,     // 通常優先度
     Low = 3         // 低優先度（先読み）
 };
+
+/// @brief HLSセグメントのダウンロード完了コールバック
+/// @param segmentIndex セグメントインデックス
+/// @param data ダウンロードしたデータ（失敗時は空）
+/// @param success 成功フラグ
+using SegmentDownloadCallback = std::function<void(int64_t segmentIndex, std::vector<uint8_t>&& data, bool success)>;
 
 /// @brief チャンク並列ダウンローダークラス
 /// 
@@ -75,6 +90,11 @@ public:
     /// @param headers ヘッダーマップ（User-Agent、Cookie等）
     void SetHeaders(const std::map<std::string, std::string>& headers);
     
+    /// @brief HTTPヘッダーを設定（全リクエストに適用）
+    /// @param headers ヘッダーマップ
+    /// @note SetHeadersと同じ機能だが、HLS用に追加されたAPI
+    void SetHttpHeaders(const std::map<std::string, std::string>& headers);
+    
     // =========================================================================
     // ダウンロード制御
     // =========================================================================
@@ -93,6 +113,31 @@ public:
     /// @brief チャンクのダウンロードをキャンセル
     /// @param offset キャンセルするチャンクのバイトオフセット
     void CancelChunk(int64_t offset);
+    
+    // =========================================================================
+    // HLSセグメントダウンロード
+    // =========================================================================
+    
+    /// @brief セグメントダウンロード完了コールバックを設定
+    /// @param callback ダウンロード完了時に呼ばれるコールバック
+    void SetSegmentDownloadCallback(SegmentDownloadCallback callback);
+    
+    /// @brief HLSセグメントURLのダウンロードをリクエスト
+    /// @param url セグメントURL（完全URL）
+    /// @param segmentIndex セグメントインデックス
+    /// @param priority 優先度（Critical, High, Medium, Low）
+    /// @param byteRangeStart バイト範囲開始位置（-1の場合は範囲指定なし）
+    /// @param byteRangeLength バイト範囲の長さ
+    void RequestSegment(const std::string& url, int64_t segmentIndex, ChunkPriority priority,
+                       int64_t byteRangeStart = -1, int64_t byteRangeLength = 0);
+    
+    /// @brief キューに入っているセグメントの優先度を変更
+    /// @param segmentIndex セグメントインデックス
+    /// @param newPriority 新しい優先度
+    void ReprioritizeSegment(int64_t segmentIndex, ChunkPriority newPriority);
+    
+    /// @brief セグメントダウンロードキューをクリア
+    void ClearSegmentQueue();
     
     // =========================================================================
     // 統計

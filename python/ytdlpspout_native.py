@@ -24,6 +24,7 @@ from ctypes import (
 from pathlib import Path
 from typing import Optional, Callable
 import os
+import logging
 
 
 # =============================================================================
@@ -78,6 +79,26 @@ class YtdlpSpoutYtDlpConfig(Structure):
     ]
 
 
+class YtdlpSpoutHttpHeader(Structure):
+    """HTTPヘッダー構造体"""
+    _fields_ = [
+        ("key", c_char_p),
+        ("value", c_char_p),
+    ]
+
+
+class YtdlpSpoutHlsCacheStats(Structure):
+    """HLSキャッシュ統計構造体"""
+    _fields_ = [
+        ("cachedSegments", c_int),
+        ("totalSegments", c_int),
+        ("downloadProgress", c_double),
+        ("bandwidth", c_double),
+        ("isFullyCached", c_int),
+        ("isHlsMode", c_int),
+    ]
+
+
 class YtdlpSpoutConfigEx(Structure):
     """拡張設定構造体"""
     _fields_ = [
@@ -90,6 +111,8 @@ class YtdlpSpoutConfigEx(Structure):
         ("verbose", c_int),
         ("slice", YtdlpSpoutSliceConfig),
         ("ytdlp", YtdlpSpoutYtDlpConfig),
+        ("httpHeaders", POINTER(YtdlpSpoutHttpHeader)),
+        ("httpHeadersCount", c_int),
     ]
 
 
@@ -218,31 +241,43 @@ class YtdlpSpoutNative:
     
     def _find_dll(self, dll_path: Optional[str]) -> Path:
         """DLLパスを検索"""
+        logger = logging.getLogger(__name__)
+        
         if dll_path:
             path = Path(dll_path)
             if path.exists():
+                logger.info(f"DLL loaded from specified path: {path.resolve()}")
                 return path
             raise FileNotFoundError(f"DLL not found: {dll_path}")
         
-        # デフォルトの検索パス
+        # デフォルトの検索パス（ビルド出力ディレクトリを優先）
         search_paths = [
+            # CMakeビルド出力（Debug優先、開発中はDebugが最新の可能性が高い）
+            Path(__file__).parent.parent / "cpp" / "build" / "bin" / "Debug" / "ytdlpspout.dll",
+            Path(__file__).parent.parent / "cpp" / "build" / "bin" / "Release" / "ytdlpspout.dll",
+            # ローカルpythonフォルダ
             Path(__file__).parent / "ytdlpspout.dll",
+            # レガシーパス（VS2022）
             Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Release" / "ytdlpspout.dll",
             Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Debug" / "ytdlpspout.dll",
+            # Presetビルドパス
             Path(__file__).parent.parent / "cpp" / "build" / "windows-x64-release" / "bin" / "ytdlpspout.dll",
             Path(__file__).parent.parent / "cpp" / "build" / "windows-x64-debug" / "bin" / "ytdlpspout.dll",
         ]
         
         for path in search_paths:
             if path.exists():
+                logger.info(f"DLL loaded from: {path.resolve()}")
                 return path
         
         # 環境変数からも検索
         if "YTDLPSPOUT_DLL" in os.environ:
             path = Path(os.environ["YTDLPSPOUT_DLL"])
             if path.exists():
+                logger.info(f"DLL loaded from environment variable: {path.resolve()}")
                 return path
         
+        logger.warning(f"DLL not found in search paths: {[str(p) for p in search_paths]}")
         raise FileNotFoundError(
             f"ytdlpspout.dll not found. Searched: {[str(p) for p in search_paths]}. "
             "Set YTDLPSPOUT_DLL environment variable or pass dll_path to constructor."
@@ -371,6 +406,10 @@ class YtdlpSpoutNative:
         # void ytdlpspout_get_cache_stats(YtdlpSpoutHandle handle, size_t* cachedChunks, size_t* totalChunks)
         lib.ytdlpspout_get_cache_stats.restype = None
         lib.ytdlpspout_get_cache_stats.argtypes = [c_void_p, POINTER(c_size_t), POINTER(c_size_t)]
+        
+        # int ytdlpspout_get_hls_cache_stats(YtdlpSpoutHandle handle, YtdlpSpoutHlsCacheStats* stats)
+        lib.ytdlpspout_get_hls_cache_stats.restype = c_int
+        lib.ytdlpspout_get_hls_cache_stats.argtypes = [c_void_p, POINTER(YtdlpSpoutHlsCacheStats)]
     
     # =========================================================================
     # プロパティ
@@ -437,6 +476,32 @@ class YtdlpSpoutNative:
         self._lib.ytdlpspout_get_cache_stats(self._handle, byref(cached), byref(total))
         return (cached.value, total.value)
     
+    def get_hls_cache_stats(self) -> Optional[dict]:
+        """
+        HLSキャッシュ統計を取得
+        
+        Returns:
+            HLS統計情報の辞書、または失敗時None
+            - cached_segments: キャッシュ済みセグメント数
+            - total_segments: 総セグメント数
+            - download_progress: ダウンロード進捗 (0.0〜1.0)
+            - bandwidth: 推定帯域幅 (bytes/sec)
+            - is_fully_cached: 完全キャッシュ済み
+            - is_hls_mode: HLSモードで再生中
+        """
+        stats = YtdlpSpoutHlsCacheStats()
+        result = self._lib.ytdlpspout_get_hls_cache_stats(self._handle, byref(stats))
+        if result != 0:
+            return None
+        return {
+            "cached_segments": stats.cachedSegments,
+            "total_segments": stats.totalSegments,
+            "download_progress": stats.downloadProgress,
+            "bandwidth": stats.bandwidth,
+            "is_fully_cached": bool(stats.isFullyCached),
+            "is_hls_mode": bool(stats.isHlsMode),
+        }
+    
     # =========================================================================
     # 再生制御
     # =========================================================================
@@ -491,7 +556,8 @@ class YtdlpSpoutNative:
         prefetch_chunks_ahead: int = 8,
         cache_path: Optional[str] = None,
         ytdlp_path: Optional[str] = None,
-        preferred_height: int = 1080
+        preferred_height: int = 1080,
+        http_headers: Optional[dict] = None
     ) -> bool:
         """
         拡張設定で再生開始（スライス読み込み対応）
@@ -512,6 +578,7 @@ class YtdlpSpoutNative:
             cache_path: ファイルキャッシュパス（Noneでメモリのみ）
             ytdlp_path: yt-dlpパス（Noneで自動検出）
             preferred_height: 希望解像度
+            http_headers: HTTPヘッダー辞書（Cookieなど）
         
         Returns:
             成功した場合True
@@ -551,6 +618,39 @@ class YtdlpSpoutNative:
             self._config_ex_refs.append(ytdlp_path_bytes)
             config.ytdlp.path = ytdlp_path_bytes
         config.ytdlp.preferredHeight = preferred_height
+        
+        # HTTPヘッダーを設定
+        if http_headers and len(http_headers) > 0:
+            # ヘッダー配列の上限チェック（100個まで）
+            MAX_HEADERS = 100
+            if len(http_headers) > MAX_HEADERS:
+                logging.warning(
+                    f"HTTPヘッダー数が上限を超えています: {len(http_headers)} > {MAX_HEADERS}。"
+                    f"最初の{MAX_HEADERS}個のみ使用します。"
+                )
+                # 辞書から最初のMAX_HEADERS個を取得
+                http_headers = dict(list(http_headers.items())[:MAX_HEADERS])
+            
+            # ヘッダー配列を作成
+            HeaderArray = YtdlpSpoutHttpHeader * len(http_headers)
+            header_array = HeaderArray()
+            
+            for i, (key, value) in enumerate(http_headers.items()):
+                key_bytes = key.encode('utf-8')
+                value_bytes = value.encode('utf-8')
+                # 文字列参照を保持（GC対策）
+                self._config_ex_refs.extend([key_bytes, value_bytes])
+                
+                header_array[i].key = key_bytes
+                header_array[i].value = value_bytes
+            
+            # 配列参照を保持
+            self._config_ex_refs.append(header_array)
+            config.httpHeaders = header_array
+            config.httpHeadersCount = len(http_headers)
+        else:
+            config.httpHeaders = None
+            config.httpHeadersCount = 0
         
         result = self._lib.ytdlpspout_start_ex(self._handle, byref(config))
         if result != 0:

@@ -117,6 +117,7 @@ struct SliceLoadingManager::Impl {
         ioConfig.prefetchChunksAhead = config.prefetchChunksAhead;
         ioConfig.criticalChunksAhead = config.criticalChunksAhead;
         ioConfig.enableContinuousDownload = config.enableContinuousDownload;
+        ioConfig.httpHeaders = config.httpHeaders;  // HTTPヘッダーを渡す
         
         resolvedUrl = source;
         
@@ -170,6 +171,7 @@ struct SliceLoadingManager::Impl {
         ioConfig.prefetchChunksAhead = config.prefetchChunksAhead;
         ioConfig.criticalChunksAhead = config.criticalChunksAhead;
         ioConfig.enableContinuousDownload = config.enableContinuousDownload;
+        ioConfig.httpHeaders = config.httpHeaders;  // HTTPヘッダーを渡す
         
         ioContext = std::make_unique<CustomIOContext>();
         if (!ioContext->Initialize(resolvedUrl, ioConfig)) {

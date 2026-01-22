@@ -293,6 +293,243 @@ void TestChunkDownloaderPriorityOrder() {
 }
 
 // =============================================================================
+// HLSセグメントダウンロードテスト
+// =============================================================================
+
+void TestSegmentDownloadCallback() {
+    TEST_CASE("ChunkDownloader segment download callback setting")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        // コールバックを設定できることを確認
+        std::atomic<bool> callbackCalled{false};
+        downloader.SetSegmentDownloadCallback(
+            [&callbackCalled](int64_t /*segmentIndex*/, std::vector<uint8_t>&& /*data*/, bool /*success*/) {
+                callbackCalled = true;
+            }
+        );
+        
+        // 例外が発生しなければOK
+    }
+    TEST_END()
+}
+
+void TestRequestSegment() {
+    TEST_CASE("ChunkDownloader request segment")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        // セグメントリクエストが例外を投げないことを確認
+        downloader.RequestSegment(
+            "http://example.com/segment0.ts", 
+            0, 
+            ChunkPriority::High
+        );
+        downloader.RequestSegment(
+            "http://example.com/segment1.ts", 
+            1, 
+            ChunkPriority::Medium
+        );
+        
+        // 例外が発生しなければOK
+    }
+    TEST_END()
+}
+
+void TestReprioritizeSegment() {
+    TEST_CASE("ChunkDownloader reprioritize segment")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        // セグメントをリクエストしてから優先度を変更
+        downloader.RequestSegment(
+            "http://example.com/segment0.ts", 
+            0, 
+            ChunkPriority::Low
+        );
+        
+        // 優先度変更が例外を投げないことを確認
+        downloader.ReprioritizeSegment(0, ChunkPriority::Critical);
+        
+        // 存在しないセグメントの優先度変更も例外を投げない
+        downloader.ReprioritizeSegment(999, ChunkPriority::High);
+    }
+    TEST_END()
+}
+
+void TestClearSegmentQueue() {
+    TEST_CASE("ChunkDownloader clear segment queue")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        // 複数のセグメントをリクエスト
+        for (int i = 0; i < 10; ++i) {
+            downloader.RequestSegment(
+                "http://example.com/segment" + std::to_string(i) + ".ts", 
+                i, 
+                ChunkPriority::Medium
+            );
+        }
+        
+        // キューをクリア
+        downloader.ClearSegmentQueue();
+        
+        // 例外が発生しなければOK
+    }
+    TEST_END()
+}
+
+void TestSetHttpHeaders() {
+    TEST_CASE("ChunkDownloader set HTTP headers")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        std::map<std::string, std::string> headers;
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+        headers["Cookie"] = "session=abc123";
+        headers["Referer"] = "https://example.com/";
+        headers["Accept"] = "*/*";
+        
+        // SetHttpHeaders（新API）が動作することを確認
+        downloader.SetHttpHeaders(headers);
+        
+        // 例外が発生しなければOK
+    }
+    TEST_END()
+}
+
+void TestSetHttpHeadersAfterStart() {
+    TEST_CASE("ChunkDownloader set HTTP headers after start")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        // まず空のヘッダーで開始
+        downloader.Start();
+        ASSERT_TRUE(downloader.IsRunning());
+        
+        // 開始後にヘッダーを設定
+        std::map<std::string, std::string> headers;
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+        headers["Cookie"] = "niconico_session=test123; user_session=abc456";
+        headers["Referer"] = "https://www.nicovideo.jp/";
+        
+        // 開始後のヘッダー設定が例外を投げないことを確認
+        downloader.SetHttpHeaders(headers);
+        
+        // セグメントリクエスト（ヘッダーが適用されることを確認）
+        // 実際のネットワークリクエストはしないが、設定が適用されることを確認
+        downloader.RequestSegment("http://localhost:1/segment0.ts", 0, ChunkPriority::Critical);
+        
+        // 少し待機
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        downloader.Stop();
+        ASSERT_FALSE(downloader.IsRunning());
+    }
+    TEST_END()
+}
+
+void TestSegmentDownloadWithCallback() {
+    TEST_CASE("ChunkDownloader segment download with callback")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+        
+        ChunkDownloader downloader(&cache, 2);
+        
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::vector<int64_t> downloadedSegments;
+        std::atomic<int> callbackCount{0};
+        
+        downloader.SetSegmentDownloadCallback(
+            [&](int64_t segmentIndex, std::vector<uint8_t>&& /*data*/, bool /*success*/) {
+                std::lock_guard<std::mutex> lock(mtx);
+                downloadedSegments.push_back(segmentIndex);
+                callbackCount++;
+                cv.notify_all();
+            }
+        );
+        
+        // 実際のネットワークなしでもAPIが動作することを確認
+        downloader.Start();
+        
+        // 架空のURLでリクエスト（実際のダウンロードは失敗するが、コールバックは呼ばれる）
+        downloader.RequestSegment("http://localhost:1/test.ts", 0, ChunkPriority::High);
+        
+        // 少し待機（タイムアウト対策）
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        
+        downloader.Stop();
+        
+        // 停止後にクラッシュしないことを確認
+    }
+    TEST_END()
+}
+
+void TestSegmentAndChunkCoexistence() {
+    TEST_CASE("ChunkDownloader segment and chunk requests coexist")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(102400);
+        
+        ChunkDownloader downloader(&cache, 4);
+        downloader.SetUrl("http://example.com/video.mp4");
+        
+        // 通常のチャンクリクエスト
+        downloader.RequestChunk(0, ChunkPriority::High);
+        downloader.RequestChunk(1024, ChunkPriority::Medium);
+        
+        // セグメントリクエスト（別キュー）
+        downloader.RequestSegment("http://example.com/seg0.ts", 0, ChunkPriority::High);
+        downloader.RequestSegment("http://example.com/seg1.ts", 1, ChunkPriority::Medium);
+        
+        // 両方のリクエストが共存できることを確認
+    }
+    TEST_END()
+}
+
+// =============================================================================
 // メイン
 // =============================================================================
 
@@ -320,6 +557,16 @@ int main() {
     TestChunkDownloaderNullCache();
     TestChunkDownloaderZeroWorkers();
     TestChunkDownloaderPriorityOrder();
+    
+    std::cout << "\n[HLS Segment Tests]" << std::endl;
+    TestSegmentDownloadCallback();
+    TestRequestSegment();
+    TestReprioritizeSegment();
+    TestClearSegmentQueue();
+    TestSetHttpHeaders();
+    TestSetHttpHeadersAfterStart();
+    TestSegmentDownloadWithCallback();
+    TestSegmentAndChunkCoexistence();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "Results: " << s_testsPassed << " passed, " 

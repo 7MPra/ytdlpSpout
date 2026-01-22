@@ -17,6 +17,7 @@
 #include <memory>
 #include <functional>
 #include <atomic>
+#include <map>
 
 namespace ytdlpspout {
 
@@ -24,6 +25,7 @@ namespace ytdlpspout {
 class BeatMap;
 struct BeatInfo;
 class BeatJumpController;
+namespace hls { class HlsSliceLoadingManager; }
 
 /// @brief プレイヤー設定
 struct PlayerConfig {
@@ -58,6 +60,9 @@ struct PlayerConfig {
         std::string path;                   // yt-dlpパス（空=自動検出）
         int preferredHeight = 1080;         // 希望解像度
     } ytdlp;
+    
+    // === HTTPヘッダー設定 ===
+    std::map<std::string, std::string> httpHeaders;  // HTTPヘッダー（Cookie等）
     
     /// @brief 入力ソースを取得（source優先、なければfilePath）
     const std::string& GetSource() const {
@@ -193,6 +198,24 @@ public:
     /// @brief 全チャンクがキャッシュ済みか
     /// @return キャッシュ済みの場合true（スライス読み込み無効時はtrue）
     bool IsFullyCached() const;
+
+    /// @brief HLSモードで再生中か
+    /// @return HLSスライス読み込み使用中の場合true
+    bool IsHlsMode() const;
+
+    /// @brief HLS統計情報構造体
+    struct HlsCacheStats {
+        int cachedSegments = 0;     ///< キャッシュ済みセグメント数
+        int totalSegments = 0;      ///< 総セグメント数
+        double downloadProgress = 0.0;  ///< ダウンロード進捗 (0.0〜1.0)
+        double bandwidth = 0.0;     ///< 推定帯域幅 (bytes/sec)
+        bool isFullyCached = false; ///< 完全キャッシュ済み
+        bool isHlsMode = false;     ///< HLSモードで再生中
+    };
+
+    /// @brief HLSキャッシュ統計を取得
+    /// @return HLSキャッシュ統計情報
+    HlsCacheStats GetHlsCacheStats() const;
 
     // =========================================================================
     // フレームデータ取得（GUI連携用）

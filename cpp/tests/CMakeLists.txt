@@ -5,6 +5,61 @@
 # Google Test を使用したテスト設定
 # 現時点では基本的なユニットテストのみ
 
+# =============================================================================
+# M3U8 Parser テスト
+# =============================================================================
+add_executable(test_m3u8_parser
+    test_m3u8_parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+target_include_directories(test_m3u8_parser PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_m3u8_parser PRIVATE
+    spdlog::spdlog
+)
+
+# テスト登録
+add_test(NAME TestM3U8Parser COMMAND test_m3u8_parser)
+
+set_tests_properties(TestM3U8Parser PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# AES Decryptor テスト
+# =============================================================================
+add_executable(test_aes_decryptor
+    test_aes_decryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+target_include_directories(test_aes_decryptor PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_aes_decryptor PRIVATE
+    spdlog::spdlog
+    bcrypt
+)
+
+# テスト登録
+add_test(NAME TestAesDecryptor COMMAND test_aes_decryptor)
+
+set_tests_properties(TestAesDecryptor PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# Decoder テスト
+# =============================================================================
+
 # テスト用実行可能ファイル
 add_executable(test_decoder
     test_decoder.cpp
@@ -41,6 +96,45 @@ add_test(NAME TestDecoder COMMAND test_decoder)
 
 # テストのワーキングディレクトリ設定
 set_tests_properties(TestDecoder PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# HLS HTTP Headers テスト
+# =============================================================================
+add_executable(test_hls_http_headers
+    test_hls_http_headers.cpp
+)
+
+target_include_directories(test_hls_http_headers PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_hls_http_headers PRIVATE
+    spdlog::spdlog
+)
+
+# FFmpegリンク
+if(LIBAV_FOUND)
+    target_include_directories(test_hls_http_headers PRIVATE ${LIBAV_INCLUDE_DIRS})
+    target_link_libraries(test_hls_http_headers PRIVATE PkgConfig::LIBAV)
+elseif(FFMPEG_LIBRARIES)
+    target_include_directories(test_hls_http_headers PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(test_hls_http_headers PRIVATE ${FFMPEG_LIBRARIES})
+endif()
+
+# DirectXリンク
+target_link_libraries(test_hls_http_headers PRIVATE
+    ${D3D11_LIBRARY}
+    ${DXGI_LIBRARY}
+    ole32
+)
+
+# テスト登録
+add_test(NAME TestHlsHttpHeaders COMMAND test_hls_http_headers)
+
+set_tests_properties(TestHlsHttpHeaders PROPERTIES
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
@@ -389,6 +483,11 @@ add_executable(test_video_player_beat
     ${CMAKE_SOURCE_DIR}/src/io/HttpClient.cpp
     ${CMAKE_SOURCE_DIR}/src/io/PrefetchScheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/io/SliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsCustomAVIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
     ${CMAKE_SOURCE_DIR}/src/ytdlp/YtDlpResolver.cpp
     ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
@@ -450,6 +549,11 @@ add_executable(test_c_api
     ${CMAKE_SOURCE_DIR}/src/io/PrefetchScheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/io/CustomIOContext.cpp
     ${CMAKE_SOURCE_DIR}/src/io/SliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsCustomAVIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
     ${CMAKE_SOURCE_DIR}/src/ytdlp/YtDlpResolver.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/AudioDecoder.cpp
     ${CMAKE_SOURCE_DIR}/src/audio/BeatMap.cpp
@@ -632,5 +736,191 @@ target_link_libraries(test_nv12_srv_pool PRIVATE
 add_test(NAME TestNV12SRVPool COMMAND test_nv12_srv_pool)
 
 set_tests_properties(TestNV12SRVPool PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# HLS Segment Cache テスト
+# =============================================================================
+add_executable(test_hls_segment_cache
+    test_hls_segment_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+target_include_directories(test_hls_segment_cache PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_hls_segment_cache PRIVATE
+    spdlog::spdlog
+    bcrypt
+)
+
+# テスト登録
+add_test(NAME TestHlsSegmentCache COMMAND test_hls_segment_cache)
+
+set_tests_properties(TestHlsSegmentCache PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# HLS Custom AVIO Context テスト
+# =============================================================================
+find_package(GTest CONFIG REQUIRED)
+
+add_executable(test_hls_avio
+    test_hls_avio.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsCustomAVIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+target_include_directories(test_hls_avio PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_hls_avio PRIVATE
+    spdlog::spdlog
+    GTest::gtest
+    GTest::gtest_main
+    bcrypt
+)
+
+# FFmpegリンク
+if(LIBAV_FOUND)
+    target_include_directories(test_hls_avio PRIVATE ${LIBAV_INCLUDE_DIRS})
+    target_link_libraries(test_hls_avio PRIVATE PkgConfig::LIBAV)
+elseif(FFMPEG_LIBRARIES)
+    target_include_directories(test_hls_avio PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(test_hls_avio PRIVATE ${FFMPEG_LIBRARIES})
+endif()
+
+# テスト登録
+add_test(NAME TestHlsAVIO COMMAND test_hls_avio)
+
+set_tests_properties(TestHlsAVIO PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# HLS Slice Loading Manager テスト
+# =============================================================================
+add_executable(test_hls_slice_loading_manager
+    test_hls_slice_loading_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsCustomAVIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/HttpClient.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/ChunkDownloader.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/SparseFileCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+target_include_directories(test_hls_slice_loading_manager PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_hls_slice_loading_manager PRIVATE
+    spdlog::spdlog
+    GTest::gtest
+    GTest::gtest_main
+    CURL::libcurl
+    bcrypt
+)
+
+# FFmpegリンク
+if(LIBAV_FOUND)
+    target_include_directories(test_hls_slice_loading_manager PRIVATE ${LIBAV_INCLUDE_DIRS})
+    target_link_libraries(test_hls_slice_loading_manager PRIVATE PkgConfig::LIBAV)
+elseif(FFMPEG_LIBRARIES)
+    target_include_directories(test_hls_slice_loading_manager PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(test_hls_slice_loading_manager PRIVATE ${FFMPEG_LIBRARIES})
+endif()
+
+# テスト登録
+add_test(NAME TestHlsSliceLoadingManager COMMAND test_hls_slice_loading_manager)
+
+set_tests_properties(TestHlsSliceLoadingManager PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# =============================================================================
+# VideoPlayer HLSスライス読み込み統合テスト
+# =============================================================================
+add_executable(test_video_player_hls
+    test_video_player_hls.cpp
+    ${CMAKE_SOURCE_DIR}/src/player/VideoPlayer.cpp
+    ${CMAKE_SOURCE_DIR}/src/player/FrameTimer.cpp
+    ${CMAKE_SOURCE_DIR}/src/decoder/VideoDecoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/decoder/FrameConverter.cpp
+    ${CMAKE_SOURCE_DIR}/src/decoder/HWAccelContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/graphics/D3D11Context.cpp
+    ${CMAKE_SOURCE_DIR}/src/graphics/SpoutSender.cpp
+    ${CMAKE_SOURCE_DIR}/src/graphics/TexturePool.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/BeatMap.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/BeatMapGenerator.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/BeatDetector.cpp
+    ${CMAKE_SOURCE_DIR}/src/audio/AudioDecoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/CustomIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/ChunkDownloader.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/SparseFileCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/HttpClient.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/PrefetchScheduler.cpp
+    ${CMAKE_SOURCE_DIR}/src/io/SliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsCustomAVIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/ytdlp/YtDlpResolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+target_include_directories(test_video_player_hls PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_video_player_hls PRIVATE
+    spdlog::spdlog
+    GTest::gtest
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json
+    CURL::libcurl
+    bcrypt
+    ${D3D11_LIBRARY}
+    ${DXGI_LIBRARY}
+    d3dcompiler
+    ole32
+)
+
+# Spout2リンク
+if(TARGET Spout2::Spout)
+    target_link_libraries(test_video_player_hls PRIVATE Spout2::Spout)
+endif()
+
+# FFmpegリンク
+if(LIBAV_FOUND)
+    target_include_directories(test_video_player_hls PRIVATE ${LIBAV_INCLUDE_DIRS})
+    target_link_libraries(test_video_player_hls PRIVATE PkgConfig::LIBAV)
+elseif(FFMPEG_LIBRARIES)
+    target_include_directories(test_video_player_hls PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(test_video_player_hls PRIVATE ${FFMPEG_LIBRARIES})
+endif()
+
+# テスト登録
+add_test(NAME TestVideoPlayerHls COMMAND test_video_player_hls)
+
+set_tests_properties(TestVideoPlayerHls PROPERTIES
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
