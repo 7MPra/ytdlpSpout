@@ -66,3 +66,11 @@
 [ytdlpspout] Initializing Logger...
 [ytdlpspout] Logger initialized
 [ytdlpspout] Player created successfully
+[ytdlpspout] ytdlpspout_create called at 18:06:07
+[ytdlpspout] Initializing Logger...
+[ytdlpspout] Logger initialized
+[ytdlpspout] Player created successfully
+[ytdlpspout] ytdlpspout_create called at 18:06:07
+[ytdlpspout] Initializing Logger...
+[ytdlpspout] Logger initialized
+[ytdlpspout] Player created successfully
