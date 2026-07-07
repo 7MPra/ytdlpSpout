@@ -76,54 +76,63 @@ ytdlpspout::VideoPlayer* GetPlayer(YtdlpSpoutHandle handle) {
 } // anonymous namespace
 
 // =============================================================================
+// 例外安全マクロ（P-5: C ABI境界を越えて例外が漏れることを防ぐ）
+// =============================================================================
+//
+// 各エクスポート関数の本体を try { ... } で囲み、直後にこのマクロを続けることで
+// std::exception派生／それ以外のすべての例外を捕捉しlast_errorに記録した上で、
+// 呼び出し規約上のエラー値を返す（voidの場合は何も返さず終了する）。
+
+#define YTDLPSPOUT_CATCH_RETURN(errorValue)                                    \
+    catch (const std::exception& e) {                                         \
+        SetLastError(std::string("Exception in ") + __func__ + ": " + e.what()); \
+        return (errorValue);                                                   \
+    } catch (...) {                                                            \
+        SetLastError(std::string("Unknown exception in ") + __func__);         \
+        return (errorValue);                                                   \
+    }
+
+#define YTDLPSPOUT_CATCH_VOID()                                                \
+    catch (const std::exception& e) {                                         \
+        SetLastError(std::string("Exception in ") + __func__ + ": " + e.what()); \
+    } catch (...) {                                                            \
+        SetLastError(std::string("Unknown exception in ") + __func__);         \
+    }
+
+// =============================================================================
 // API実装
 // =============================================================================
 
 extern "C" {
+
+// ラップトップ省電力環境対策: ドライバーに高パフォーマンスGPU使用をヒント
+// NVIDIA / AMD ハイブリッド環境で D3D11 作成前にプロセスを dGPU に割り当てやすくする
+#ifdef _WIN32
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) unsigned long AmdPowerXpressRequestHighPerformance = 1;
+#endif
 
 const char* ytdlpspout_version(void) {
     return YTDLPSPOUT_VERSION_STRING;
 }
 
 YtdlpSpoutHandle ytdlpspout_create(void) {
-    // デバッグ: ファイルに直接出力（stderrが見えない場合のため）
-    FILE* debugFile = fopen("F:/ytdlpSpout/dll_debug.txt", "a");
-    if (debugFile) {
-        fprintf(debugFile, "[ytdlpspout] ytdlpspout_create called at %s\n", __TIME__);
-        fflush(debugFile);
-    }
-    
     try {
         // Loggerを初期化（まだ初期化されていない場合のみ）
-        // DLL API使用時にログ出力を有効化
-        // ファイル出力: DLLのstdoutはPythonプロセスでキャプチャされないため
-        // 絶対パスを使用して確実にログファイルを出力
+        // デバッグログは非表示（Info以上のみ）
         if (!ytdlpspout::Logger::IsInitialized()) {
-            if (debugFile) {
-                fprintf(debugFile, "[ytdlpspout] Initializing Logger...\n");
-                fflush(debugFile);
-            }
-            ytdlpspout::Logger::Initialize(true, "F:/ytdlpSpout/ytdlpspout_debug.log", ytdlpspout::LogLevel::Debug);
-            if (debugFile) {
-                fprintf(debugFile, "[ytdlpspout] Logger initialized\n");
-                fflush(debugFile);
-            }
+            ytdlpspout::Logger::Initialize(false, "", ytdlpspout::LogLevel::Info);
         }
         
         auto* ctx = new PlayerContext();
         ctx->player = std::make_unique<ytdlpspout::VideoPlayer>();
         SetLastError("");  // Clear error
-        if (debugFile) {
-            fprintf(debugFile, "[ytdlpspout] Player created successfully\n");
-            fclose(debugFile);
-        }
         return static_cast<YtdlpSpoutHandle>(ctx);
     } catch (const std::exception& e) {
-        if (debugFile) {
-            fprintf(debugFile, "[ytdlpspout] Exception: %s\n", e.what());
-            fclose(debugFile);
-        }
         SetLastError(std::string("Failed to create player: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        SetLastError("Failed to create player: unknown exception");
         return nullptr;
     }
 }
@@ -225,89 +234,102 @@ int ytdlpspout_start(YtdlpSpoutHandle handle, const YtdlpSpoutConfig* config) {
         
         SetLastError("");
         return 0;
-    } catch (const std::exception& e) {
-        SetLastError(std::string("Exception during start: ") + e.what());
-        return -6;
-    }
+    } YTDLPSPOUT_CATCH_RETURN(-6)
 }
 
 void ytdlpspout_stop(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (player) {
-        player->Stop();
-    }
+    try {
+        auto* player = GetPlayer(handle);
+        if (player) {
+            player->Stop();
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 void ytdlpspout_pause(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (player) {
-        player->Pause();
-    }
+    try {
+        auto* player = GetPlayer(handle);
+        if (player) {
+            player->Pause();
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 void ytdlpspout_resume(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (player) {
-        player->Resume();
-    }
+    try {
+        auto* player = GetPlayer(handle);
+        if (player) {
+            player->Resume();
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 int ytdlpspout_seek(YtdlpSpoutHandle handle, double seconds) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return -1;
-    }
-    
-    if (!player->Seek(seconds)) {
-        SetLastError("Seek failed");
-        return -2;
-    }
-    
-    return 0;
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return -1;
+        }
+
+        if (!player->Seek(seconds)) {
+            SetLastError("Seek failed");
+            return -2;
+        }
+
+        return 0;
+    } YTDLPSPOUT_CATCH_RETURN(-4)
 }
 
 int ytdlpspout_process_frame(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return 0;
-    }
-    
-    return player->ProcessFrame() ? 1 : 0;
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return 0;
+        }
+
+        return player->ProcessFrame() ? 1 : 0;
+    } YTDLPSPOUT_CATCH_RETURN(0)
 }
 
 YtdlpSpoutState ytdlpspout_get_state(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return YTDLPSPOUT_STATE_ERROR;
-    }
-    
-    switch (player->GetState()) {
-        case ytdlpspout::PlayerState::Stopped:
-            return YTDLPSPOUT_STATE_STOPPED;
-        case ytdlpspout::PlayerState::Playing:
-            return YTDLPSPOUT_STATE_PLAYING;
-        case ytdlpspout::PlayerState::Paused:
-            return YTDLPSPOUT_STATE_PAUSED;
-        case ytdlpspout::PlayerState::Error:
-        default:
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
             return YTDLPSPOUT_STATE_ERROR;
-    }
+        }
+
+        switch (player->GetState()) {
+            case ytdlpspout::PlayerState::Stopped:
+                return YTDLPSPOUT_STATE_STOPPED;
+            case ytdlpspout::PlayerState::Playing:
+                return YTDLPSPOUT_STATE_PLAYING;
+            case ytdlpspout::PlayerState::Paused:
+                return YTDLPSPOUT_STATE_PAUSED;
+            case ytdlpspout::PlayerState::Error:
+            default:
+                return YTDLPSPOUT_STATE_ERROR;
+        }
+    } YTDLPSPOUT_CATCH_RETURN(YTDLPSPOUT_STATE_ERROR)
 }
 
 int ytdlpspout_is_playing(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return 0;
-    }
-    return player->IsPlaying() ? 1 : 0;
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return 0;
+        }
+        return player->IsPlaying() ? 1 : 0;
+    } YTDLPSPOUT_CATCH_RETURN(0)
 }
 
 double ytdlpspout_get_position(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return 0.0;
-    }
-    return player->GetPlaybackTime();
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return 0.0;
+        }
+        return player->GetPlaybackTime();
+    } YTDLPSPOUT_CATCH_RETURN(0.0)
 }
 
 double ytdlpspout_get_current_time(YtdlpSpoutHandle handle) {
@@ -315,73 +337,83 @@ double ytdlpspout_get_current_time(YtdlpSpoutHandle handle) {
 }
 
 double ytdlpspout_get_duration(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return 0.0;
-    }
-    return player->GetDuration();
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return 0.0;
+        }
+        return player->GetDuration();
+    } YTDLPSPOUT_CATCH_RETURN(0.0)
 }
 
 int ytdlpspout_get_video_info(YtdlpSpoutHandle handle, YtdlpSpoutVideoInfo* info) {
-    if (!info) {
-        SetLastError("Invalid info: nullptr");
-        return -1;
-    }
-    
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return -2;
-    }
-    
-    info->width = player->GetWidth();
-    info->height = player->GetHeight();
-    info->fps = player->GetFPS();
-    info->duration = player->GetDuration();
-    info->totalFrames = player->GetTotalFrames();
-    
-    return 0;
+    try {
+        if (!info) {
+            SetLastError("Invalid info: nullptr");
+            return -1;
+        }
+
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return -2;
+        }
+
+        info->width = player->GetWidth();
+        info->height = player->GetHeight();
+        info->fps = player->GetFPS();
+        info->duration = player->GetDuration();
+        info->totalFrames = player->GetTotalFrames();
+
+        return 0;
+    } YTDLPSPOUT_CATCH_RETURN(-3)
 }
 
 int ytdlpspout_jump_beats(YtdlpSpoutHandle handle, int beats, int forward) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return -1;
-    }
-    
-    if (!player->GetBeatMap()) {
-        SetLastError("No beatmap loaded");
-        return -2;
-    }
-    
-    if (!player->JumpBeats(beats, forward != 0)) {
-        SetLastError("Jump beats failed");
-        return -3;
-    }
-    
-    return 0;
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return -1;
+        }
+
+        if (!player->GetBeatMap()) {
+            SetLastError("No beatmap loaded");
+            return -2;
+        }
+
+        if (!player->JumpBeats(beats, forward != 0)) {
+            SetLastError("Jump beats failed");
+            return -3;
+        }
+
+        return 0;
+    } YTDLPSPOUT_CATCH_RETURN(-4)
 }
 
 float ytdlpspout_get_bpm(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return 0.0f;
-    }
-    
-    auto beatMap = player->GetBeatMap();
-    if (!beatMap) {
-        return 0.0f;
-    }
-    
-    return beatMap->bpm;
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return 0.0f;
+        }
+
+        auto beatMap = player->GetBeatMap();
+        if (!beatMap) {
+            return 0.0f;
+        }
+
+        return beatMap->bpm;
+    } YTDLPSPOUT_CATCH_RETURN(0.0f)
 }
 
 int ytdlpspout_get_frame_buffer_size(YtdlpSpoutHandle handle) {
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return 0;
-    }
-    
-    return player->GetFrameBufferSize();
+    try {
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return 0;
+        }
+
+        return player->GetFrameBufferSize();
+    } YTDLPSPOUT_CATCH_RETURN(0)
 }
 
 int ytdlpspout_get_current_frame(
@@ -391,39 +423,41 @@ int ytdlpspout_get_current_frame(
     int* outWidth,
     int* outHeight)
 {
-    if (!handle) {
-        SetLastError("Invalid handle: nullptr");
-        return -1;
-    }
-    if (!buffer) {
-        SetLastError("Invalid buffer: nullptr");
-        return -2;
-    }
-    
-    auto* player = GetPlayer(handle);
-    if (!player) {
-        return -3;
-    }
-    
-    int result = player->GetCurrentFrameData(buffer, bufferSize, outWidth, outHeight);
-    if (result != 0) {
-        switch (result) {
-            case -1:
-                SetLastError("Invalid buffer parameters");
-                break;
-            case -2:
-                SetLastError("No valid frame available");
-                break;
-            case -3:
-                SetLastError("Buffer too small");
-                break;
-            default:
-                SetLastError("Unknown error getting frame data");
-                break;
+    try {
+        if (!handle) {
+            SetLastError("Invalid handle: nullptr");
+            return -1;
         }
-    }
-    
-    return result;
+        if (!buffer) {
+            SetLastError("Invalid buffer: nullptr");
+            return -2;
+        }
+
+        auto* player = GetPlayer(handle);
+        if (!player) {
+            return -3;
+        }
+
+        int result = player->GetCurrentFrameData(buffer, bufferSize, outWidth, outHeight);
+        if (result != 0) {
+            switch (result) {
+                case -1:
+                    SetLastError("Invalid buffer parameters");
+                    break;
+                case -2:
+                    SetLastError("No valid frame available");
+                    break;
+                case -3:
+                    SetLastError("Buffer too small");
+                    break;
+                default:
+                    SetLastError("Unknown error getting frame data");
+                    break;
+            }
+        }
+
+        return result;
+    } YTDLPSPOUT_CATCH_RETURN(-4)
 }
 
 const char* ytdlpspout_get_last_error(void) {
@@ -435,13 +469,15 @@ void ytdlpspout_set_progress_callback(
     YtdlpSpoutProgressCallback callback,
     void* userData)
 {
-    if (!handle) return;
-    
-    auto* ctx = GetContext(handle);
-    if (ctx) {
-        ctx->progressCallback = callback;
-        ctx->progressUserData = userData;
-    }
+    try {
+        if (!handle) return;
+
+        auto* ctx = GetContext(handle);
+        if (ctx) {
+            ctx->progressCallback = callback;
+            ctx->progressUserData = userData;
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 void ytdlpspout_set_error_callback(
@@ -449,13 +485,15 @@ void ytdlpspout_set_error_callback(
     YtdlpSpoutErrorCallback callback,
     void* userData)
 {
-    if (!handle) return;
-    
-    auto* ctx = GetContext(handle);
-    if (ctx) {
-        ctx->errorCallback = callback;
-        ctx->errorUserData = userData;
-    }
+    try {
+        if (!handle) return;
+
+        auto* ctx = GetContext(handle);
+        if (ctx) {
+            ctx->errorCallback = callback;
+            ctx->errorUserData = userData;
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 void ytdlpspout_set_completion_callback(
@@ -463,13 +501,15 @@ void ytdlpspout_set_completion_callback(
     YtdlpSpoutCompletionCallback callback,
     void* userData)
 {
-    if (!handle) return;
-    
-    auto* ctx = GetContext(handle);
-    if (ctx) {
-        ctx->completionCallback = callback;
-        ctx->completionUserData = userData;
-    }
+    try {
+        if (!handle) return;
+
+        auto* ctx = GetContext(handle);
+        if (ctx) {
+            ctx->completionCallback = callback;
+            ctx->completionUserData = userData;
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 // =============================================================================
@@ -477,24 +517,27 @@ void ytdlpspout_set_completion_callback(
 // =============================================================================
 
 void ytdlpspout_config_ex_init(YtdlpSpoutConfigEx* config) {
-    if (!config) return;
-    memset(config, 0, sizeof(*config));
-    config->senderName = "ytdlpSpout";
-    config->loop = 0;
-    config->useHardwareAccel = 1;
-    config->verbose = 0;
-    config->slice.enabled = 1;
-    config->slice.chunkSize = 2 * 1024 * 1024;          // 2MB - 高解像度向け
-    config->slice.maxCacheMemory = 256 * 1024 * 1024;   // 256MB
-    config->slice.maxConcurrentDownloads = 6;            // 6ワーカー
-    config->slice.prefetchChunksAhead = 24;              // 48MB先読み
-    config->slice.criticalChunksAhead = 6;
-    config->slice.enableContinuousDownload = 1;
-    config->slice.cachePath = nullptr;
-    config->ytdlp.path = nullptr;
-    config->ytdlp.preferredHeight = 1080;
-    config->httpHeaders = nullptr;
-    config->httpHeadersCount = 0;
+    try {
+        if (!config) return;
+        memset(config, 0, sizeof(*config));
+        config->senderName = "ytdlpSpout";
+        config->loop = 0;
+        config->useHardwareAccel = 1;
+        config->verbose = 0;
+        config->slice.enabled = 1;
+        config->slice.chunkSize = 2 * 1024 * 1024;          // 2MB - 高解像度向け
+        config->slice.maxCacheMemory = 256 * 1024 * 1024;   // 256MB
+        config->slice.maxConcurrentDownloads = 6;            // 6ワーカー
+        config->slice.prefetchChunksAhead = 24;              // 48MB先読み
+        config->slice.criticalChunksAhead = 6;
+        config->slice.enableContinuousDownload = 1;
+        config->slice.cachePath = nullptr;
+        config->ytdlp.path = nullptr;
+        config->ytdlp.preferredHeight = 1080;
+        config->httpHeaders = nullptr;
+        config->httpHeadersCount = 0;
+        config->isHlsHint = -1;  // 自動判定
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* config) {
@@ -525,6 +568,10 @@ int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* confi
         if (sourceType == ytdlpspout::ytdlp::SourceType::YtDlpUrl) {
             LOG_INFO("Resolving yt-dlp URL: {}", inputPath);
             ytdlpspout::ytdlp::YtDlpResolver resolver;
+            // RES-4: config->ytdlp.pathで渡されたカスタムyt-dlpパスを初回URL解決に反映する
+            if (config->ytdlp.path && config->ytdlp.path[0] != '\0') {
+                resolver.SetYtDlpPath(config->ytdlp.path);
+            }
             int preferredHeight = config->ytdlp.preferredHeight > 0 ? config->ytdlp.preferredHeight : 1080;
             auto streamUrl = resolver.GetStreamUrl(inputPath, preferredHeight);
             if (!streamUrl) {
@@ -542,7 +589,8 @@ int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* confi
         playerConfig.loop = config->loop != 0;
         playerConfig.useHardwareAccel = config->useHardwareAccel != 0;
         playerConfig.verbose = config->verbose != 0;
-        
+        playerConfig.isHlsHint = config->isHlsHint;
+
         // スライス設定をPlayerConfigに反映
         playerConfig.slice.enabled = config->slice.enabled != 0;
         playerConfig.slice.chunkSize = config->slice.chunkSize > 0 
@@ -551,8 +599,13 @@ int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* confi
             ? config->slice.maxCacheMemory : 128 * 1024 * 1024;
         playerConfig.slice.maxConcurrentDownloads = config->slice.maxConcurrentDownloads > 0 
             ? config->slice.maxConcurrentDownloads : 4;
-        playerConfig.slice.prefetchChunksAhead = config->slice.prefetchChunksAhead > 0 
+        playerConfig.slice.prefetchChunksAhead = config->slice.prefetchChunksAhead > 0
             ? config->slice.prefetchChunksAhead : 8;
+        // RES-7: criticalChunksAhead/enableContinuousDownloadもPlayerConfigに反映する
+        // （従来はここでコピーされず、ytdlpspout_config_ex_initの既定値が捨てられていた）
+        playerConfig.slice.criticalChunksAhead = config->slice.criticalChunksAhead > 0
+            ? config->slice.criticalChunksAhead : playerConfig.slice.criticalChunksAhead;
+        playerConfig.slice.enableContinuousDownload = config->slice.enableContinuousDownload != 0;
         if (config->slice.cachePath) {
             playerConfig.slice.cachePath = config->slice.cachePath;
         }
@@ -622,31 +675,34 @@ int ytdlpspout_start_ex(YtdlpSpoutHandle handle, const YtdlpSpoutConfigEx* confi
         
         SetLastError("");
         return 0;
-    } catch (const std::exception& e) {
-        SetLastError(std::string("Exception during start: ") + e.what());
-        return -1;
-    }
+    } YTDLPSPOUT_CATCH_RETURN(-1)
 }
 
 double ytdlpspout_get_download_progress(YtdlpSpoutHandle handle) {
-    if (!handle) return 0.0;
-    auto* ctx = GetContext(handle);
-    if (!ctx || !ctx->player) return 0.0;
-    return ctx->player->GetDownloadProgress();
+    try {
+        if (!handle) return 0.0;
+        auto* ctx = GetContext(handle);
+        if (!ctx || !ctx->player) return 0.0;
+        return ctx->player->GetDownloadProgress();
+    } YTDLPSPOUT_CATCH_RETURN(0.0)
 }
 
 double ytdlpspout_get_bandwidth(YtdlpSpoutHandle handle) {
-    if (!handle) return 0.0;
-    // TODO: 帯域幅測定は将来実装予定
-    // 現時点ではVideoPlayerからの取得方法がないため0を返す
-    return 0.0;
+    try {
+        if (!handle) return 0.0;
+        // TODO: 帯域幅測定は将来実装予定
+        // 現時点ではVideoPlayerからの取得方法がないため0を返す
+        return 0.0;
+    } YTDLPSPOUT_CATCH_RETURN(0.0)
 }
 
 int ytdlpspout_is_fully_cached(YtdlpSpoutHandle handle) {
-    if (!handle) return 0;
-    auto* ctx = GetContext(handle);
-    if (!ctx || !ctx->player) return 0;
-    return ctx->player->IsFullyCached() ? 1 : 0;
+    try {
+        if (!handle) return 0;
+        auto* ctx = GetContext(handle);
+        if (!ctx || !ctx->player) return 0;
+        return ctx->player->IsFullyCached() ? 1 : 0;
+    } YTDLPSPOUT_CATCH_RETURN(0)
 }
 
 void ytdlpspout_get_cache_stats(
@@ -656,19 +712,21 @@ void ytdlpspout_get_cache_stats(
 {
     if (cachedChunks) *cachedChunks = 0;
     if (totalChunks) *totalChunks = 0;
-    
-    if (!handle) return;
-    auto* ctx = GetContext(handle);
-    if (!ctx || !ctx->player) return;
-    
-    // ダウンロード進捗から推定
-    // 注: 正確なチャンク数を取得するにはVideoPlayerに追加APIが必要
-    double progress = ctx->player->GetDownloadProgress();
-    if (progress >= 1.0) {
-        // 完全にキャッシュ済み
-        if (cachedChunks) *cachedChunks = 1;
-        if (totalChunks) *totalChunks = 1;
-    }
+
+    try {
+        if (!handle) return;
+        auto* ctx = GetContext(handle);
+        if (!ctx || !ctx->player) return;
+
+        // ダウンロード進捗から推定
+        // 注: 正確なチャンク数を取得するにはVideoPlayerに追加APIが必要
+        double progress = ctx->player->GetDownloadProgress();
+        if (progress >= 1.0) {
+            // 完全にキャッシュ済み
+            if (cachedChunks) *cachedChunks = 1;
+            if (totalChunks) *totalChunks = 1;
+        }
+    } YTDLPSPOUT_CATCH_VOID()
 }
 
 int ytdlpspout_get_hls_cache_stats(YtdlpSpoutHandle handle, YtdlpSpoutHlsCacheStats* stats) {
@@ -676,31 +734,33 @@ int ytdlpspout_get_hls_cache_stats(YtdlpSpoutHandle handle, YtdlpSpoutHlsCacheSt
         SetLastError("Invalid stats: nullptr");
         return -1;
     }
-    
+
     // statsをゼロ初期化
     memset(stats, 0, sizeof(*stats));
-    
-    if (!handle) {
-        // ハンドルがなくてもエラーではなく、デフォルト値を返す
+
+    try {
+        if (!handle) {
+            // ハンドルがなくてもエラーではなく、デフォルト値を返す
+            return 0;
+        }
+
+        auto* ctx = GetContext(handle);
+        if (!ctx || !ctx->player) {
+            // プレイヤーがなくてもエラーではなく、デフォルト値を返す
+            return 0;
+        }
+
+        // VideoPlayerからHLS統計を取得
+        auto hlsStats = ctx->player->GetHlsCacheStats();
+        stats->cachedSegments = hlsStats.cachedSegments;
+        stats->totalSegments = hlsStats.totalSegments;
+        stats->downloadProgress = hlsStats.downloadProgress;
+        stats->bandwidth = hlsStats.bandwidth;
+        stats->isFullyCached = hlsStats.isFullyCached ? 1 : 0;
+        stats->isHlsMode = hlsStats.isHlsMode ? 1 : 0;
+
         return 0;
-    }
-    
-    auto* ctx = GetContext(handle);
-    if (!ctx || !ctx->player) {
-        // プレイヤーがなくてもエラーではなく、デフォルト値を返す
-        return 0;
-    }
-    
-    // VideoPlayerからHLS統計を取得
-    auto hlsStats = ctx->player->GetHlsCacheStats();
-    stats->cachedSegments = hlsStats.cachedSegments;
-    stats->totalSegments = hlsStats.totalSegments;
-    stats->downloadProgress = hlsStats.downloadProgress;
-    stats->bandwidth = hlsStats.bandwidth;
-    stats->isFullyCached = hlsStats.isFullyCached ? 1 : 0;
-    stats->isHlsMode = hlsStats.isHlsMode ? 1 : 0;
-    
-    return 0;
+    } YTDLPSPOUT_CATCH_RETURN(-2)
 }
 
 } // extern "C"

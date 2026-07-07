@@ -64,8 +64,26 @@ TEST(HlsSliceLoadingManagerStaticTest, IsHlsUrl_NotHls) {
 TEST(HlsSliceLoadingManagerStaticTest, IsHlsUrl_EdgeCases) {
     // URLにm3u8が含まれるがパスとしては無効なケース
     EXPECT_TRUE(HlsSliceLoadingManager::IsHlsUrl("https://m3u8.example.com/video.m3u8"));
-    // クエリパラメータにm3u8が含まれるケース
+    // クエリパラメータにm3u8が含まれるケース（値が"m3u8"そのものではないので誤検知しない）
     EXPECT_FALSE(HlsSliceLoadingManager::IsHlsUrl("https://example.com/video?format=m3u8like"));
+}
+
+// =============================================================================
+// IsHlsUrl() クエリパラメータ判定テスト（問題L-5: 判定基準の統一）
+// =============================================================================
+
+TEST(HlsSliceLoadingManagerStaticTest, IsHlsUrl_FormatQueryParam) {
+    // format=m3u8 が末尾にあるケース
+    EXPECT_TRUE(HlsSliceLoadingManager::IsHlsUrl("https://example.com/videoplayback?format=m3u8"));
+    // format=m3u8 の後に他のクエリパラメータが続くケース
+    EXPECT_TRUE(HlsSliceLoadingManager::IsHlsUrl("https://example.com/videoplayback?format=m3u8&sig=abc"));
+    // 大文字小文字を無視
+    EXPECT_TRUE(HlsSliceLoadingManager::IsHlsUrl("https://example.com/videoplayback?FORMAT=M3U8"));
+}
+
+TEST(HlsSliceLoadingManagerStaticTest, IsHlsUrl_MimeQueryParam) {
+    EXPECT_TRUE(HlsSliceLoadingManager::IsHlsUrl(
+        "https://example.com/videoplayback?mime=application%2Fvnd.apple.mpegurl"));
 }
 
 // =============================================================================

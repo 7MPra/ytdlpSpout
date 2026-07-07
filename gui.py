@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -116,10 +117,23 @@ class App:
         # yt-dlp非同期リゾルバー（URL解決中のインスタンス保持）
         self._ytdlp_resolver: YtDlpAsyncResolver | None = None
         self._url_resolving = False  # URL解決中フラグ
-        
+        # URL解決の世代カウンタ（Stop後にキャンセルされた解決結果を無視するため）
+        self._url_resolve_generation = 0
+
+        # ストリーム開始の世代カウンタ（Start処理中にStopが押された場合、
+        # 後からバックグラウンドスレッドで構築が完了したStreamerを
+        # 自動的に破棄し、孤立ストリーム化を防ぐため）
+        self._stream_start_generation = 0
+        self._stream_lock = threading.Lock()
+
         # プログレスデータ初期化
         self.download_progress: dict[str, Any] = self._create_empty_progress()
-        
+
+        # プレビュー処理用の常駐ワーカースレッド起動（最新フレーム1件のみ保持するキュー経由）
+        self._preview_frame_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._preview_worker_thread: threading.Thread | None = None
+        self._start_preview_worker()
+
         # UI初期化
         self._setup_appearance()
         self._setup_fonts()
@@ -445,13 +459,8 @@ class App:
             pass
     
     def debug_log(self, msg: str) -> None:
-        """デバッグ専用ログ（常に出力）"""
-        try:
-            timestamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
-            debug_msg = f"[{timestamp}] {msg}"
-            self._log_direct(debug_msg)
-        except Exception:
-            pass
+        """デバッグ専用ログ（無効化：出力しない）"""
+        pass
     
     def _start_main_thread_monitor(self) -> None:
         """メインスレッドのブロッキングを監視"""
@@ -651,9 +660,9 @@ class App:
                     cleaned_url
                 ]
                 
-                # cookiesファイルが存在すれば使用
-                cookie_file = os.path.join("data", "cookies.txt")
-                if os.path.exists(cookie_file):
+                # 全サイト共通のCookieファイル（リゾルバーと同じ候補）
+                cookie_file = YtDlpAsyncResolver.get_default_cookie_file(Path(__file__).parent)
+                if cookie_file:
                     cmd.insert(-1, "--cookies")
                     cmd.insert(-1, cookie_file)
                 
@@ -1111,8 +1120,10 @@ class App:
             if self.max_enable.get() and maxw and maxh:
                 max_res = (int(maxw), int(maxh))
         except (ValueError, TypeError):
-            pass
-        
+            # Issue GUI-3: 無警告のままCap設定が無効化されるのを防ぐため、
+            # 何が無効化されたかをログに明示する
+            self.log(f"警告: 解像度（Max）の値が不正です。Cap設定を適用しません: 幅='{maxw}' 高さ='{maxh}'")
+
         # 手動解像度設定
         try:
             manw = self.manw_var.get().strip()
@@ -1120,8 +1131,10 @@ class App:
             if self.manual_enable.get() and manw and manh:
                 manual_res = (int(manw), int(manh))
         except (ValueError, TypeError):
-            pass
-        
+            # Issue GUI-3: 無警告のままManual設定が無効化されるのを防ぐため、
+            # 何が無効化されたかをログに明示する
+            self.log(f"警告: 解像度（Manual）の値が不正です。Manual設定を適用しません: 幅='{manw}' 高さ='{manh}'")
+
         return max_res, manual_res
     
     def _create_streamer(
@@ -1182,7 +1195,41 @@ class App:
                 init_ok_cb=init_ok_cb,
                 external_spout_sender=external_spout_sender
             )
-    
+
+    def _commit_started_streamer(self, streamer, generation: int, on_committed=None) -> bool:
+        """バックグラウンドで構築済みのStreamerをself.streamerへ確定させる。
+
+        Start処理（URL解決やStreamer構築）はバックグラウンドスレッドで行われるため、
+        構築完了前にStop（on_stop）が呼ばれて世代カウンタ(_stream_start_generation)が
+        進んでいる可能性がある。その場合はここで検出し、構築済みのstreamerを
+        即座にstop()して破棄し、self.streamerへの代入も.start()も行わない
+        （孤立ストリーム防止：Issue GUI-2）。
+
+        generationチェックとself.streamerへの代入は_stream_lockで保護し、
+        on_stop()側の世代インクリメント＋streamer読み取りと原子的に扱う。
+
+        戻り値: 採用してstart()まで実行できた場合True、破棄した場合False。
+        """
+        with self._stream_lock:
+            if generation != self._stream_start_generation:
+                stale = True
+            else:
+                self.streamer = streamer
+                stale = False
+
+        if stale:
+            self.log("Stopが先に実行されたため、構築済みのストリーマーを破棄します。")
+            try:
+                streamer.stop()
+            except Exception as e:
+                self.log(f"破棄対象ストリーマーの停止警告: {e}")
+            return False
+
+        streamer.start()
+        if on_committed:
+            on_committed()
+        return True
+
     def _start_local_file_stream(self, file_path: str) -> None:
         """ローカルファイルからのストリーミングを開始"""
         try:
@@ -1203,8 +1250,10 @@ class App:
             self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_LOCAL)
             
         except Exception as e:
-            self.log(f"ローカルファイルストリーミング開始エラー: {e}")
-            self.on_auto_stop()
+            # 例外発生時点ではself.streamer=...の代入が未完了（Noneのまま）のため、
+            # on_auto_stop()ではボタン状態が復帰しない。他の開始失敗経路と同じ
+            # _handle_start_error()でStart/Stopボタンを正しい状態に戻す。
+            self._handle_start_error(f"ローカルファイルストリーミング開始エラー: {e}")
     
     def _start_url_stream(self, video_source_url: str) -> None:
         """URLからのストリーミングを開始（非同期URL解決対応）"""
@@ -1233,40 +1282,34 @@ class App:
         """yt-dlp URL解決を行ってからストリーミングを開始"""
         self.log("URL解決中...")
         self._url_resolving = True
-        
-        # Cookie ファイルのパスを取得
-        cookie_file = None
-        try:
-            import os
-            from pathlib import Path
-            for candidate in [
-                Path(__file__).parent / "data" / "cookies.txt",
-                Path(__file__).parent / "cookies.txt",
-            ]:
-                if candidate.exists():
-                    cookie_file = str(candidate)
-                    break
-        except Exception:
-            pass
-        
+        # Stop後にキャンセルされた解決結果を無視するための世代カウンタ
+        self._url_resolve_generation += 1
+        generation = self._url_resolve_generation
+
+        # 全サイト共通のCookieファイル（存在すれば自動で使用）
+        cookie_file = YtDlpAsyncResolver.get_default_cookie_file(Path(__file__).parent)
+
         # 新しいリゾルバーを作成
         self._ytdlp_resolver = YtDlpAsyncResolver(
             log_cb=lambda m: self.root.after(0, self.log, m),
             cookie_file=cookie_file,
             verbose=False
         )
-        
+
         # 非同期でURL解決を開始
         future = self._ytdlp_resolver.resolve_async(video_source_url)
-        
+
         def on_resolve_complete() -> None:
             """URL解決完了時のコールバック"""
+            # Stop等で世代が進んでいれば、この解決結果は無視する（勝手な再生開始防止）
+            if generation != self._url_resolve_generation:
+                return
             try:
                 result = future.result(timeout=0)  # 既に完了しているはず
                 self._url_resolving = False
-                
+
                 if result is None:
-                    self.log("[yt-dlp] URL解決に失敗しました。従来の方法で再生を試みます。")
+                    self.log("[yt-dlp] URL解決に失敗。直接URLとして再生を試みます")
                     # フォールバック: 従来の方法で再生
                     self._start_url_stream_direct(video_source_url, sender, max_res, manual_res)
                     return
@@ -1275,8 +1318,11 @@ class App:
                 
                 # 解決済みURLでストリーマーを作成
                 def start_resolved_stream() -> None:
+                    # Start処理中にStopが押された場合に構築済みStreamerを
+                    # 破棄できるよう、構築前の世代を捕捉しておく（Issue GUI-2）
+                    stream_generation = self._stream_start_generation
                     try:
-                        self.streamer = NativeStreamerWrapper(
+                        streamer = NativeStreamerWrapper(
                             video_url=video_source_url,  # 元のURL（表示用）
                             sender_name=sender,
                             max_resolution=max_res,
@@ -1288,13 +1334,19 @@ class App:
                             init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
                             external_spout_sender=None,
                             pre_resolved_url=result.stream_url,  # 解決済みURL
-                            pre_resolved_headers=result.http_headers  # HTTPヘッダー
+                            pre_resolved_headers=result.http_headers,  # HTTPヘッダー
+                            pre_resolved_is_hls=result.is_hls  # yt-dlpのprotocolに基づくHLS判定（None=自動）
                         )
-                        self.streamer.start()
-                        self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING))
+                        self._commit_started_streamer(
+                            streamer,
+                            stream_generation,
+                            on_committed=lambda: self.root.after(
+                                0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING)
+                            )
+                        )
                     except Exception as e:
                         self.root.after(0, self._handle_start_error, f"ストリーミング開始エラー: {e}")
-                
+
                 threading.Thread(target=start_resolved_stream, daemon=True).start()
                 
             except Exception as e:
@@ -1305,6 +1357,9 @@ class App:
         
         def poll_resolution() -> None:
             """URL解決の完了をポーリング"""
+            # Stop等で世代が進んでいれば、このポーリングループは打ち切る
+            if generation != self._url_resolve_generation:
+                return
             if future.done():
                 on_resolve_complete()
             else:
@@ -1323,8 +1378,11 @@ class App:
     ) -> None:
         """直接URLでストリーミングを開始（従来の処理）"""
         def start_streaming_thread() -> None:
+            # Start処理中にStopが押された場合に構築済みStreamerを
+            # 破棄できるよう、構築前の世代を捕捉しておく（Issue GUI-2）
+            stream_generation = self._stream_start_generation
             try:
-                self.streamer = self._create_streamer(
+                streamer = self._create_streamer(
                     video_source_url,
                     sender,
                     max_resolution=max_res,
@@ -1335,11 +1393,16 @@ class App:
                     init_ok_cb=lambda: self.root.after(0, self.on_stream_start_success),
                     external_spout_sender=None  # C++ DLLがSpout送信を担当
                 )
-                self.streamer.start()
-                self.root.after(0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING))
+                self._commit_started_streamer(
+                    streamer,
+                    stream_generation,
+                    on_committed=lambda: self.root.after(
+                        0, lambda: self.update_seekbar_color(UIConfig.SEEKBAR_KNOB_DOWNLOADING)
+                    )
+                )
             except Exception as e:
                 self.root.after(0, self._handle_start_error, f"ストリーミング開始エラー: {e}")
-        
+
         threading.Thread(target=start_streaming_thread, daemon=True).start()
 
     def on_stream(self) -> None:
@@ -1627,25 +1690,46 @@ class App:
     def on_stop(self, delete_local_file: bool = True, skip_ui_reset: bool = False) -> None:
         """ストリーミング停止処理"""
         try:
+            # URL解決中のリゾルバーをキャンセル（Stop後に解決完了→勝手に再生開始するのを防止）
+            self._url_resolving = False
+            self._url_resolve_generation += 1
+            if self._ytdlp_resolver is not None:
+                try:
+                    self._ytdlp_resolver.cancel()
+                except Exception as e:
+                    self.log(f"URL解決キャンセル警告: {e}")
+
             # ダウンロード中のサブプロセスをキャンセル
             try:
                 self._cancel_download()
             except Exception as e:
                 self.log(f"ダウンロードキャンセル警告: {e}")
-            
+
+            # ストリーム開始処理の世代を進める。開始処理中（バックグラウンドで
+            # Streamer構築中）にStopが呼ばれた場合、後から構築が完了しても
+            # 世代不一致により自動的に破棄され、self.streamerには代入されない
+            # （孤立ストリーム防止）。self.streamerの読み取り・クリアも同じ
+            # ロックの中で行い、_commit_started_streamer側との競合を防ぐ。
+            with self._stream_lock:
+                self._stream_start_generation += 1
+                current_streamer = self.streamer
+                self.streamer = None
+
             # 現在のStreamerを停止
-            if self.streamer:
+            if current_streamer:
                 try:
-                    self.streamer.stop()
+                    current_streamer.stop()
                 except Exception as e:
                     self.log(f"ストリーマー停止警告: {e}")
-                finally:
-                    self.streamer = None
-            
+
             # 進捗バーを非表示にする
             self.hide_download_progress()
-            
+
         finally:
+            # メインスレッド監視を停止（動作中の場合のみ）
+            if self.main_thread_monitor_active:
+                self._stop_main_thread_monitor()
+
             # 共有SpoutSenderを解放（再生セッション終了のため確実に実行）
             if self.spout_sender:
                 try:
@@ -1722,10 +1806,14 @@ class App:
         if self.streamer:
             self.streamer.stop()
             self.streamer = None
-        
+
         # 進捗バーを非表示にする
         self.hide_download_progress()
-        
+
+        # メインスレッド監視を停止（開始失敗時も動作中の場合は必ず停止する）
+        if self.main_thread_monitor_active:
+            self._stop_main_thread_monitor()
+
         self.download_in_progress = False
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
@@ -1741,6 +1829,8 @@ class App:
         # ストリーマーが存在しない場合は何もしない（切り替え中の誤動作防止）
         if self.streamer is None:
             self.log("動画の再生が完了しました。（ストリーマーなし）")
+            if self.main_thread_monitor_active:
+                self._stop_main_thread_monitor()
             return
         
         self.log("動画の再生が完了しました。")
@@ -1759,16 +1849,41 @@ class App:
         finally:
             self.root.destroy()
 
+    def _sync_streamer_preview_enabled(self) -> None:
+        """ウィンドウの最小化状態をstreamer.preview_enabledへ反映する
+
+        最小化中はプレビュー映像がユーザーに見えないため、streamerの
+        preview_enabledをFalseにして、GUI表示用のフレーム取得・変換
+        （get_current_frame/BGRA->BGR変換/リサイズ）を止める。これにより
+        C++側の省電力リードバック省略機構が働く余地が生まれる。
+        復帰（最小化解除）時はTrueに戻し、従来通りプレビューを更新する。
+
+        最小化以外の「実際に表示されていない」状態（ウィジェット非表示等）は
+        判別が不確実なため、ここでは連動させない。
+        """
+        if not self.streamer or not hasattr(self.streamer, 'preview_enabled'):
+            return
+        try:
+            is_minimized = self.root.state() == 'iconic'
+        except Exception:
+            # 状態取得に失敗した場合は安全側（プレビュー有効のまま）に倒す
+            return
+        try:
+            self.streamer.preview_enabled = not is_minimized
+        except Exception:
+            pass
+
     def update_preview(self) -> None:
         """プレビュー画面を更新する"""
         if self.preview_update_disabled:
             self.root.after(UIConfig.PREVIEW_UPDATE_INTERVAL, self.update_preview)
             return
-            
+
         update_start_time: float | None = None
         try:
             update_start_time = time.time()
-            
+            self._sync_streamer_preview_enabled()
+
             if self.streamer and self.streamer.latest_frame_bgr is not None:
                 # フレーム取得を高速化
                 with self.streamer.frame_lock:
@@ -1869,17 +1984,39 @@ class App:
         except Exception:
             pass
     
+    def _start_preview_worker(self) -> None:
+        """プレビューフレーム処理用の常駐ワーカースレッドを起動
+
+        50ms毎の更新のたびに使い捨てスレッドを生成しないよう、
+        単一の常駐スレッドがキューを待ち受けて処理する。
+        キューには最新フレーム1件のみを保持し、古いフレームは破棄する。
+        ストリーム停止中はキューが空のままアイドル待機する。
+        """
+        def worker() -> None:
+            while True:
+                item = self._preview_frame_queue.get()
+                frame, start_time = item
+                try:
+                    # 画像処理をワーカースレッドで実行
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    self.root.after(0, lambda: self._finalize_preview_update(rgb, start_time))
+                except Exception as e:
+                    self.root.after(0, self.debug_log, f"フレーム処理エラー: {e}")
+
+        self._preview_worker_thread = threading.Thread(target=worker, daemon=True)
+        self._preview_worker_thread.start()
+
     def _update_preview_frame_async(self, frame: Any, start_time: float) -> None:
-        """プレビューフレーム更新を非同期で処理"""
-        def process_frame() -> None:
-            try:
-                # 画像処理を別スレッドで実行
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                self.root.after(0, lambda: self._finalize_preview_update(rgb, start_time))
-            except Exception as e:
-                self.root.after(0, self.debug_log, f"フレーム処理エラー: {e}")
-        
-        threading.Thread(target=process_frame, daemon=True).start()
+        """プレビューフレームを常駐ワーカースレッドに渡す（最新フレームのみ保持）"""
+        # 古いフレームが未処理のまま残っていれば破棄し、最新フレームに差し替える
+        try:
+            self._preview_frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._preview_frame_queue.put_nowait((frame, start_time))
+        except queue.Full:
+            pass
     
     def _finalize_preview_update(self, rgb: Any, start_time: float) -> None:
         """プレビュー更新の最終処理（メインスレッド）"""
@@ -1986,7 +2123,36 @@ class HeadlessApp:
             print(f"[{time.strftime('%H:%M:%S')}] {msg}")
         else:
             print(msg)
-    
+
+    @staticmethod
+    def _is_streamer_alive(streamer) -> bool:
+        """Streamer/NativeStreamerWrapperの実行中判定（Issue GUI-5）
+
+        存在しない`is_running`属性への依存をやめ、実装によって異なる
+        実在の状態を参照する:
+        - NativeStreamerWrapper: self._thread / self._stop_event
+        - レガシーStreamer:      self.thread  / self.stop_event
+
+        判定不能な場合は安全側として「実行中」とみなし、
+        stop_event（Ctrl+CやstopCb経由）による終了待機に委ねる。
+        """
+        if streamer is None:
+            return False
+
+        thread = getattr(streamer, '_thread', None)
+        if thread is None:
+            thread = getattr(streamer, 'thread', None)
+        if thread is not None:
+            return thread.is_alive()
+
+        stop_event = getattr(streamer, '_stop_event', None)
+        if stop_event is None:
+            stop_event = getattr(streamer, 'stop_event', None)
+        if stop_event is not None:
+            return not stop_event.is_set()
+
+        return True
+
     def run(self) -> int:
         """メイン実行ループ"""
         args = self.args
@@ -2027,7 +2193,7 @@ class HeadlessApp:
             
             # ストリーマーの終了を待機
             while not self.stop_event.is_set():
-                if hasattr(self.streamer, 'is_running') and not self.streamer.is_running:
+                if not self._is_streamer_alive(self.streamer):
                     break
                 time.sleep(0.1)
             
@@ -2060,18 +2226,24 @@ class HeadlessApp:
         args = self.args
         if args.max_width and args.max_height:
             return (args.max_width, args.max_height)
-        elif not args.no_limit:
+        if args.max_width or args.max_height:
+            # Issue GUI-4: 片方だけ指定された場合に無警告で無視しない
+            self.log("警告: --max-widthと--max-heightは両方指定してください。解像度上限の指定を無視します。")
+        if not args.no_limit:
             # デフォルトで1080p制限を設定（安定性重視）
             if args.verbose:
                 self.log("デフォルト解像度制限: 1080p (--no-limitで無効化可能)")
             return (1920, 1080)
         return None
-    
+
     def _get_manual_resolution(self):
         """手動解像度設定を取得"""
         args = self.args
         if args.width and args.height:
             return (args.width, args.height)
+        if args.width or args.height:
+            # Issue GUI-4: 片方だけ指定された場合に無警告で無視しない
+            self.log("警告: --widthと--heightは両方指定してください。手動解像度の指定を無視します。")
         return None
     
     def _create_streamer(self, video_url, sender_name, max_resolution, manual_resolution, loop_vod):

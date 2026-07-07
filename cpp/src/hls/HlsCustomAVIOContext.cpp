@@ -11,6 +11,7 @@
 #include <mutex>
 #include <vector>
 #include <functional>
+#include <unordered_set>
 
 // FFmpeg
 extern "C" {
@@ -76,7 +77,11 @@ struct HlsCustomAVIOContext::Impl {
     // 状態
     bool initialized = false;
     std::mutex mutex;
-    
+
+    // 恒久失敗セグメントに対して既に自動再ダウンロードを試みたかどうか
+    // （1セグメントにつき1回だけ自動復旧を試みるための管理。SeekToTime()でリセットされる）
+    std::unordered_set<int64_t> retriedSegments;
+
     /// @brief デストラクタ
     ~Impl() {
         // AVIOContextをクリーンアップ
@@ -246,12 +251,21 @@ struct HlsCustomAVIOContext::Impl {
 
     // シークコールバック
     std::function<void(int64_t)> onSeekCallback;
+
+    // セグメント再ダウンロード要求コールバック（恒久失敗からの自動復旧用）
+    std::function<void(int64_t)> onSegmentRetryCallback;
 };
 
 void HlsCustomAVIOContext::SetOnSeekCallback(std::function<void(int64_t)> callback) {
     if (!m_impl) return;
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     m_impl->onSeekCallback = callback;
+}
+
+void HlsCustomAVIOContext::SetOnSegmentRetryCallback(std::function<void(int64_t)> callback) {
+    if (!m_impl) return;
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    m_impl->onSegmentRetryCallback = callback;
 }
 
 // =============================================================================
@@ -358,8 +372,9 @@ void HlsCustomAVIOContext::Close() {
     m_impl->position = 0;
     m_impl->currentSegmentIndex = 0;
     m_impl->currentSegmentOffset = 0;
+    m_impl->retriedSegments.clear();
     m_impl->initialized = false;
-    
+
     LOG_INFO("HlsCustomAVIOContext: Closed");
 }
 
@@ -486,14 +501,18 @@ int64_t HlsCustomAVIOContext::SeekToTime(double seconds) {
     }
     
     int64_t newPosition = m_impl->segmentOffsets[segmentIndex];
-    
+
     LOG_TRACE("HlsCustomAVIOContext: SeekToTime {} sec -> segment {} (offset {})",
               seconds, segmentIndex, newPosition);
-    
+
     m_impl->currentSegmentIndex = segmentIndex;
     m_impl->currentSegmentOffset = 0;
     m_impl->position = newPosition;
-    
+
+    // ユーザー操作によるシーク: リトライ済み管理をリセットし、
+    // 以前恒久失敗としてマークされたセグメントにも再度復旧の機会を与える
+    m_impl->retriedSegments.clear();
+
     return newPosition;
 }
 
@@ -563,14 +582,46 @@ int HlsCustomAVIOContext::ReadPacket(void* opaque, uint8_t* buf, int bufSize) {
         
         // ロック外でデータ取得（待機可能）
         auto segmentData = cache->ReadSegment(segmentToRead, timeout);
-        
+
         if (!segmentData) {
             // タイムアウトまたはデータなし
             if (totalBytesRead > 0) {
-                // 部分的に読み取れた場合はそれを返す
+                // 部分的に読み取れた場合はそれを返す（続きは次回のReadPacket呼び出しで処理）
                 break;
             }
-            LOG_WARN("HlsCustomAVIOContext: ReadSegment timeout for segment {}", 
+
+            // 恒久的なダウンロード失敗（リトライ枯渇）かどうかを確認する。
+            // 単なるタイムアウト（まだダウンロード中）であれば、従来通りEAGAINを返し
+            // FFmpeg側の再試行に委ねる。恒久失敗の場合は無限EAGAINループを避けるため、
+            // 1回だけ自動再ダウンロードを試み、それでも失敗すればEIOで確定的に失敗させる。
+            if (cache->IsSegmentFailed(segmentToRead)) {
+                bool alreadyRetried;
+                std::function<void(int64_t)> retryCallback;
+                {
+                    std::lock_guard<std::mutex> lock(impl.mutex);
+                    alreadyRetried = impl.retriedSegments.find(segmentToRead) != impl.retriedSegments.end();
+                    if (!alreadyRetried) {
+                        impl.retriedSegments.insert(segmentToRead);
+                    }
+                    retryCallback = impl.onSegmentRetryCallback;
+                }
+
+                if (alreadyRetried) {
+                    LOG_ERROR("HlsCustomAVIOContext: Segment {} permanently failed even after "
+                              "automatic retry, returning EIO", segmentToRead);
+                    return AVERROR(EIO);
+                }
+
+                LOG_WARN("HlsCustomAVIOContext: Segment {} download failed permanently, "
+                         "requesting one-time automatic re-download", segmentToRead);
+                if (retryCallback) {
+                    // Managerがロックを取得するため、ここではimpl.mutexを保持しない状態で呼び出す
+                    retryCallback(segmentToRead);
+                }
+                return AVERROR(EAGAIN);
+            }
+
+            LOG_WARN("HlsCustomAVIOContext: ReadSegment timeout for segment {}",
                      segmentToRead);
             return AVERROR(EAGAIN);
         }

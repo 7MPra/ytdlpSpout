@@ -13,9 +13,9 @@ namespace ytdlpspout {
 // PooledTexture 実装
 // =============================================================================
 
-PooledTexture::PooledTexture(ComPtr<ID3D11Texture2D> texture, TexturePool* pool, size_t index)
+PooledTexture::PooledTexture(ComPtr<ID3D11Texture2D> texture, std::weak_ptr<TexturePool> pool, size_t index)
     : m_texture(std::move(texture))
-    , m_pool(pool)
+    , m_pool(std::move(pool))
     , m_index(index)
 {
 }
@@ -26,27 +26,32 @@ PooledTexture::~PooledTexture() {
 
 PooledTexture::PooledTexture(PooledTexture&& other) noexcept
     : m_texture(std::move(other.m_texture))
-    , m_pool(other.m_pool)
+    , m_pool(std::move(other.m_pool))
     , m_index(other.m_index)
 {
-    other.m_pool = nullptr;
+    other.m_pool.reset();
 }
 
 PooledTexture& PooledTexture::operator=(PooledTexture&& other) noexcept {
     if (this != &other) {
         Release();
         m_texture = std::move(other.m_texture);
-        m_pool = other.m_pool;
+        m_pool = std::move(other.m_pool);
         m_index = other.m_index;
-        other.m_pool = nullptr;
+        other.m_pool.reset();
     }
     return *this;
 }
 
 void PooledTexture::Release() {
-    if (m_pool && m_texture) {
-        m_pool->Release(m_index);
-        m_pool = nullptr;
+    // Issue C: weak_ptr::lock()でプールがまだ生存しているか確認してから返却する。
+    // Stop()等でTexturePoolが既に破棄済み（reset済み）の場合はlock()がnullptrを返すため、
+    // 解放済みメモリへのアクセス（use-after-free）を避け、ComPtrの解放のみ行う。
+    if (m_texture) {
+        if (auto pool = m_pool.lock()) {
+            pool->Release(m_index);
+        }
+        m_pool.reset();
     }
     m_texture.Reset();
 }
@@ -198,7 +203,9 @@ PooledTexture TexturePool::Acquire() {
 
     LOG_TRACE("Acquired texture {} (available: {})", index, m_available.size());
 
-    return PooledTexture(m_textures[index], this, index);
+    // Issue C: shared_from_this()を使うため、TexturePoolは必ずshared_ptr管理下で
+    // 生成されている必要がある（ヘッダーのクラスコメント参照）。
+    return PooledTexture(m_textures[index], weak_from_this(), index);
 }
 
 void TexturePool::Release(size_t index) {

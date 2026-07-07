@@ -1,0 +1,19 @@
+# ytdlpSpout - Python dependencies
+#
+# These cover the Python GUI / CLI wrapper layer (gui.py, python/*.py).
+# The C++ native backend (cpp/) is built separately with CMake + vcpkg -
+# see README.md "ビルド" section.
+#
+# Versions below are lower bounds, pinned to what was verified working in
+# the project's .venv (2026-07). Install with:
+#   uv pip install -r requirements.txt
+
+yt-dlp>=2025.12.8
+opencv-python>=4.12.0.88
+customtkinter>=5.2.2
+pillow>=11.3.0
+numpy>=2.2.6
+
+# Windows-only: Spout frame sender bindings (Spout2 Python wrapper).
+# Requires Windows + the Spout2 runtime; not installable on macOS/Linux.
+SpoutGL>=0.1.1

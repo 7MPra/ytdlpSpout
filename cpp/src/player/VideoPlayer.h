@@ -63,7 +63,10 @@ struct PlayerConfig {
     
     // === HTTPヘッダー設定 ===
     std::map<std::string, std::string> httpHeaders;  // HTTPヘッダー（Cookie等）
-    
+
+    // === HLS判定ヒント ===
+    int isHlsHint = -1;  // -1=自動判定、0=非HLS、1=HLS（yt-dlp側の判定結果を伝搬）
+
     /// @brief 入力ソースを取得（source優先、なければfilePath）
     const std::string& GetSource() const {
         return source.empty() ? filePath : source;

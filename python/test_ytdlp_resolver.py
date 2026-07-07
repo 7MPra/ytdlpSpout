@@ -51,16 +51,38 @@ class TestResolvedInfo:
 
 
 class TestYtDlpAsyncResolverUrlDetection:
-    """YtDlpAsyncResolver.is_ytdlp_url() のテスト"""
-    
+    """YtDlpAsyncResolver.is_ytdlp_url() のテスト
+
+    PY-1: allowlist方式を反転し、http(s)のページURL（直接メディア拡張子で
+    終わらないもの）は未知ドメインでもyt-dlp解決を試みるように変更した。
+    """
+
     def test_youtube_url(self):
         """YouTubeのURLを検出"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
-        
+
         assert YtDlpAsyncResolver.is_ytdlp_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ") is True
         assert YtDlpAsyncResolver.is_ytdlp_url("https://youtube.com/watch?v=dQw4w9WgXcQ") is True
         assert YtDlpAsyncResolver.is_ytdlp_url("https://youtu.be/dQw4w9WgXcQ") is True
         assert YtDlpAsyncResolver.is_ytdlp_url("https://www.youtube.com/shorts/abcdefg") is True
+
+    def test_unknown_domain_page_url_is_true(self):
+        """未知ドメインのページURL（拡張子なし）はyt-dlp解決を試みる(True)"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        assert YtDlpAsyncResolver.is_ytdlp_url("https://example-video-site.com/watch/123") is True
+
+    def test_unknown_domain_direct_media_extension_is_false(self):
+        """未知ドメインでも直接メディア拡張子で終わるURLはFalse"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        assert YtDlpAsyncResolver.is_ytdlp_url("https://example-video-site.com/video.mp4") is False
+
+    def test_known_domain_with_direct_extension_is_still_true(self):
+        """既知ドメインは拡張子が直接メディアでもyt-dlp優先(True)"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        assert YtDlpAsyncResolver.is_ytdlp_url("https://www.youtube.com/video.mp4") is True
     
     def test_twitch_url(self):
         """TwitchのURLを検出"""
@@ -69,8 +91,8 @@ class TestYtDlpAsyncResolverUrlDetection:
         assert YtDlpAsyncResolver.is_ytdlp_url("https://www.twitch.tv/username") is True
         assert YtDlpAsyncResolver.is_ytdlp_url("https://twitch.tv/videos/123456789") is True
     
-    def test_niconico_url(self):
-        """ニコニコ動画のURLを検出"""
+    def test_supported_domain_urls(self):
+        """対応ドメインのURLがyt-dlp対象として検出される"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
         
         assert YtDlpAsyncResolver.is_ytdlp_url("https://www.nicovideo.jp/watch/sm12345678") is True
@@ -333,6 +355,147 @@ class TestYtDlpAsyncResolverCookieFile:
         assert opts['cookiefile'] == "test_cookies.txt"
         
         resolver.shutdown()
+
+
+class _MockCookie:
+    """テスト用のcookiejarエントリ模擬クラス"""
+
+    def __init__(self, name: str, value: str, domain: str):
+        self.name = name
+        self.value = value
+        self.domain = domain
+
+
+class TestYtDlpAsyncResolverCookieDomainFilter:
+    """PY-2: Cookieヘッダー構築時のドメインフィルタリングのテスト"""
+
+    def test_other_domain_cookie_not_included(self):
+        """マッチしないドメインのCookieは連結対象に含まれない"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        cookiejar = [
+            _MockCookie("session", "abc123", ".nicovideo.jp"),
+            _MockCookie("unrelated", "xyz789", ".other-site.example"),
+        ]
+
+        header = YtDlpAsyncResolver._build_cookie_header(cookiejar, "delivery.domand.nicovideo.jp")
+
+        assert "session=abc123" in header
+        assert "unrelated=xyz789" not in header
+
+    def test_nicovideo_domain_cookie_matches_domand_host(self):
+        """.nicovideo.jpドメインのcookieがdelivery.domand.nicovideo.jpホストにマッチする"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        cookiejar = [_MockCookie("nicosid", "sid-value", ".nicovideo.jp")]
+
+        header = YtDlpAsyncResolver._build_cookie_header(cookiejar, "delivery.domand.nicovideo.jp")
+
+        assert header == "nicosid=sid-value"
+
+    @patch('yt_dlp.YoutubeDL')
+    def test_existing_cookie_header_not_overwritten(self, mock_ydl_class):
+        """yt-dlpが既に計算したCookieヘッダーは上書きされない"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        mock_ydl = MagicMock()
+        mock_ydl.__enter__ = Mock(return_value=mock_ydl)
+        mock_ydl.__exit__ = Mock(return_value=False)
+        mock_ydl.extract_info.return_value = {
+            'url': 'https://resolved.example.com/video.mp4',
+            'duration': 60.0,
+            'width': 640,
+            'height': 480,
+            'title': 'Cookie Preserve Test',
+            'http_headers': {'Cookie': 'from_ytdlp=already_set'},
+        }
+        mock_ydl.cookiejar = [_MockCookie("other", "value", ".resolved.example.com")]
+        mock_ydl_class.return_value = mock_ydl
+
+        resolver = YtDlpAsyncResolver()
+        result = resolver.resolve_sync("https://www.youtube.com/watch?v=test123")
+
+        assert result is not None
+        assert result.http_headers['Cookie'] == 'from_ytdlp=already_set'
+
+    @patch('yt_dlp.YoutubeDL')
+    def test_cookiejar_not_merged_when_domain_mismatched(self, mock_ydl_class):
+        """resolve_sync全体でも、無関係ドメインのCookieはヘッダーに設定されない"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        mock_ydl = MagicMock()
+        mock_ydl.__enter__ = Mock(return_value=mock_ydl)
+        mock_ydl.__exit__ = Mock(return_value=False)
+        mock_ydl.extract_info.return_value = {
+            'url': 'https://resolved.example.com/video.mp4',
+            'duration': 60.0,
+            'width': 640,
+            'height': 480,
+            'title': 'Cookie Domain Test',
+            'http_headers': {},
+        }
+        mock_ydl.cookiejar = [_MockCookie("secret", "leak", ".unrelated-site.example")]
+        mock_ydl_class.return_value = mock_ydl
+
+        resolver = YtDlpAsyncResolver()
+        result = resolver.resolve_sync("https://www.youtube.com/watch?v=test123")
+
+        assert result is not None
+        assert 'Cookie' not in result.http_headers
+
+
+class TestResolvedInfoProtocolAndIsHls:
+    """PY-3: ResolvedInfoのprotocol/is_liveフィールドとis_hlsプロパティのテスト"""
+
+    def test_is_hls_true_for_m3u8_protocol(self):
+        """protocolに'm3u8'を含む場合はis_hlsがTrue"""
+        from python.ytdlp_resolver import ResolvedInfo
+
+        info = ResolvedInfo(stream_url="https://example.com/playlist.m3u8", protocol="m3u8_native")
+        assert info.is_hls is True
+
+    def test_is_hls_false_for_https_protocol(self):
+        """protocolが'https'などm3u8を含まない場合はis_hlsがFalse"""
+        from python.ytdlp_resolver import ResolvedInfo
+
+        info = ResolvedInfo(stream_url="https://example.com/video.mp4", protocol="https")
+        assert info.is_hls is False
+
+    def test_is_hls_none_when_protocol_unset(self):
+        """protocolが空文字（未設定）の場合はis_hlsがNone"""
+        from python.ytdlp_resolver import ResolvedInfo
+
+        info = ResolvedInfo(stream_url="https://example.com/video.mp4")
+        assert info.protocol == ""
+        assert info.is_live is False
+        assert info.is_hls is None
+
+    @patch('yt_dlp.YoutubeDL')
+    def test_resolve_sync_sets_protocol_and_is_live(self, mock_ydl_class):
+        """resolve_syncがinfoのprotocol/is_liveをResolvedInfoに反映する"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        mock_ydl = MagicMock()
+        mock_ydl.__enter__ = Mock(return_value=mock_ydl)
+        mock_ydl.__exit__ = Mock(return_value=False)
+        mock_ydl.extract_info.return_value = {
+            'url': 'https://dmc.nicovideo.jp/video.m3u8',
+            'duration': 0.0,
+            'width': 1280,
+            'height': 720,
+            'title': 'Live Test',
+            'protocol': 'm3u8_native',
+            'is_live': True,
+        }
+        mock_ydl_class.return_value = mock_ydl
+
+        resolver = YtDlpAsyncResolver()
+        result = resolver.resolve_sync("https://live.nicovideo.jp/watch/lv12345")
+
+        assert result is not None
+        assert result.protocol == 'm3u8_native'
+        assert result.is_live is True
+        assert result.is_hls is True
 
 
 if __name__ == "__main__":

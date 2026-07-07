@@ -85,6 +85,10 @@ void BeatDetector::Reset() {
     energyHistory_.clear();
     beatPositions_.clear();
     totalSamplesProcessed_ = 0.0;
+
+    // MED-7: インクリメンタル処理用状態もリセットする
+    smoothedEnergyHistory_.clear();
+    nextPeakScanIndex_ = 0;
 }
 
 // =============================================================================
@@ -109,59 +113,91 @@ void BeatDetector::DetectPeaks() {
     if (energyHistory_.size() < 3) {
         return;
     }
-    
-    // 平滑化したエネルギーを計算
-    std::vector<double> smoothedEnergy = energyHistory_;
-    ApplyLowPassFilter(smoothedEnergy, kLowPassAlpha);
-    
+
+    // MED-7: energyHistory_ 全体を毎回コピー・平滑化するとO(n^2)になるため、
+    // 平滑化(ローパスフィルタ)は新規追加分のみをインクリメンタルに計算し、
+    // smoothedEnergyHistory_ に永続的に保持・追記する。
+    size_t prevSmoothedSize = smoothedEnergyHistory_.size();
+    if (prevSmoothedSize < energyHistory_.size()) {
+        std::vector<double> segment;
+        segment.reserve(energyHistory_.size() - prevSmoothedSize + 1);
+
+        size_t rawStart;
+        if (prevSmoothedSize == 0) {
+            // 元アルゴリズムに合わせ、先頭要素は非フィルタのまま
+            smoothedEnergyHistory_.push_back(energyHistory_[0]);
+            segment.push_back(energyHistory_[0]);  // フィルタ継続用シード
+            rawStart = 1;
+        } else {
+            segment.push_back(smoothedEnergyHistory_.back());  // シード = 直前の平滑化値
+            rawStart = prevSmoothedSize;
+        }
+
+        for (size_t i = rawStart; i < energyHistory_.size(); ++i) {
+            segment.push_back(energyHistory_[i]);
+        }
+
+        // segmentは [シード, 新規raw値...] なので、既存のApplyLowPassFilterを
+        // そのまま再利用できる（IIRフィルタはt-1の値のみに依存するため、
+        // 全体を毎回再計算するのと数学的に等価）
+        ApplyLowPassFilter(segment, kLowPassAlpha);
+
+        // segment[0] はシードなので除外して追記
+        smoothedEnergyHistory_.insert(smoothedEnergyHistory_.end(), segment.begin() + 1, segment.end());
+    }
+
+    const std::vector<double>& smoothedEnergy = smoothedEnergyHistory_;
+
     // 移動平均を計算（局所的な閾値）
     size_t windowSize = std::min(static_cast<size_t>(20), energyHistory_.size() / 2);
     if (windowSize < 3) {
         windowSize = 3;
     }
-    
-    // 新しいビートのみを検出（最後に検出したビート以降から）
-    size_t startIndex = 0;
-    if (!beatPositions_.empty()) {
-        double lastBeatTime = beatPositions_.back();
-        double frameTime = static_cast<double>(hopSize_) / sampleRate_;
-        startIndex = static_cast<size_t>(lastBeatTime / frameTime) + 1;
-    }
-    
-    if (startIndex >= smoothedEnergy.size()) {
+
+    // MED-7: 「最後に検出したビート以降」ではなく「まだ検査していないインデックス以降」
+    // から再開する。ビートが見つからない区間が続いても同じ範囲を毎回再走査しない
+    // ようにすることで、全体としてO(n)に抑える。
+    size_t startIndex = std::max(nextPeakScanIndex_, windowSize);
+
+    if (smoothedEnergy.size() < 2 || startIndex >= smoothedEnergy.size() - 1) {
         return;
     }
-    
-    for (size_t i = std::max(startIndex, windowSize); i < smoothedEnergy.size() - 1; ++i) {
+
+    size_t endIndex = smoothedEnergy.size() - 1;  // i+1 を参照するため最後の1つ手前まで
+
+    for (size_t i = startIndex; i < endIndex; ++i) {
         // 局所平均を計算
         double localSum = 0.0;
         for (size_t j = i - windowSize; j < i; ++j) {
             localSum += smoothedEnergy[j];
         }
         double localMean = localSum / windowSize;
-        
+
         // ピーク検出条件
         // 1. 現在値が局所平均より十分大きい
         // 2. 現在値が前後より大きい（局所最大）
         double threshold = localMean * kPeakThresholdMultiplier;
-        
+
         if (smoothedEnergy[i] > threshold &&
             smoothedEnergy[i] > smoothedEnergy[i - 1] &&
             smoothedEnergy[i] > smoothedEnergy[i + 1]) {
-            
+
             // フレームインデックスを秒に変換
             double beatTime = static_cast<double>(i * hopSize_) / sampleRate_;
-            
+
             // 既に近くにビートがない場合のみ追加
             // （BPM 200 で 0.3秒ごと = 最小間隔）
             double minInterval = 60.0 / kMaxBPM;
-            
-            if (beatPositions_.empty() || 
+
+            if (beatPositions_.empty() ||
                 (beatTime - beatPositions_.back()) >= minInterval) {
                 beatPositions_.push_back(beatTime);
             }
         }
     }
+
+    // 走査済み範囲を記録し、次回はここから再開する
+    nextPeakScanIndex_ = endIndex;
 }
 
 float BeatDetector::EstimateBPMFromIntervals() const {

@@ -26,7 +26,7 @@ namespace io {
 /// @brief HTTPレスポンス情報
 struct HttpResponse {
     int statusCode = 0;                            // HTTPステータスコード
-    std::map<std::string, std::string> headers;    // レスポンスヘッダー
+    std::map<std::string, std::string> headers;    // レスポンスヘッダー（キーは小文字に正規化される）
     std::vector<uint8_t> data;                     // レスポンスボディ
     std::string errorMessage;                      // エラーメッセージ
     bool success = false;                          // 成功フラグ
@@ -56,6 +56,44 @@ using ProgressCallback = std::function<bool(int64_t downloaded, int64_t total)>;
 /// @param data 受信データ
 /// @param size データサイズ
 using DataCallback = std::function<void(const uint8_t* data, size_t size)>;
+
+/// @brief 内部実装用の純粋関数群（ユニットテストのために公開）
+namespace detail {
+
+/// @brief リクエストをリトライすべきかどうかを判定する
+/// @param curlCode curl_easy_performの戻り値（CURLcodeを int にキャストしたもの）
+/// @param httpStatus HTTPステータスコード（curlCode成功時のみ意味を持つ）
+/// @return リトライすべき場合true
+/// @details リトライ対象: curl_easy_perform失敗（CURLE_ABORTED_BY_CALLBACKによる
+///          ユーザーキャンセルを除く）、およびHTTPステータス429/5xx。
+///          403/404等その他の4xxはリトライしない。
+bool ShouldRetryRequest(int curlCode, int httpStatus);
+
+/// @brief Rangeリクエストのレスポンスとして妥当かどうかを判定する
+/// @param statusCode HTTPステータスコード
+/// @param startByte リクエストした開始バイト位置
+/// @param dataSize 実際に受信したデータサイズ
+/// @param requestedLen リクエストした範囲の長さ（endByte - startByte + 1）
+/// @return 妥当な場合true
+/// @details statusCode==200かつstartByte>0の場合、サーバーがRangeを無視して
+///          全ボディを返したとみなしfalseを返す。statusCode==200かつ
+///          startByte==0の場合でも、受信サイズが要求範囲長を超える場合は
+///          安全側としてfalseを返す。
+bool IsValidRangeResponse(int statusCode, int64_t startByte, int64_t dataSize, int64_t requestedLen);
+
+/// @brief HTTPステータス行（"HTTP/1.1 200 OK"等）かどうかを判定する
+/// @param line ヘッダー1行（前後の改行有無は問わない）
+/// @return ステータス行の場合true
+bool IsHttpStatusLine(const std::string& line);
+
+/// @brief ヘッダー1行を "Key: Value" としてパースする
+/// @param rawLine 生のヘッダー行（末尾に\r\nが付いていてもよい）
+/// @param outKey パース結果のキー（小文字に正規化される）
+/// @param outValue パース結果の値（前後の空白は除去される）
+/// @return パースできた場合true（コロンを含まない行はfalse）
+bool ParseHeaderLine(const std::string& rawLine, std::string& outKey, std::string& outValue);
+
+} // namespace detail
 
 /// @brief HTTPクライアントクラス
 class HttpClient {

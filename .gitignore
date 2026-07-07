@@ -163,8 +163,20 @@ dist_package/
 *.zip
 *.exe
 
+# C++ native backend build output / DLLs (rebuild via cpp/build - see README)
+# python/ytdlpspout.dll and its runtime dependencies (ffmpeg, Spout, etc.) are
+# build artifacts, not source - do not commit them. Working-tree copies stay
+# for local runs; regenerate with `cmake --build cpp/build --config Release`.
+python/*.dll
+
+# Runtime debug log written by the C++ DLL on each run (see c_api.cpp)
+dll_debug.txt
+
 # User data (cookies, etc.)
 /data/
+
+# SpecStory AI pair-programming session logs (local dev history, not release content)
+.specstory/
 
 # OS generated files
 .DS_Store
@@ -184,3 +196,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Stray build artifacts occasionally left at repo root by local C++ test runs
+*.obj

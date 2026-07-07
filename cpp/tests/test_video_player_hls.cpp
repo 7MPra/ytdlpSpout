@@ -123,6 +123,60 @@ TEST_F(VideoPlayerHlsTest, DownloadProgressBeforeStart) {
 }
 
 // =============================================================================
+// PLY-1: 統計getterとStop()の並行アクセス（use-after-free回帰テスト）
+// =============================================================================
+// GUI側の統計ポーリングスレッド（GetDownloadProgress/IsFullyCached/IsHlsMode/
+// GetHlsCacheStats）とStop()（sliceManager/hlsManagerのreset()を行う）が同一の
+// mutexで保護されていることを確認する。修正前はgetter側がロックを取らずに
+// hlsManager/sliceManagerを参照していたため、Stop()と競合するとreset()直後の
+// 破棄済みポインタを参照しクラッシュ（UAF）する可能性があった。
+// ここではThreadSanitizer等が無い環境でも「デッドロックしない」「クラッシュしない」
+// ことを確認するスモークテストとして、統計取得スレッドとStop()スレッドを
+// 短時間並行実行する。
+TEST_F(VideoPlayerHlsTest, ConcurrentStatsPollingDuringStop_NoCrashOrDeadlock) {
+    std::atomic<bool> stopPolling{ false };
+
+    std::thread poller([&]() {
+        while (!stopPolling.load(std::memory_order_relaxed)) {
+            // Stop()と同一mutexで保護されているため、reset()途中/直後の
+            // ポインタを安全に読める（例外・クラッシュなしで既定値を返す）はず。
+            volatile double progress = player_.GetDownloadProgress();
+            volatile bool fullyCached = player_.IsFullyCached();
+            volatile bool hlsMode = player_.IsHlsMode();
+            VideoPlayer::HlsCacheStats stats = player_.GetHlsCacheStats();
+            (void)progress;
+            (void)fullyCached;
+            (void)hlsMode;
+            (void)stats;
+        }
+    });
+
+    // Stop()を短時間繰り返し呼び出し、pollerスレッドと競合させる
+    for (int i = 0; i < 200; ++i) {
+        player_.Stop();
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    stopPolling.store(true, std::memory_order_relaxed);
+    poller.join();
+
+    // クラッシュ・デッドロックせずここに到達すれば成功
+    EXPECT_EQ(PlayerState::Stopped, player_.GetState());
+}
+
+// =============================================================================
+// P-7: HLSプレイリスト総時間のVideoInfo反映（回帰テスト）
+// =============================================================================
+// 注: decoder側でduration/totalFramesが取得できない場合にHLSプレイリストの
+// 総時間で補完するロジック自体は、実際のHLSセグメント配信サーバーが必要なため
+// 統合テストで検証する。ここではStart前のデフォルト値（0）が期待どおりである
+// ことのみを回帰テストとして確認する。
+TEST_F(VideoPlayerHlsTest, DurationAndTotalFramesAreZeroBeforeStart) {
+    EXPECT_DOUBLE_EQ(0.0, player_.GetDuration());
+    EXPECT_EQ(0, player_.GetTotalFrames());
+}
+
+// =============================================================================
 // HLSモードフラグテスト
 // =============================================================================
 

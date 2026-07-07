@@ -168,42 +168,51 @@ bool SpoutSender::SendTexture(ID3D11Texture2D* texture, unsigned int width, unsi
     }
 
     // サイズ変更をチェック - 再作成が必要
+    // 注意(MED-1): m_impl->width/height は作成が成功した場合にのみ更新する。
+    // 失敗した場合はここで更新しないことで、次フレームで同じ解像度が来ても
+    // needsRecreate が再度 true になり、再作成が試行される（永久スキップを防ぐ）。
     bool needsRecreate = (width != m_impl->width || height != m_impl->height);
-    
+
     if (needsRecreate) {
-        LOG_INFO("Sender size changed: {}x{} -> {}x{}", 
+        LOG_INFO("Sender size changed: {}x{} -> {}x{}",
                  m_impl->width, m_impl->height, width, height);
-        
+
         // 既存のリソースを解放
         m_impl->ReleaseSender();
-        
-        m_impl->width = width;
-        m_impl->height = height;
-        
-        // 共有テクスチャを作成
+
+        // 共有テクスチャを作成（ローカル変数に受け取り、成功時のみコミットする）
         DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        ID3D11Texture2D* newSharedTexture = nullptr;
+        HANDLE newShareHandle = nullptr;
         if (!m_impl->spoutDX.CreateSharedDX11Texture(
                 m_impl->device,
                 width, height,
                 format,
-                &m_impl->sharedTexture,
-                m_impl->shareHandle)) {
-            LOG_ERROR("Failed to create shared texture");
+                &newSharedTexture,
+                newShareHandle)) {
+            LOG_ERROR("Failed to create shared texture ({}x{}); will retry next frame", width, height);
+            // m_impl->width/height はロールバックしない（未コミットのまま）ので
+            // 次フレームで同じ解像度でも再作成が試行される。
             return false;
         }
-        
+
         // Senderを登録
         if (!m_impl->senderNames.CreateSender(
                 m_impl->senderName.c_str(),
                 width, height,
-                m_impl->shareHandle,
+                newShareHandle,
                 static_cast<DWORD>(format))) {
-            LOG_ERROR("Failed to create sender");
-            m_impl->sharedTexture->Release();
-            m_impl->sharedTexture = nullptr;
+            LOG_ERROR("Failed to create sender ({}x{}); will retry next frame", width, height);
+            newSharedTexture->Release();
+            newSharedTexture = nullptr;
             return false;
         }
-        
+
+        // ここまで到達したら成功 - 状態をコミット
+        m_impl->sharedTexture = newSharedTexture;
+        m_impl->shareHandle = newShareHandle;
+        m_impl->width = width;
+        m_impl->height = height;
         m_impl->senderCreated = true;
         LOG_INFO("Spout sender created: {}x{}", width, height);
     }
@@ -267,6 +276,13 @@ bool SpoutSender::SetSenderName(const std::string& name) {
 }
 
 bool SpoutSender::SetSize(unsigned int width, unsigned int height) {
+    // 注意(MED-6): このAPIは「次回のSendTexture呼び出しでSender/共有テクスチャの
+    // 再作成を強制する」ためのキャッシュ無効化専用メソッドである。
+    // width/height の値そのものは保存されず、実際に送信されるサイズは
+    // 次回 SendTexture() 呼び出し時に渡されたテクスチャ（またはその引数）の
+    // 実サイズから決定される。呼び出し側はこの引数を「次に送信されるサイズの予約」
+    // と解釈してはならない。渡された値が現在のサイズと異なる場合にのみ
+    // 再作成をトリガーするための比較用途にのみ使われる。
     std::lock_guard<std::mutex> lock(m_impl->mutex);
 
     if (width == 0 || height == 0) {
@@ -278,8 +294,11 @@ bool SpoutSender::SetSize(unsigned int width, unsigned int height) {
         return true;  // 変更なし
     }
 
-    LOG_DEBUG("Setting sender size: {}x{}", width, height);
-    // 次回送信時にサイズ変更を検出して再作成
+    LOG_DEBUG("Invalidating sender cache due to size request {}x{} (actual size at next "
+              "SendTexture() call determines the real recreated size)", width, height);
+    // 次回送信時にサイズ変更を検出して再作成（MED-1の失敗時ロールバック仕様と整合:
+    // ここで 0 にリセットしても、次回 SendTexture が失敗すれば再度 0 のままとなり、
+    // その次のフレームでも再作成が試行され続ける）
     m_impl->width = 0;
     m_impl->height = 0;
 

@@ -208,6 +208,7 @@ target_include_directories(test_chunk_downloader PRIVATE
 target_link_libraries(test_chunk_downloader PRIVATE
     spdlog::spdlog
     CURL::libcurl
+    ws2_32
 )
 
 # テスト登録
@@ -269,6 +270,11 @@ add_executable(test_decoder_custom_io
     ${CMAKE_SOURCE_DIR}/src/io/HttpClient.cpp
     ${CMAKE_SOURCE_DIR}/src/io/PrefetchScheduler.cpp
     ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSliceLoadingManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsCustomAVIOContext.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/HlsSegmentCache.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/AesCbcDecryptor.cpp
+    ${CMAKE_SOURCE_DIR}/src/hls/M3U8Parser.cpp
 )
 
 target_include_directories(test_decoder_custom_io PRIVATE
@@ -279,6 +285,7 @@ target_include_directories(test_decoder_custom_io PRIVATE
 target_link_libraries(test_decoder_custom_io PRIVATE
     spdlog::spdlog
     CURL::libcurl
+    bcrypt
 )
 
 # FFmpegリンク

@@ -113,6 +113,7 @@ class YtdlpSpoutConfigEx(Structure):
         ("ytdlp", YtdlpSpoutYtDlpConfig),
         ("httpHeaders", POINTER(YtdlpSpoutHttpHeader)),
         ("httpHeadersCount", c_int),
+        ("isHlsHint", c_int),
     ]
 
 
@@ -223,6 +224,10 @@ class YtdlpSpoutNative:
         self._on_progress: Optional[Callable[[float, float], None]] = None
         self._on_error: Optional[Callable[[str], None]] = None
         self._on_completion: Optional[Callable[[], None]] = None
+
+        # get_current_frame()用の使い回しバッファ（サイズ変化時のみ再確保）
+        self._frame_buffer = None
+        self._frame_buffer_size = 0
     
     def __del__(self):
         """デストラクタ: プレイヤーを破棄"""
@@ -550,18 +555,19 @@ class YtdlpSpoutNative:
         use_hardware_accel: bool = True,
         verbose: bool = False,
         slice_enabled: bool = True,
-        chunk_size: int = 1024 * 1024,
-        max_cache_memory: int = 128 * 1024 * 1024,
-        max_concurrent_downloads: int = 4,
-        prefetch_chunks_ahead: int = 8,
+        chunk_size: Optional[int] = None,
+        max_cache_memory: Optional[int] = None,
+        max_concurrent_downloads: Optional[int] = None,
+        prefetch_chunks_ahead: Optional[int] = None,
         cache_path: Optional[str] = None,
         ytdlp_path: Optional[str] = None,
         preferred_height: int = 1080,
-        http_headers: Optional[dict] = None
+        http_headers: Optional[dict] = None,
+        is_hls: Optional[bool] = None
     ) -> bool:
         """
         拡張設定で再生開始（スライス読み込み対応）
-        
+
         Args:
             source: ファイルパスまたはURL
             sender_name: Spout Sender名
@@ -571,15 +577,21 @@ class YtdlpSpoutNative:
             use_hardware_accel: ハードウェアアクセラレーションを使用するか
             verbose: 詳細ログを出力するか
             slice_enabled: スライス読み込みを有効にするか
-            chunk_size: チャンクサイズ（バイト）
-            max_cache_memory: 最大キャッシュメモリ（バイト）
-            max_concurrent_downloads: 最大並列ダウンロード数
-            prefetch_chunks_ahead: 先読みチャンク数
+            chunk_size: チャンクサイズ（バイト）。None（デフォルト）の場合、
+                ytdlpspout_config_ex_init()が設定するC++側のチューニング済み既定値
+                （2MB、高解像度向け）を維持する。明示的に指定した場合のみ上書きする。
+            max_cache_memory: 最大キャッシュメモリ（バイト）。Noneの場合はC++側の
+                既定値（256MB）を維持する。
+            max_concurrent_downloads: 最大並列ダウンロード数。Noneの場合はC++側の
+                既定値（6）を維持する。
+            prefetch_chunks_ahead: 先読みチャンク数。Noneの場合はC++側の既定値
+                （24）を維持する。
             cache_path: ファイルキャッシュパス（Noneでメモリのみ）
             ytdlp_path: yt-dlpパス（Noneで自動検出）
             preferred_height: 希望解像度
             http_headers: HTTPヘッダー辞書（Cookieなど）
-        
+            is_hls: HLS判定ヒント（None=C++側で自動判定、True/False=呼び出し側の判定結果を強制）
+
         Returns:
             成功した場合True
         """
@@ -604,10 +616,17 @@ class YtdlpSpoutNative:
         config.verbose = 1 if verbose else 0
         
         config.slice.enabled = 1 if slice_enabled else 0
-        config.slice.chunkSize = chunk_size
-        config.slice.maxCacheMemory = max_cache_memory
-        config.slice.maxConcurrentDownloads = max_concurrent_downloads
-        config.slice.prefetchChunksAhead = prefetch_chunks_ahead
+        # PLY-2: Noneの場合はytdlpspout_config_ex_init()が設定したC++側の
+        # チューニング済み既定値（chunkSize=2MB等）を保持する。呼び出し側が
+        # 明示的に値を渡した場合のみ、その値でconfigを上書きする。
+        if chunk_size is not None:
+            config.slice.chunkSize = chunk_size
+        if max_cache_memory is not None:
+            config.slice.maxCacheMemory = max_cache_memory
+        if max_concurrent_downloads is not None:
+            config.slice.maxConcurrentDownloads = max_concurrent_downloads
+        if prefetch_chunks_ahead is not None:
+            config.slice.prefetchChunksAhead = prefetch_chunks_ahead
         if cache_path:
             cache_path_bytes = cache_path.encode('utf-8')
             self._config_ex_refs.append(cache_path_bytes)
@@ -651,7 +670,13 @@ class YtdlpSpoutNative:
         else:
             config.httpHeaders = None
             config.httpHeadersCount = 0
-        
+
+        # HLS判定ヒント: None=自動判定(-1)、True/False=呼び出し側の判定結果を強制
+        if is_hls is None:
+            config.isHlsHint = -1
+        else:
+            config.isHlsHint = 1 if is_hls else 0
+
         result = self._lib.ytdlpspout_start_ex(self._handle, byref(config))
         if result != 0:
             error = self.get_last_error()
@@ -844,18 +869,22 @@ class YtdlpSpoutNative:
     def get_current_frame(self):
         """
         現在のフレームをBGRA numpy配列として取得
-        
+
         Returns:
             numpy.ndarray (height, width, 4) BGRA形式、失敗時はNone
         """
         buffer_size = self.get_frame_buffer_size()
         if buffer_size <= 0:
             return None
-        
-        buffer = (ctypes.c_uint8 * buffer_size)()
+
+        # バッファはインスタンスで使い回し、サイズが変化した場合のみ再確保する
+        if self._frame_buffer is None or self._frame_buffer_size != buffer_size:
+            self._frame_buffer = (ctypes.c_uint8 * buffer_size)()
+            self._frame_buffer_size = buffer_size
+        buffer = self._frame_buffer
         width = ctypes.c_int()
         height = ctypes.c_int()
-        
+
         result = self._lib.ytdlpspout_get_current_frame(
             self._handle,
             buffer,
@@ -863,13 +892,15 @@ class YtdlpSpoutNative:
             ctypes.byref(width),
             ctypes.byref(height)
         )
-        
+
         if result != 0:
             return None
-        
+
         import numpy as np
+        # バッファは次回呼び出しで上書きされるため、返却前にコピーして
+        # 呼び出し側が保持する参照の独立性（従来の意味論）を維持する
         frame = np.frombuffer(buffer, dtype=np.uint8)
-        frame = frame.reshape((height.value, width.value, 4))
+        frame = frame.reshape((height.value, width.value, 4)).copy()
         return frame
 
 

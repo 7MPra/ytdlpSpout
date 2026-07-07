@@ -66,6 +66,7 @@ struct M3U8Playlist {
     std::optional<HlsEncryptionKey> encryptionKey;  ///< 暗号化キー情報
     std::optional<HlsMap> map;            ///< 初期化セグメント情報 (#EXT-X-MAP)
     double totalDuration = 0.0;           ///< 全セグメントの合計時間
+    bool hasKeyRotation = false;           ///< プレイリスト内で#EXT-X-KEYが途中で変化した（鍵ローテーション）か
 };
 
 /// @brief HLS品質バリアント情報（マスタープレイリスト用）
@@ -112,6 +113,11 @@ public:
         const std::string& baseUrl,
         const std::string& relativeUrl
     );
+
+    /// @brief URLからベースパスを取得（末尾のファイル名を除いた部分。クエリ/フラグメントは除去済み）
+    /// @param url 対象URL
+    /// @return ベースパス（末尾に'/'を含む）
+    static std::string GetBasePath(const std::string& url);
 
     // =========================================================================
     // マスタープレイリスト対応
@@ -173,11 +179,11 @@ private:
     /// @brief 16進数文字列（0x...）をバイト配列に変換
     static std::vector<uint8_t> ParseHexString(const std::string& hexStr);
 
-    /// @brief URLからベースパスを取得
-    static std::string GetBasePath(const std::string& url);
-
     /// @brief URLのホスト部分を取得
     static std::string GetUrlOrigin(const std::string& url);
+
+    /// @brief URLのスキーム部分を取得（例: "https:"）。スキーム相対URL（//host/path）の解決に使用
+    static std::string GetUrlScheme(const std::string& url);
 };
 
 }  // namespace hls

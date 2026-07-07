@@ -97,17 +97,66 @@ bool TestIsSupportedUrl_NicoNico() {
 
 bool TestIsSupportedUrl_NotSupported() {
     // Not supported URLs (direct file URLs, local paths)
-    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("C:\\Videos\\test.mp4"), 
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("C:\\Videos\\test.mp4"),
                 "Local path should NOT be supported");
-    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("/home/user/video.mp4"), 
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("/home/user/video.mp4"),
                 "Unix local path should NOT be supported");
-    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("https://example.com/video.mp4"), 
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("https://example.com/video.mp4"),
                 "Direct video URL should NOT be supported");
-    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("http://192.168.1.1/stream.m3u8"), 
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("http://192.168.1.1/stream.m3u8"),
                 "Direct stream URL should NOT be supported");
-    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl(""), 
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl(""),
                 "Empty string should NOT be supported");
-    
+
+    return true;
+}
+
+bool TestIsSupportedUrl_ExpandedDomains() {
+    // RES-8: C++側の既知ドメインリストをpython/ytdlp_resolver.pyのYTDLP_DOMAINSに揃えた
+    // ことの確認（従来欠落していたドメインを含む）
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://www.instagram.com/p/abc123/"),
+                "Instagram URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://www.tiktok.com/@user/video/123"),
+                "TikTok URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://www.facebook.com/watch/?v=123"),
+                "Facebook URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://fb.watch/abc123/"),
+                "fb.watch URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://soundcloud.com/artist/track"),
+                "SoundCloud URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://artist.bandcamp.com/track/song"),
+                "Bandcamp URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://www.reddit.com/r/videos/comments/abc"),
+                "Reddit URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://www.youtube-nocookie.com/embed/abc"),
+                "youtube-nocookie.com URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://live.nicovideo.jp/watch/lv12345"),
+                "live.nicovideo.jp URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://www.bilibili.tv/en/video/123"),
+                "bilibili.tv URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://x.com/user/status/123"),
+                "x.com URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://music.youtube.com/watch?v=abc"),
+                "music.youtube.com (subdomain) URL should be supported");
+
+    return true;
+}
+
+bool TestIsSupportedUrl_UnknownDomain() {
+    // 未知ドメインでも、直接メディア拡張子でなければyt-dlp解決対象（ページURL想定）
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://example.com/watch/12345"),
+                "Unknown domain page URL should be supported (yt-dlp fallback)");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://some-video-site.example/videos/abc"),
+                "Unknown video site page URL should be supported");
+    TEST_ASSERT(YtDlpResolver::IsSupportedUrl("https://example.com/watch?v=abc&list=xyz"),
+                "Unknown domain URL with query string but no media extension should be supported");
+
+    // 未知ドメインでも直接メディア拡張子なら直リンクとして扱う（yt-dlp対象外）
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("https://cdn.example.com/media/clip.webm"),
+                "Unknown domain .webm direct link should NOT be supported");
+    TEST_ASSERT(!YtDlpResolver::IsSupportedUrl("https://cdn.example.com/media/clip.mp4?token=abc"),
+                "Unknown domain .mp4 direct link with query string should NOT be supported");
+
     return true;
 }
 
@@ -137,6 +186,70 @@ bool TestYtDlpResolver_SetPath() {
     TEST_ASSERT(resolver.GetYtDlpPath() == "yt-dlp", 
                 "Empty path should reset to default");
     
+    return true;
+}
+
+// =============================================================================
+// テストケース: QuoteWinArg（RES-1: コマンド/引数インジェクション対策）
+// =============================================================================
+
+bool TestQuoteWinArg_Simple() {
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("simple") == "\"simple\"",
+                "Simple argument should be wrapped in quotes");
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("") == "\"\"",
+                "Empty argument should become an empty quoted string");
+
+    return true;
+}
+
+bool TestQuoteWinArg_Spaces() {
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("hello world") == "\"hello world\"",
+                "Spaces should be preserved inside quotes");
+
+    return true;
+}
+
+bool TestQuoteWinArg_Ampersand() {
+    // '&' はクオート内では特別な意味を持たず、そのまま渡る
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("a&b") == "\"a&b\"",
+                "Ampersand should be inert inside quotes");
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("https://example.com/watch?v=abc&list=xyz") ==
+                "\"https://example.com/watch?v=abc&list=xyz\"",
+                "URL with ampersand should be safely quoted as a single argument");
+
+    return true;
+}
+
+bool TestQuoteWinArg_DoubleQuote() {
+    // 内部の " は \" にエスケープされる
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("say \"hi\"") == "\"say \\\"hi\\\"\"",
+                "Embedded double quotes should be escaped as \\\"");
+
+    return true;
+}
+
+bool TestQuoteWinArg_Backslashes() {
+    // 通常のパス中のバックスラッシュは、"の直前や末尾でなければそのまま
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("C:\\Tools\\yt-dlp.exe") ==
+                "\"C:\\Tools\\yt-dlp.exe\"",
+                "Backslashes not adjacent to a quote should be unchanged");
+
+    // 末尾のバックスラッシュは閉じる"の直前で2倍化される
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("C:\\path\\") == "\"C:\\path\\\\\"",
+                "Trailing backslash before closing quote should be doubled");
+
+    // バックスラッシュの直後に"が続く場合、2n+1本の\+エスケープされた"になる
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("a\\\"b") == "\"a\\\\\\\"b\"",
+                "Backslash immediately preceding an embedded quote should be doubled plus one escape");
+
+    return true;
+}
+
+bool TestQuoteWinArg_CaretPercent() {
+    // ^ と % はダブルクオート内では特殊文字ではなく、そのまま渡る
+    TEST_ASSERT(YtDlpResolver::QuoteWinArg("100%^done") == "\"100%^done\"",
+                "Caret and percent should pass through unchanged inside quotes");
+
     return true;
 }
 
@@ -241,7 +354,47 @@ bool TestParseMetadataJson_Invalid() {
     // 空文字列
     auto result3 = resolver.ParseMetadataJson("");
     TEST_ASSERT(!result3.has_value(), "Should fail for empty string");
-    
+
+    return true;
+}
+
+bool TestParseMetadataJson_NullFields() {
+    YtDlpResolver resolver;
+
+    // RES-3: title/uploader/is_live/thumbnailがnullでも解析全体が失敗しないこと
+    // （nlohmann::json の j.value(key, default) はキーが存在しても値がnullの場合に
+    //   type_error(302)を送出するため、null安全なヘルパーで既定値にフォールバックする）
+    std::string json = R"({
+        "id": "abc123",
+        "title": null,
+        "uploader": null,
+        "duration": null,
+        "is_live": null,
+        "thumbnail": null,
+        "formats": [
+            {
+                "format_id": "137",
+                "url": "https://example.com/video.mp4",
+                "width": 1920,
+                "height": 1080,
+                "vcodec": null,
+                "acodec": null
+            }
+        ]
+    })";
+
+    auto metadata = resolver.ParseMetadataJson(json);
+    TEST_ASSERT(metadata.has_value(), "Should parse successfully even with null fields");
+    TEST_ASSERT(metadata->id == "abc123", "ID should still be parsed correctly");
+    TEST_ASSERT(metadata->title.empty(), "Null title should fall back to default (empty string)");
+    TEST_ASSERT(metadata->uploader.empty(), "Null uploader should fall back to default (empty string)");
+    TEST_ASSERT(metadata->duration == 0.0, "Null duration should fall back to default (0.0)");
+    TEST_ASSERT(!metadata->isLive, "Null is_live should fall back to default (false)");
+    TEST_ASSERT(metadata->thumbnailUrl.empty(), "Null thumbnail should fall back to default (empty string)");
+    TEST_ASSERT(metadata->formats.size() == 1, "Should still parse the single format entry");
+    TEST_ASSERT(metadata->formats[0].vcodec == "none", "Null vcodec should fall back to default \"none\"");
+    TEST_ASSERT(metadata->formats[0].acodec == "none", "Null acodec should fall back to default \"none\"");
+
     return true;
 }
 
@@ -337,7 +490,11 @@ bool TestGetSourceType() {
                 "YouTube short URL should be YtDlpUrl");
     TEST_ASSERT(YtDlpResolver::GetSourceType("https://vimeo.com/123") == SourceType::YtDlpUrl,
                 "Vimeo URL should be YtDlpUrl");
-    
+    TEST_ASSERT(YtDlpResolver::GetSourceType("https://example.com/watch/12345") == SourceType::YtDlpUrl,
+                "Unknown domain page URL (no media extension) should be YtDlpUrl");
+    TEST_ASSERT(YtDlpResolver::GetSourceType("https://cdn.example.com/media/clip.mp4") == SourceType::HttpUrl,
+                "Unknown domain .mp4 direct link should be HttpUrl");
+
     return true;
 }
 
@@ -361,16 +518,27 @@ int main() {
     RUN_TEST(TestIsSupportedUrl_Vimeo);
     RUN_TEST(TestIsSupportedUrl_NicoNico);
     RUN_TEST(TestIsSupportedUrl_NotSupported);
-    
+    RUN_TEST(TestIsSupportedUrl_UnknownDomain);
+    RUN_TEST(TestIsSupportedUrl_ExpandedDomains);
+
     // コンストラクタ・パステスト
     RUN_TEST(TestYtDlpResolver_Constructor);
     RUN_TEST(TestYtDlpResolver_SetPath);
-    
+
+    // QuoteWinArgテスト（コマンド/引数インジェクション対策）
+    RUN_TEST(TestQuoteWinArg_Simple);
+    RUN_TEST(TestQuoteWinArg_Spaces);
+    RUN_TEST(TestQuoteWinArg_Ampersand);
+    RUN_TEST(TestQuoteWinArg_DoubleQuote);
+    RUN_TEST(TestQuoteWinArg_Backslashes);
+    RUN_TEST(TestQuoteWinArg_CaretPercent);
+
     // JSON解析テスト
     RUN_TEST(TestParseMetadataJson_ValidYouTube);
     RUN_TEST(TestParseMetadataJson_LiveStream);
     RUN_TEST(TestParseMetadataJson_Invalid);
-    
+    RUN_TEST(TestParseMetadataJson_NullFields);
+
     // フォーマット選択テスト
     RUN_TEST(TestSelectBestFormat_PreferHeight);
     RUN_TEST(TestSelectBestFormat_PreferCodec);

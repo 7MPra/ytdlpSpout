@@ -2,6 +2,13 @@
 // test_chunk_downloader.cpp - ChunkDownloaderのユニットテスト
 // =============================================================================
 
+#ifdef _WIN32
+// winsock2.hはwindows.hより先にincludeする必要があるため最上部に置く
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
 #include <iostream>
 #include <cassert>
 #include <thread>
@@ -58,6 +65,85 @@ static int s_testsFailed = 0;
 
 #define ASSERT_LE(a, b) \
     if (!((a) <= (b))) throw std::runtime_error("Assertion failed: " #a " <= " #b)
+
+// =============================================================================
+// テスト用モックサーバー（恒久的失敗シナリオ用）
+// =============================================================================
+//
+// "http://localhost:1/..." のような接続不能ポートへのリクエストは、
+// 環境によってはOS/仮想化レイヤーのTCP接続拒否(RST)の返却に数秒かかる場合があり
+// （実測: このテスト実行環境では127.0.0.1への拒否接続1回あたり約2秒）、
+// HttpClient内部リトライ(H-1)とChunkDownloader内部リトライ(C-1)が二重にネストすると
+// 恒久的失敗に到達するまでの時間が数十秒に膨れ上がり、テストのデッドラインや
+// ctestの実行時間制限を超えてしまう。
+//
+// このMockFailingServerは実際にListen/Acceptしたうえで即座に接続を切断するため、
+// TCP接続自体は即時に確立され（OS依存の拒否タイムアウトが発生しない）、
+// リトライにかかる時間はH-1/C-1が意図したバックオフ待機時間のみに支配される
+// ようになり、環境非依存で高速かつ決定的にテストできる。
+#ifdef _WIN32
+class MockFailingServer {
+public:
+    MockFailingServer() {
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+        listenSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;  // OSに空きポートを選ばせる
+
+        bind(listenSocket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        listen(listenSocket_, SOMAXCONN);
+
+        int addrLen = sizeof(addr);
+        getsockname(listenSocket_, reinterpret_cast<sockaddr*>(&addr), &addrLen);
+        port_ = ntohs(addr.sin_port);
+
+        running_ = true;
+        thread_ = std::thread([this] { Run(); });
+    }
+
+    ~MockFailingServer() {
+        running_ = false;
+        if (listenSocket_ != INVALID_SOCKET) {
+            closesocket(listenSocket_);
+            listenSocket_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        WSACleanup();
+    }
+
+    MockFailingServer(const MockFailingServer&) = delete;
+    MockFailingServer& operator=(const MockFailingServer&) = delete;
+
+    /// @brief このモックサーバーを指す完全URLを返す
+    std::string Url(const std::string& path) const {
+        return "http://127.0.0.1:" + std::to_string(port_) + path;
+    }
+
+private:
+    void Run() {
+        while (running_) {
+            SOCKET client = accept(listenSocket_, nullptr, nullptr);
+            if (client == INVALID_SOCKET) {
+                break;  // listenSocketがcloseされた（デストラクタから）
+            }
+            // リクエストを読まずに即座に切断し、サーバーダウンを模擬する
+            closesocket(client);
+        }
+    }
+
+    SOCKET listenSocket_ = INVALID_SOCKET;
+    std::thread thread_;
+    std::atomic<bool> running_{false};
+    unsigned short port_ = 0;
+};
+#endif  // _WIN32
 
 // =============================================================================
 // ChunkDownloader基本テスト
@@ -449,10 +535,11 @@ void TestSetHttpHeadersAfterStart() {
         
         // 開始後のヘッダー設定が例外を投げないことを確認
         downloader.SetHttpHeaders(headers);
-        
+
         // セグメントリクエスト（ヘッダーが適用されることを確認）
         // 実際のネットワークリクエストはしないが、設定が適用されることを確認
-        downloader.RequestSegment("http://localhost:1/segment0.ts", 0, ChunkPriority::Critical);
+        MockFailingServer mockServer;
+        downloader.RequestSegment(mockServer.Url("/segment0.ts"), 0, ChunkPriority::Critical);
         
         // 少し待機
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -492,7 +579,8 @@ void TestSegmentDownloadWithCallback() {
         downloader.Start();
         
         // 架空のURLでリクエスト（実際のダウンロードは失敗するが、コールバックは呼ばれる）
-        downloader.RequestSegment("http://localhost:1/test.ts", 0, ChunkPriority::High);
+        MockFailingServer mockServer;
+        downloader.RequestSegment(mockServer.Url("/test.ts"), 0, ChunkPriority::High);
         
         // 少し待機（タイムアウト対策）
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -525,6 +613,114 @@ void TestSegmentAndChunkCoexistence() {
         downloader.RequestSegment("http://example.com/seg1.ts", 1, ChunkPriority::Medium);
         
         // 両方のリクエストが共存できることを確認
+    }
+    TEST_END()
+}
+
+// =============================================================================
+// リトライ/再キューテスト（C-1）
+// =============================================================================
+
+void TestChunkDownloaderRequestChunkResetsErrorState() {
+    TEST_CASE("ChunkDownloader RequestChunk resets Error chunk to Pending (C-1)")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);  // 10KB
+
+        ChunkDownloader downloader(&cache, 2);
+        downloader.SetUrl("http://example.com/test.bin");
+
+        // attempt上限に達して恒久的に失敗した状態を模擬する
+        int64_t chunkIndex = cache.GetChunkIndex(0);
+        cache.SetChunkState(chunkIndex, ChunkState::Error);
+        ASSERT_TRUE(cache.GetChunkState(chunkIndex) == ChunkState::Error);
+
+        // Error状態のチャンクを再リクエストすると、再ダウンロード対象として
+        // 受け付けられ、Pendingに戻ることを確認する（永久放置されない）
+        downloader.RequestChunk(0, ChunkPriority::Critical);
+        ASSERT_TRUE(cache.GetChunkState(chunkIndex) == ChunkState::Pending);
+    }
+    TEST_END()
+}
+
+void TestChunkDownloaderPermanentFailureReachesErrorState() {
+    TEST_CASE("ChunkDownloader chunk exhausts retries and reaches Error state (C-1)")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+
+        ChunkDownloader downloader(&cache, 1);
+        // 接続不可なURL（即座に失敗する）を指定し、attempt上限まで再試行された後、
+        // 永久に放置されず最終的にError状態へ到達することを確認する
+        MockFailingServer mockServer;
+        downloader.SetUrl(mockServer.Url("/test.bin"));
+        downloader.Start();
+        downloader.RequestChunk(0, ChunkPriority::Critical);
+
+        int64_t chunkIndex = cache.GetChunkIndex(0);
+        ChunkState finalState = ChunkState::Pending;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+        while (std::chrono::steady_clock::now() < deadline) {
+            finalState = cache.GetChunkState(chunkIndex);
+            if (finalState == ChunkState::Error) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
+        downloader.Stop();
+
+        ASSERT_TRUE(finalState == ChunkState::Error);
+    }
+    TEST_END()
+}
+
+void TestSegmentDownloaderRetriesBeforePermanentFailure() {
+    TEST_CASE("ChunkDownloader segment exhausts retries and notifies failure exactly once (C-1)")
+    {
+        SparseFileCacheConfig cacheConfig;
+        cacheConfig.chunkSize = 1024;
+        cacheConfig.maxMemoryBytes = 1024 * 1024;
+        SparseFileCache cache(cacheConfig);
+        cache.Initialize(10240);
+
+        ChunkDownloader downloader(&cache, 1);
+
+        std::mutex mtx;
+        std::condition_variable cv;
+        int callbackCount = 0;
+        bool lastSuccess = true;
+
+        downloader.SetSegmentDownloadCallback(
+            [&](int64_t /*segmentIndex*/, std::vector<uint8_t>&& /*data*/, bool success) {
+                std::lock_guard<std::mutex> lock(mtx);
+                callbackCount++;
+                lastSuccess = success;
+                cv.notify_all();
+            }
+        );
+
+        downloader.Start();
+        // 接続不可なURLをリクエスト。attempt上限まで再試行された後、
+        // 再キュー中はコールバックが呼ばれず、最終的に1回だけ通知されることを確認する
+        MockFailingServer mockServer;
+        downloader.RequestSegment(mockServer.Url("/segment0.ts"), 0, ChunkPriority::Critical);
+
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait_for(lock, std::chrono::seconds(40), [&] { return callbackCount > 0; });
+        }
+
+        downloader.Stop();
+
+        ASSERT_EQ(callbackCount, 1);
+        ASSERT_FALSE(lastSuccess);
     }
     TEST_END()
 }
@@ -567,6 +763,11 @@ int main() {
     TestSetHttpHeadersAfterStart();
     TestSegmentDownloadWithCallback();
     TestSegmentAndChunkCoexistence();
+
+    std::cout << "\n[Retry/Requeue Tests (C-1)]" << std::endl;
+    TestChunkDownloaderRequestChunkResetsErrorState();
+    TestChunkDownloaderPermanentFailureReachesErrorState();
+    TestSegmentDownloaderRetriesBeforePermanentFailure();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "Results: " << s_testsPassed << " passed, " 

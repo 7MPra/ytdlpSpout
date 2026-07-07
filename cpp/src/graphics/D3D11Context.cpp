@@ -8,6 +8,10 @@
 
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#if __has_include(<dxgi1_6.h>)
+#include <dxgi1_6.h>
+#define YTDLPSPOUT_USE_DXGI_GPU_PREFERENCE 1
+#endif
 #include <array>
 #include <vector>
 
@@ -184,15 +188,35 @@ bool D3D11Context::Initialize(bool preferHardware) {
         D3D_FEATURE_LEVEL_10_0,
     };
 
-    D3D_DRIVER_TYPE driverType = preferHardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP;
+    IDXGIAdapter* adapterToUse = nullptr;
+    ComPtr<IDXGIAdapter> highPerfAdapter;
 
-    // デバイス作成
+#ifdef YTDLPSPOUT_USE_DXGI_GPU_PREFERENCE
+    // ラップトップ省電力環境対策: 高パフォーマンスGPUを明示選択（Spout安定動作のため）
+    ComPtr<IDXGIFactory6> factory6;
+    HRESULT hrFactory = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory6));
+    if (SUCCEEDED(hrFactory) && factory6) {
+        HRESULT hrEnum = factory6->EnumAdapterByGpuPreference(
+            0,
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            IID_PPV_ARGS(&highPerfAdapter));
+        if (SUCCEEDED(hrEnum) && highPerfAdapter) {
+            adapterToUse = highPerfAdapter.Get();
+            LOG_INFO("Using high-performance GPU (EnumAdapterByGpuPreference)");
+        }
+    }
+#endif
+
+    D3D_DRIVER_TYPE driverType = (adapterToUse != nullptr)
+        ? D3D_DRIVER_TYPE_UNKNOWN
+        : (preferHardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP);
+
     HRESULT hr = D3D11CreateDevice(
-        nullptr,                          // アダプタ（nullptrでデフォルト）
-        driverType,                       // ドライバタイプ
-        nullptr,                          // ソフトウェアラスタライザ
-        createDeviceFlags,                // フラグ
-        featureLevels.data(),             // フィーチャーレベル配列
+        adapterToUse,                     // 高パフォーマンスアダプタ、または nullptr でデフォルト
+        driverType,
+        nullptr,
+        createDeviceFlags,
+        featureLevels.data(),
         static_cast<UINT>(featureLevels.size()),
         D3D11_SDK_VERSION,
         m_device.GetAddressOf(),
@@ -200,8 +224,8 @@ bool D3D11Context::Initialize(bool preferHardware) {
         m_context.GetAddressOf()
     );
 
-    // ハードウェア失敗時はWARPにフォールバック
-    if (FAILED(hr) && preferHardware) {
+    // ハードウェア失敗時はWARPにフォールバック（アダプタ指定時は行わない）
+    if (FAILED(hr) && preferHardware && adapterToUse == nullptr) {
         LOG_WARN("Hardware D3D11 device creation failed, falling back to WARP");
         hr = D3D11CreateDevice(
             nullptr,
@@ -217,9 +241,31 @@ bool D3D11Context::Initialize(bool preferHardware) {
         );
     }
 
+    // 高パフォーマンスアダプタで失敗した場合はデフォルトアダプタで再試行
+#ifdef YTDLPSPOUT_USE_DXGI_GPU_PREFERENCE
+    if (FAILED(hr) && adapterToUse != nullptr) {
+        LOG_WARN("High-performance adapter failed, falling back to default adapter");
+        adapterToUse = nullptr;
+        highPerfAdapter.Reset();
+        driverType = preferHardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP;
+        hr = D3D11CreateDevice(
+            nullptr,
+            driverType,
+            nullptr,
+            createDeviceFlags,
+            featureLevels.data(),
+            static_cast<UINT>(featureLevels.size()),
+            D3D11_SDK_VERSION,
+            m_device.GetAddressOf(),
+            &m_featureLevel,
+            m_context.GetAddressOf()
+        );
+    }
+#endif
+
     HR_CHECK(hr, "D3D11CreateDevice failed");
 
-    // DXGIアダプタを取得
+    // DXGIアダプタを取得（デバイスから取得して m_adapter を保持）
     ComPtr<IDXGIDevice> dxgiDevice;
     hr = m_device.As(&dxgiDevice);
     if (SUCCEEDED(hr)) {
@@ -975,6 +1021,13 @@ std::string D3D11Context::GetAdapterName() const {
     if (SUCCEEDED(m_adapter->GetDesc(&desc))) {
         // ワイド文字からマルチバイト文字へ変換
         int size = WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nullptr, 0, nullptr, nullptr);
+        // MED-5: 変換失敗時（size <= 0）は size - 1 が負になり、size_t への暗黙変換で
+        // 巨大な値になって std::string 構築時にクラッシュ/bad_alloc する。
+        // 失敗時は空文字列相当を返して早期リターンする。
+        if (size <= 0) {
+            LOG_WARN("WideCharToMultiByte failed while converting adapter name");
+            return "Unknown";
+        }
         std::string name(size - 1, 0);
         WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name.data(), size, nullptr, nullptr);
         return name;

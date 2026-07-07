@@ -53,17 +53,23 @@ public:
 
 private:
     friend class TexturePool;
-    
-    PooledTexture(ComPtr<ID3D11Texture2D> texture, class TexturePool* pool, size_t index);
-    
+
+    PooledTexture(ComPtr<ID3D11Texture2D> texture, std::weak_ptr<class TexturePool> pool, size_t index);
+
     ComPtr<ID3D11Texture2D> m_texture;
-    TexturePool* m_pool = nullptr;
+    // Issue C: 生ポインタだとStop()等でTexturePoolが破棄された後にデストラクタが
+    // 解放済みプールへアクセスしてuse-after-freeになるため、weak_ptrで安全に参照する。
+    std::weak_ptr<class TexturePool> m_pool;
     size_t m_index = 0;
 };
 
 /// @brief テクスチャプールクラス
 /// @details 固定サイズのテクスチャを事前確保し、効率的に再利用
-class TexturePool {
+/// @note Acquire()内でshared_from_this()を使用するため、本クラスは必ず
+///       std::make_shared<TexturePool>() 等でshared_ptr管理下に生成すること
+///       （スタック上や生ポインタでの生成はshared_from_this()呼び出し時に
+///       std::bad_weak_ptrで落ちるため不可）。
+class TexturePool : public std::enable_shared_from_this<TexturePool> {
 public:
     /// @brief プール設定
     struct Config {

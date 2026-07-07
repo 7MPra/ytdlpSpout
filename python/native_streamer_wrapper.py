@@ -29,6 +29,19 @@ except ImportError:
 from .ytdlpspout_native import YtdlpSpoutNative, YtdlpSpoutState
 from .ytdlp_resolver import YtDlpAsyncResolver
 
+# DLL検索ディレクトリをプロセス内で一度だけ登録するためのフラグ
+# （Release/Debugなど複数のビルドディレクトリを同時に登録すると、依存DLLが
+#   バージョン違いで解決されロード失敗するため、1ディレクトリのみに限定する）
+_dll_directory_registered = False
+
+# プレビュー用フレーム変換の最小間隔（秒）
+# GUIプレビューの実消費レートはgui.py update_preview()の周期（50ms=20Hz）であり、
+# 動画自体のfps（例: 60fps）でget_current_frame()＋BGRA->BGR変換＋リサイズを行うのは
+# CPU/GPUリードバックの無駄になる。変換レートを最大30fps程度に抑えることで、
+# 消費側レートに近づけつつ、C++側の省電力リードバック省略機構（GUIからのフレーム要求が
+# 一定時間なければリードバックを省略する）が働く余地を残す。
+_PREVIEW_CONVERT_MIN_INTERVAL = 1.0 / 30.0
+
 
 class NativeStreamerWrapper:
     """
@@ -59,10 +72,11 @@ class NativeStreamerWrapper:
         external_spout_sender: Any = None,  # C++ DLLでは無視
         pre_resolved_url: Optional[str] = None,  # 事前解決済みの直接ストリームURL
         pre_resolved_headers: Optional[dict] = None,  # 事前解決済みのHTTPヘッダー
+        pre_resolved_is_hls: Optional[bool] = None,  # 事前解決済みのHLS判定結果（yt-dlp側）
     ):
         """
         NativeStreamerWrapperを初期化
-        
+
         Args:
             video_url: 動画ファイルパスまたはURL（元のURL、表示用に保持）
             sender_name: Spout Sender名
@@ -76,10 +90,12 @@ class NativeStreamerWrapper:
             external_spout_sender: 外部SpoutSender（C++ DLLでは無視）
             pre_resolved_url: 事前にyt-dlpで解決済みの直接ストリームURL（オプション）
             pre_resolved_headers: 事前解決済みのHTTPヘッダー（Cookie等）
+            pre_resolved_is_hls: 事前にyt-dlpで判定済みのHLS判定結果（None=C++側で自動判定）
         """
         self.video_url = video_url
         self._pre_resolved_url = pre_resolved_url  # 事前解決済みURL
         self._pre_resolved_headers = pre_resolved_headers  # 事前解決済みHTTPヘッダー
+        self._pre_resolved_is_hls = pre_resolved_is_hls  # 事前解決済みHLS判定結果
         self.sender_name = sender_name
         self.loop_vod = loop_vod
         self._verbose = verbose
@@ -115,6 +131,20 @@ class NativeStreamerWrapper:
         # フレームデータ
         self.latest_frame_bgr: Optional[Any] = None  # np.ndarray
         self.frame_lock = threading.Lock()
+
+        # プレビュー消費制御（GUI最小化時など、プレビューが不要な間は
+        # get_current_frame()経由のGPU->CPUリードバックとBGRA->BGR変換・リサイズを
+        # 完全にスキップする。デフォルトTrueで完全後方互換）
+        self._preview_enabled = True
+        self._preview_enabled_lock = threading.Lock()
+
+        # プレビュー変換スロットリング／FPS計測用の状態
+        # （_run()開始時に再初期化されるが、_run()を呼ばずに直接
+        #   _update_preview_frame()を検証できるようデフォルト値も設定しておく）
+        self._last_preview_convert_time = 0.0
+        self._fps_frame_count = 0
+        self._fps_start_time = time.perf_counter()
+        self._spout_first_frame_sent = False
         
         # PTS同期用（シームレス切り替え対応）
         self.current_frame_pts: float = 0.0  # 現在フレームのPTS（秒）
@@ -200,7 +230,25 @@ class NativeStreamerWrapper:
         if self._native:
             return self._native.bandwidth
         return 0.0
-    
+
+    @property
+    def preview_enabled(self) -> bool:
+        """
+        プレビュー用フレーム変換が有効かどうか（スレッドセーフ）
+
+        Falseの間、再生スレッドはget_current_frame()の呼び出し・
+        BGRA->BGR変換・リサイズ・latest_frame_bgr更新をスキップする
+        （PTS更新や一時停止処理などその他のループ処理は継続する）。
+        デフォルトはTrue（完全後方互換）。
+        """
+        with self._preview_enabled_lock:
+            return self._preview_enabled
+
+    @preview_enabled.setter
+    def preview_enabled(self, value: bool) -> None:
+        with self._preview_enabled_lock:
+            self._preview_enabled = bool(value)
+
     def log(self, msg: str):
         """ログメッセージを出力"""
         if self._log_cb:
@@ -210,7 +258,7 @@ class NativeStreamerWrapper:
         """
         フォールバックフォーマットのリストを取得
         
-        ニコニコ動画等のAAC音声対応を含む
+        AAC音声対応・汎用フォールバックを含む
         ytdlp_resolver.FALLBACK_FORMATS を共通定義として使用
         
         Returns:
@@ -447,60 +495,100 @@ class NativeStreamerWrapper:
             True: 初期化完了, False: タイムアウト
         """
         return self._dll_ready.wait(timeout=timeout)
-    
+
+    def _update_preview_frame(self, native) -> None:
+        """
+        GUI表示用のフレームを取得・変換し、latest_frame_bgrを更新する
+        （Spout送信はC++ DLLが担当するため、本メソッドはGUIプレビュー専用）
+
+        - preview_enabledがFalseの間は完全にスキップする（get_current_frame()すら
+          呼ばない）。これによりC++側の省電力リードバック省略機構が働く余地を残す。
+        - preview_enabledがTrueでも、前回変換から_PREVIEW_CONVERT_MIN_INTERVAL秒
+          未満なら変換をスキップする（動画fpsが高くてもプレビュー変換レートを抑える）。
+        """
+        if not self.preview_enabled:
+            return
+
+        now = time.perf_counter()
+        if now - self._last_preview_convert_time < _PREVIEW_CONVERT_MIN_INTERVAL:
+            return
+        self._last_preview_convert_time = now
+
+        try:
+            t_start = time.perf_counter()
+            frame_bgra = native.get_current_frame()
+            t_get = time.perf_counter()
+
+            if frame_bgra is not None and HAS_NUMPY:
+                # GUI表示用にフレームを保持
+                import cv2
+                frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
+
+                # 解像度制限がある場合はリサイズ（GUI表示用）
+                if self._output_width != self._width or self._output_height != self._height:
+                    frame_bgr = cv2.resize(frame_bgr, (self._output_width, self._output_height))
+
+                with self.frame_lock:
+                    self.latest_frame_bgr = frame_bgr
+
+                # C++ DLLがSpout送信を担当（Spout有効ビルド）
+                # Python側のSpoutGL送信は不要
+                if not self._spout_first_frame_sent:
+                    self._spout_first_frame_sent = True
+                    self.log(f"[Spout] C++ DLLからフレーム送信中: {self._width}x{self._height}")
+
+                # FPS計測（10秒ごとにログ出力）
+                self._fps_frame_count += 1
+                elapsed = time.perf_counter() - self._fps_start_time
+                if elapsed >= 10.0:
+                    actual_fps = self._fps_frame_count / elapsed
+                    get_ms = (t_get - t_start) * 1000
+                    self.log(f"[Native] 実測FPS: {actual_fps:.1f} (目標: {self._detected_fps:.1f}) | get:{get_ms:.1f}ms")
+                    self._fps_frame_count = 0
+                    self._fps_start_time = time.perf_counter()
+        except Exception:
+            pass
+
     def _run(self):
         """再生スレッドのメイン処理"""
-        # デバッグログ用関数
-        def debug_log(msg):
-            try:
-                with open("F:/ytdlpSpout/python_debug.log", "a", encoding="utf-8") as f:
-                    import datetime
-                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                    f.write(f"[{ts}] {msg}\n")
-            except:
-                pass
-
-        debug_log("--- _run thread started ---")
         try:
             # スレッド内でDLLディレクトリを設定（Windowsのスレッドセーフティ対策）
             import os
             from pathlib import Path
-            import sys
-            
-            debug_log(f"CWD: {os.getcwd()}")
-            
-            dll_search_paths = [
-                Path(__file__).parent / "ytdlpspout.dll",
-                Path("F:/ytdlpSpout/python/ytdlpspout.dll"), # 絶対パスも追加
-                Path(__file__).parent.parent / "cpp" / "build" / "bin" / "Release", # 正しいReleaseパス
-                Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Release",
-                Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Debug",
-            ]
-            
-            for dll_dir in dll_search_paths:
-                dll_dir_str = str(dll_dir.parent.resolve()) if dll_dir.is_file() else str(dll_dir.resolve())
-                debug_log(f"Checking DLL dir: {dll_dir_str}")
-                
-                if os.path.isdir(dll_dir_str):
-                    if dll_dir_str not in os.environ.get("PATH", ""):
-                        os.environ["PATH"] = dll_dir_str + os.pathsep + os.environ.get("PATH", "")
-                        debug_log("Added to PATH")
-                    
+
+            global _dll_directory_registered
+            if not _dll_directory_registered:
+                # 候補を順に調べ、ytdlpspout.dllが実在する最初の1ディレクトリのみを採用する
+                # （複数のビルドディレクトリを一括登録しない）
+                dll_candidates = [
+                    Path(__file__).parent / "ytdlpspout.dll",
+                    Path(__file__).parent.parent / "cpp" / "build" / "bin" / "Release" / "ytdlpspout.dll",
+                    Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Release" / "ytdlpspout.dll",
+                    Path(__file__).parent.parent / "cpp" / "build" / "vs2022" / "bin" / "Debug" / "ytdlpspout.dll",
+                ]
+
+                chosen_dir = None
+                for dll_path in dll_candidates:
+                    if dll_path.is_file():
+                        chosen_dir = str(dll_path.parent.resolve())
+                        break
+
+                if chosen_dir:
+                    if chosen_dir not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = chosen_dir + os.pathsep + os.environ.get("PATH", "")
                     if hasattr(os, 'add_dll_directory'):
                         try:
-                            os.add_dll_directory(dll_dir_str)
-                            debug_log("Added to add_dll_directory")
-                        except (OSError, AttributeError) as e:
-                            debug_log(f"Failed to add_dll_directory: {e}")
-            
-            debug_log("Initializing YtdlpSpoutNative...")
+                            os.add_dll_directory(chosen_dir)
+                        except (OSError, AttributeError):
+                            pass
+                    self.log(f"[Native] DLL検索ディレクトリを登録: {chosen_dir}")
+
+                _dll_directory_registered = True
+
             try:
                 self._native = YtdlpSpoutNative()
-                debug_log("YtdlpSpoutNative initialized successfully")
             except Exception as e:
-                debug_log(f"Failed to initialize YtdlpSpoutNative: {e}")
-                import traceback
-                debug_log(traceback.format_exc())
+                self.log(f"[Native] 初期化失敗: {e}")
                 return
 
             self.log(f"[Native] C++ DLLバックエンドを初期化中...")
@@ -520,15 +608,19 @@ class NativeStreamerWrapper:
             url_preview = input_url[:80] + "..." if len(input_url) > 80 else input_url
             is_m3u8 = ".m3u8" in input_url.lower()
             self.log(f"[Native] URL概要: {url_preview}")
-            self.log(f"[Native] HLS判定: {is_m3u8}")
-            
+            if self._pre_resolved_is_hls is not None:
+                self.log(f"[Native] HLS判定: {self._pre_resolved_is_hls} (yt-dlp解決結果)")
+            else:
+                self.log(f"[Native] HLS判定: {is_m3u8}")
+
             # start_ex()を使用してHTTPヘッダーを渡す
             self._native.start_ex(
                 source=input_url,
                 sender_name=self.sender_name,
                 loop=self.loop_vod,
                 verbose=self._verbose,
-                http_headers=self._pre_resolved_headers
+                http_headers=self._pre_resolved_headers,
+                is_hls=self._pre_resolved_is_hls
             )
             
             # 動画情報取得
@@ -582,13 +674,15 @@ class NativeStreamerWrapper:
             self._dll_ready.set()
             
             # Spout送信状態フラグ（初回送信ログ用）
-            spout_first_frame_sent = False
             spout_error_logged = False
-            
-            # FPS計測用
-            fps_frame_count = 0
-            fps_start_time = time.perf_counter()
-            
+
+            # プレビュー変換スロットリング／FPS計測用の状態を再初期化
+            # （_update_preview_frame()で使用。実行開始時点から計測し直す）
+            self._spout_first_frame_sent = False
+            self._fps_frame_count = 0
+            self._fps_start_time = time.perf_counter()
+            self._last_preview_convert_time = 0.0
+
             # FPS制限用タイマー
             frame_interval = 1.0 / self._detected_fps if self._detected_fps > 0 else 1.0 / 30.0
             last_frame_time = time.perf_counter()
@@ -655,41 +749,10 @@ class NativeStreamerWrapper:
                             continue
                 
                 # フレームデータ取得（GUI表示用のみ、Spout送信はC++ DLLが担当）
-                try:
-                    t_start = time.perf_counter()
-                    frame_bgra = native.get_current_frame()
-                    t_get = time.perf_counter()
-                    
-                    if frame_bgra is not None and HAS_NUMPY:
-                        # GUI表示用にフレームを保持
-                        import cv2
-                        frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
-                        
-                        # 解像度制限がある場合はリサイズ（GUI表示用）
-                        if self._output_width != self._width or self._output_height != self._height:
-                            frame_bgr = cv2.resize(frame_bgr, (self._output_width, self._output_height))
-                        
-                        with self.frame_lock:
-                            self.latest_frame_bgr = frame_bgr
-                        
-                        # C++ DLLがSpout送信を担当（Spout有効ビルド）
-                        # Python側のSpoutGL送信は不要
-                        if not spout_first_frame_sent:
-                            spout_first_frame_sent = True
-                            self.log(f"[Spout] C++ DLLからフレーム送信中: {self._width}x{self._height}")
-                        
-                        # FPS計測（10秒ごとにログ出力）
-                        fps_frame_count += 1
-                        elapsed = time.perf_counter() - fps_start_time
-                        if elapsed >= 10.0:
-                            actual_fps = fps_frame_count / elapsed
-                            get_ms = (t_get - t_start) * 1000
-                            self.log(f"[Native] 実測FPS: {actual_fps:.1f} (目標: {self._detected_fps:.1f}) | get:{get_ms:.1f}ms")
-                            fps_frame_count = 0
-                            fps_start_time = time.perf_counter()
-                except Exception:
-                    pass
-                
+                # preview_enabled=Falseの間、および前回変換からスロットリング間隔未満の
+                # 場合はget_current_frame()自体を呼ばない（詳細は_update_preview_frame参照）
+                self._update_preview_frame(native)
+
                 # FPS制限：C++ DLL側でフレームレート制御しているので
                 # Python側は急激なバースト（2倍以上）のみ防止
                 current_time = time.perf_counter()

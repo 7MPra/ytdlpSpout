@@ -67,6 +67,13 @@ private:
     std::vector<double> energyHistory_; ///< エネルギー履歴
     std::vector<double> beatPositions_; ///< 検出されたビート位置
     double totalSamplesProcessed_;      ///< 処理済みサンプル総数
+
+    // MED-7: DetectPeaksをO(n^2)にしないためのインクリメンタル処理用状態。
+    // energyHistory_ は Reset() まで単調増加し続けるため、毎回全体を
+    // コピー・平滑化・再走査すると長尺コンテンツでO(n^2)になる。
+    // 以下の状態で「新規追加分のみ」処理するようにする。
+    std::vector<double> smoothedEnergyHistory_; ///< 平滑化済みエネルギー履歴（energyHistory_と並行して伸びる。インクリメンタルに計算・追記される）
+    size_t nextPeakScanIndex_ = 0;               ///< 次にピーク候補として検査を再開するインデックス（検査済み範囲を再走査しないため）
     
     // =========================================================================
     // 内部メソッド

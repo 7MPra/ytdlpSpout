@@ -198,11 +198,17 @@ void PrefetchScheduler::TriggerPrefetch() {
     
     for (int64_t chunk : chunks) {
         ChunkState state = m_impl->cache->GetChunkState(chunk);
-        
-        if (state == ChunkState::Empty) {
+
+        // Empty（未ダウンロード）に加え、再試行上限に達していないErrorチャンクも
+        // 再リクエスト対象にする（恒久ストール防止・Issue B-IO）
+        bool shouldRequest = (state == ChunkState::Empty) ||
+            (state == ChunkState::Error &&
+             m_impl->cache->GetChunkFailCount(chunk) <= kMaxChunkFailCount);
+
+        if (shouldRequest) {
             // 優先度を決定
             ChunkPriority priority;
-            
+
             if (chunk <= currentChunk + m_impl->config.criticalChunksAhead) {
                 priority = ChunkPriority::Critical;
             } else if (chunk <= currentChunk + 6) {
@@ -210,7 +216,13 @@ void PrefetchScheduler::TriggerPrefetch() {
             } else {
                 priority = ChunkPriority::Medium;
             }
-            
+
+            if (state == ChunkState::Error) {
+                // 状態遷移を明確にするため、再リクエスト前にEmptyへリセットする
+                // （ChunkDownloader側はError状態でも受け付けるが、失敗カウントは保持される）
+                m_impl->cache->SetChunkState(chunk, ChunkState::Empty);
+            }
+
             // ダウンロードをリクエスト
             int64_t byteOffset = m_impl->cache->GetByteOffset(chunk);
             m_impl->downloader->RequestChunk(byteOffset, priority);
@@ -228,8 +240,15 @@ void PrefetchScheduler::TriggerPrefetch() {
         
         for (int64_t chunk = startChunk; chunk < endChunk; ++chunk) {
             ChunkState state = m_impl->cache->GetChunkState(chunk);
-            
-            if (state == ChunkState::Empty) {
+
+            bool shouldRequest = (state == ChunkState::Empty) ||
+                (state == ChunkState::Error &&
+                 m_impl->cache->GetChunkFailCount(chunk) <= kMaxChunkFailCount);
+
+            if (shouldRequest) {
+                if (state == ChunkState::Error) {
+                    m_impl->cache->SetChunkState(chunk, ChunkState::Empty);
+                }
                 int64_t byteOffset = m_impl->cache->GetByteOffset(chunk);
                 m_impl->downloader->RequestChunk(byteOffset, ChunkPriority::Low);
             }

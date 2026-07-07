@@ -191,6 +191,48 @@ std::optional<FormatInfo> YtDlpResolver::SelectBestFormat(const VideoMetadata& m
 // JSON解析
 // =============================================================================
 
+namespace {
+
+// nlohmann::json の j.value(key, default) は、キーが存在しても値が null の場合に
+// type_error(302) を送出してしまう（is_null()のガードが必要）。
+// yt-dlpはuploader/thumbnail/duration等をしばしばnullで返すため、
+// 以下のヘルパーでnull安全・型不一致安全にフィールドを取得する。
+
+std::string JsonStringOr(const json& j, const std::string& key, const std::string& def) {
+    if (!j.contains(key) || j.at(key).is_null()) {
+        return def;
+    }
+    try {
+        return j.at(key).get<std::string>();
+    } catch (const json::type_error&) {
+        return def;
+    }
+}
+
+bool JsonBoolOr(const json& j, const std::string& key, bool def) {
+    if (!j.contains(key) || j.at(key).is_null()) {
+        return def;
+    }
+    try {
+        return j.at(key).get<bool>();
+    } catch (const json::type_error&) {
+        return def;
+    }
+}
+
+double JsonNumberOr(const json& j, const std::string& key, double def) {
+    if (!j.contains(key) || j.at(key).is_null()) {
+        return def;
+    }
+    try {
+        return j.at(key).get<double>();
+    } catch (const json::type_error&) {
+        return def;
+    }
+}
+
+} // namespace
+
 std::optional<VideoMetadata> YtDlpResolver::ParseMetadataJson(const std::string& jsonStr) {
     if (jsonStr.empty()) {
         return std::nullopt;
@@ -206,24 +248,22 @@ std::optional<VideoMetadata> YtDlpResolver::ParseMetadataJson(const std::string&
         }
 
         VideoMetadata metadata;
-        metadata.id = j.value("id", "");
-        metadata.title = j.value("title", "");
-        metadata.uploader = j.value("uploader", "");
-        metadata.isLive = j.value("is_live", false);
-        metadata.thumbnailUrl = j.value("thumbnail", "");
+        metadata.id = JsonStringOr(j, "id", "");
+        metadata.title = JsonStringOr(j, "title", "");
+        metadata.uploader = JsonStringOr(j, "uploader", "");
+        metadata.isLive = JsonBoolOr(j, "is_live", false);
+        metadata.thumbnailUrl = JsonStringOr(j, "thumbnail", "");
 
         // durationはnullの場合がある（ライブ配信など）
-        if (j.contains("duration") && !j["duration"].is_null()) {
-            metadata.duration = j["duration"].get<double>();
-        }
+        metadata.duration = JsonNumberOr(j, "duration", 0.0);
 
         // フォーマット解析
         if (j.contains("formats") && j["formats"].is_array()) {
             for (const auto& fmtJson : j["formats"]) {
                 FormatInfo fmt;
-                fmt.formatId = fmtJson.value("format_id", "");
-                fmt.url = fmtJson.value("url", "");
-                fmt.ext = fmtJson.value("ext", "");
+                fmt.formatId = JsonStringOr(fmtJson, "format_id", "");
+                fmt.url = JsonStringOr(fmtJson, "url", "");
+                fmt.ext = JsonStringOr(fmtJson, "ext", "");
 
                 // 数値フィールド（nullの場合がある）
                 if (fmtJson.contains("width") && !fmtJson["width"].is_null()) {
@@ -243,8 +283,8 @@ std::optional<VideoMetadata> YtDlpResolver::ParseMetadataJson(const std::string&
                 }
 
                 // コーデック
-                fmt.vcodec = fmtJson.value("vcodec", "none");
-                fmt.acodec = fmtJson.value("acodec", "none");
+                fmt.vcodec = JsonStringOr(fmtJson, "vcodec", "none");
+                fmt.acodec = JsonStringOr(fmtJson, "acodec", "none");
 
                 // ビデオ/オーディオ判定
                 fmt.hasVideo = (fmt.vcodec != "none" && !fmt.vcodec.empty());
@@ -269,45 +309,141 @@ std::optional<VideoMetadata> YtDlpResolver::ParseMetadataJson(const std::string&
 // 静的ユーティリティ
 // =============================================================================
 
+namespace {
+
+// 直接再生可能なファイル拡張子（python/ytdlp_resolver.py の DIRECT_EXTENSIONS と同期）
+const std::vector<std::string>& DirectMediaExtensions() {
+    static const std::vector<std::string> exts = {
+        ".mp4", ".webm", ".mkv", ".avi", ".mov", ".flv", ".wmv",
+        ".m3u8", ".mpd", ".ts",
+        ".mp3", ".ogg", ".wav", ".flac", ".m4a",
+    };
+    return exts;
+}
+
+// http(s) URLのパス部分（クエリ・フラグメント除去、小文字化）を取り出す
+// ※ 呼び出し前にhttp(s)スキームであることを確認しておくこと
+std::string ExtractUrlPathLower(const std::string& url) {
+    size_t schemeEnd = url.find("://");
+    size_t pathStart = (schemeEnd == std::string::npos) ? 0 : schemeEnd + 3;
+    size_t slashPos = url.find('/', pathStart);
+    std::string path = (slashPos == std::string::npos) ? std::string() : url.substr(slashPos);
+    size_t queryPos = path.find_first_of("?#");
+    if (queryPos != std::string::npos) {
+        path = path.substr(0, queryPos);
+    }
+    std::transform(path.begin(), path.end(), path.begin(), ::tolower);
+    return path;
+}
+
+// URLのパス末尾が既知の直接メディア拡張子かどうか
+bool HasDirectMediaExtension(const std::string& url) {
+    std::string path = ExtractUrlPathLower(url);
+    for (const auto& ext : DirectMediaExtensions()) {
+        if (path.size() >= ext.size() &&
+            path.compare(path.size() - ext.size(), ext.size(), ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// http(s) URLのホスト部分（ユーザー情報・ポート除去、小文字化、www.除去）を取り出す
+// ※ 呼び出し前にhttp(s)スキームであることを確認しておくこと
+std::string ExtractUrlHostLower(const std::string& url) {
+    size_t schemeEnd = url.find("://");
+    size_t hostStart = (schemeEnd == std::string::npos) ? 0 : schemeEnd + 3;
+    size_t hostEnd = url.find_first_of("/?#", hostStart);
+    std::string host = (hostEnd == std::string::npos) ? url.substr(hostStart) : url.substr(hostStart, hostEnd - hostStart);
+
+    // userinfo除去 (user:pass@host)
+    size_t atPos = host.find('@');
+    if (atPos != std::string::npos) {
+        host = host.substr(atPos + 1);
+    }
+    // ポート除去
+    size_t colonPos = host.find(':');
+    if (colonPos != std::string::npos) {
+        host = host.substr(0, colonPos);
+    }
+
+    std::transform(host.begin(), host.end(), host.begin(), ::tolower);
+    if (host.compare(0, 4, "www.") == 0) {
+        host = host.substr(4);
+    }
+    return host;
+}
+
+// 既知のyt-dlp対応ドメイン一覧
+// ※ python/ytdlp_resolver.py の YtDlpAsyncResolver.YTDLP_DOMAINS と必ず同期させること
+//    （Python側を正とする）
+const std::vector<std::string>& KnownYtdlpDomains() {
+    static const std::vector<std::string> domains = {
+        // 動画サイト
+        "youtube.com", "youtu.be", "youtube-nocookie.com",
+        "twitch.tv",
+        "nicovideo.jp", "nico.ms", "live.nicovideo.jp",
+        "vimeo.com",
+        "dailymotion.com",
+        "bilibili.com", "bilibili.tv",
+
+        // SNS動画
+        "twitter.com", "x.com",
+        "instagram.com",
+        "tiktok.com",
+        "facebook.com", "fb.watch",
+
+        // その他
+        "soundcloud.com",
+        "bandcamp.com",
+        "reddit.com",
+        "pornhub.com", "xvideos.com",
+    };
+    return domains;
+}
+
+// hostが既知のyt-dlp対応ドメイン（またはそのサブドメイン）かどうか判定
+// （python/ytdlp_resolver.py の _is_known_ytdlp_domain と同じ判定ロジック）
+bool IsKnownYtdlpDomain(const std::string& host) {
+    if (host.empty()) {
+        return false;
+    }
+    for (const auto& domain : KnownYtdlpDomains()) {
+        if (host == domain) {
+            return true;
+        }
+        if (host.size() > domain.size() &&
+            host.compare(host.size() - domain.size(), domain.size(), domain) == 0 &&
+            host[host.size() - domain.size() - 1] == '.') {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 bool YtDlpResolver::IsSupportedUrl(const std::string& url) {
     if (url.empty()) {
         return false;
     }
 
-    // サポートするサイトのパターン
-    static const std::vector<std::regex> patterns = {
-        // YouTube
-        std::regex(R"(https?://(www\.)?youtube\.com/)", std::regex::icase),
-        std::regex(R"(https?://youtu\.be/)", std::regex::icase),
-        std::regex(R"(https?://music\.youtube\.com/)", std::regex::icase),
-        
-        // Twitch
-        std::regex(R"(https?://(www\.)?twitch\.tv/)", std::regex::icase),
-        
-        // Vimeo
-        std::regex(R"(https?://(www\.)?(player\.)?vimeo\.com/)", std::regex::icase),
-        
-        // NicoNico
-        std::regex(R"(https?://(www\.)?nicovideo\.jp/)", std::regex::icase),
-        std::regex(R"(https?://nico\.ms/)", std::regex::icase),
-        
-        // Twitter/X
-        std::regex(R"(https?://(www\.)?(twitter|x)\.com/)", std::regex::icase),
-        
-        // Dailymotion
-        std::regex(R"(https?://(www\.)?dailymotion\.com/)", std::regex::icase),
-        
-        // Bilibili
-        std::regex(R"(https?://(www\.)?bilibili\.com/)", std::regex::icase),
-    };
-
-    for (const auto& pattern : patterns) {
-        if (std::regex_search(url, pattern)) {
-            return true;
-        }
+    // http(s) URL以外（ローカルパス等）はyt-dlp解決の対象外
+    static const std::regex schemePattern(R"(^https?://)", std::regex::icase);
+    if (!std::regex_search(url, schemePattern)) {
+        return false;
     }
 
-    return false;
+    // 既知サイトのドメインは拡張子の有無に関わらずyt-dlp解決対象
+    // （python/ytdlp_resolver.py の YTDLP_DOMAINS と同一内容に揃えている）
+    std::string host = ExtractUrlHostLower(url);
+    if (IsKnownYtdlpDomain(host)) {
+        return true;
+    }
+
+    // 未知サイトでも、直接メディア拡張子でなければyt-dlp解決を試みる
+    // （python/ytdlp_resolver.py の is_ytdlp_url と反転条件を揃える）
+    return !HasDirectMediaExtension(url);
 }
 
 SourceType YtDlpResolver::GetSourceType(const std::string& pathOrUrl) {
@@ -365,20 +501,74 @@ bool YtDlpResolver::IsHwDecodableCodec(const std::string& vcodec) {
 }
 
 // =============================================================================
+// コマンドライン引数クオート（RES-1: コマンド/引数インジェクション対策）
+// =============================================================================
+
+std::string YtDlpResolver::QuoteWinArg(const std::string& arg) {
+    // MSDN「Parsing C++ Command-Line Arguments」/ CommandLineToArgvW互換規則:
+    //   - 引数は常に " で囲む
+    //   - " の直前に連続する \ は2倍にし、" 自体は \" にエスケープする
+    //   - 閉じる " の直前に来る連続する \ も2倍にする（エスケープと解釈されないように）
+    // これにより引数中のスペース/"/&/^/%等が単一の引数としてそのまま子プロセスに渡る。
+    std::string result;
+    result.push_back('"');
+
+    size_t backslashes = 0;
+    for (char c : arg) {
+        if (c == '\\') {
+            ++backslashes;
+            continue;
+        }
+        if (c == '"') {
+            // 直前の\をすべて2倍にし、"自体をエスケープする\を1つ追加
+            result.append(backslashes * 2 + 1, '\\');
+            backslashes = 0;
+            result.push_back('"');
+        } else {
+            // \はここでは特殊文字ではないためそのまま出力
+            result.append(backslashes, '\\');
+            backslashes = 0;
+            result.push_back(c);
+        }
+    }
+    // 末尾に残った\は、後続の閉じる"のために2倍にする
+    result.append(backslashes * 2, '\\');
+    result.push_back('"');
+    return result;
+}
+
+// =============================================================================
 // プロセス実行
 // =============================================================================
 
+namespace {
+
+// UTF-8文字列をUTF-16 (std::wstring) に変換する
+// コードベースの文字列はUTF-8だが、CreateProcessWにはUTF-16が必要なため変換する
+// （RES-2: CreateProcessAはANSI/システムロケール解釈のため非ASCIIパス/URLが破損する）
+std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) {
+        return std::wstring();
+    }
+    int sizeNeeded = MultiByteToWideChar(
+        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (sizeNeeded <= 0) {
+        return std::wstring();
+    }
+    std::wstring wide(static_cast<size_t>(sizeNeeded), L'\0');
+    MultiByteToWideChar(
+        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), sizeNeeded);
+    return wide;
+}
+
+} // namespace
+
 bool YtDlpResolver::ExecuteYtDlp(const std::vector<std::string>& args, std::string& output) {
-    // コマンドライン構築
-    std::string cmdLine = "\"" + m_ytdlpPath + "\"";
+    // コマンドライン構築（全引数・実行ファイルパスをWindows規則で正しくクオート・エスケープ）
+    std::string cmdLine = QuoteWinArg(m_ytdlpPath);
     for (const auto& arg : args) {
         cmdLine += " ";
-        // 引数にスペースや特殊文字が含まれる場合はクォート
-        if (arg.find(' ') != std::string::npos || arg.find('&') != std::string::npos) {
-            cmdLine += "\"" + arg + "\"";
-        } else {
-            cmdLine += arg;
-        }
+        cmdLine += QuoteWinArg(arg);
     }
 
     LOG_DEBUG("Executing: {}", cmdLine);
@@ -410,19 +600,20 @@ bool YtDlpResolver::ExecuteYtDlp(const std::vector<std::string>& args, std::stri
     SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
 
-    // プロセス起動
-    STARTUPINFOA si = {};
-    si.cb = sizeof(STARTUPINFOA);
+    // プロセス起動（UTF-8→UTF-16変換の上でCreateProcessWを使用し、非ASCIIパス/URLの破損を防ぐ）
+    STARTUPINFOW si = {};
+    si.cb = sizeof(STARTUPINFOW);
     si.hStdOutput = hStdoutWrite;
     si.hStdError = hStderrWrite;
     si.dwFlags = STARTF_USESTDHANDLES;
 
     PROCESS_INFORMATION pi = {};
 
-    std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
-    cmdLineBuf.push_back('\0');
+    std::wstring wCmdLine = Utf8ToWide(cmdLine);
+    std::vector<wchar_t> cmdLineBuf(wCmdLine.begin(), wCmdLine.end());
+    cmdLineBuf.push_back(L'\0');
 
-    BOOL success = CreateProcessA(
+    BOOL success = CreateProcessW(
         nullptr,
         cmdLineBuf.data(),
         nullptr,

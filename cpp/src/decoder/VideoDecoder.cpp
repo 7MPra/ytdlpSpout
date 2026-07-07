@@ -5,6 +5,7 @@
 #include "VideoDecoder.h"
 #include "HWAccelContext.h"
 #include "io/CustomIOContext.h"
+#include "hls/HlsSliceLoadingManager.h"
 #include "utils/Logger.h"
 #include "utils/ErrorHandling.h"
 
@@ -20,8 +21,20 @@ extern "C" {
 }
 
 #include <mutex>
-#include <algorithm>
-#include <cctype>
+
+// =============================================================================
+// MED-2: 実行時HWデコード失敗時のソフトウェアフォールバック設定
+// =============================================================================
+
+namespace {
+    // ハードウェアデコードが初期化後に実行時失敗する場合、多くは環境的な非互換性
+    // （特定コーデック/解像度/ドライバ）に起因し、再生開始直後の数フレームで
+    // 顕在化する。このウィンドウ内での失敗のみを「HW非対応」とみなして
+    // ソフトウェアデコードへの一度限りのフォールバックをトリガーする。
+    // （ウィンドウ外で発生する孤立した1フレームのデコードエラーまでフォールバック
+    //   対象にすると、正常に動作しているHWデコードを不必要に無効化してしまうため）
+    constexpr int64_t kMaxHwFailureFramesForFallback = 5;
+}
 
 // =============================================================================
 // HLS HTTPヘッダー伝播用構造体
@@ -67,22 +80,6 @@ static int custom_io_open(AVFormatContext* s, AVIOContext** pb,
     return ret;
 }
 
-// =============================================================================
-// ヘルパー関数
-// =============================================================================
-
-/// @brief URLがHLSストリームかどうかを判定
-/// @param url 判定するURL
-/// @return HLSストリームの場合true
-static bool IsHlsUrl(const std::string& url) {
-    std::string lower = url;
-    std::transform(lower.begin(), lower.end(), lower.begin(), 
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return (lower.find(".m3u8") != std::string::npos) ||
-           (lower.find("format=m3u8") != std::string::npos) ||
-           (lower.find("/hls/") != std::string::npos);
-}
-
 namespace ytdlpspout {
 
 // =============================================================================
@@ -118,9 +115,13 @@ struct VideoDecoder::Impl {
     
     // ハードウェアアクセラレーション
     std::unique_ptr<HWAccelContext> hwAccelCtx;
-    
-    // HLS HTTPヘッダー伝播用コンテキスト
-    HttpHeaderContext* httpHeaderCtx = nullptr;
+
+    // MED-2: 実行時HWデコード失敗時のソフトウェアフォールバック制御
+    // 一度SWへ切り替えたら再度HWを試みない（無限リトライ防止、確定的挙動にする）
+    bool hwFallbackAttempted = false;
+
+    // HLS HTTPヘッダー伝播用コンテキスト（unique_ptr化により全失敗パスで自動解放）
+    std::unique_ptr<HttpHeaderContext> httpHeaderCtx;
     
     // コールバック
     ErrorCallback errorCallback;
@@ -169,7 +170,8 @@ bool VideoDecoder::Open(const std::string& filePath, ID3D11Device* d3dDevice,
     bool isUrl = (filePath.rfind("http://", 0) == 0) || (filePath.rfind("https://", 0) == 0);
     
     // HLS判定 - HLSの場合はCustomIOContextを使わずFFmpegネイティブHTTPを使用
-    bool isHls = IsHlsUrl(filePath);
+    // （判定ロジックはHlsSliceLoadingManagerに一本化し、VideoPlayer側と齟齬が出ないようにする）
+    bool isHls = hls::HlsSliceLoadingManager::IsHlsUrl(filePath);
     if (isHls) {
         LOG_INFO("Detected HLS stream, using FFmpeg native HTTP handler");
     }
@@ -247,13 +249,13 @@ bool VideoDecoder::Open(const std::string& filePath, ID3D11Device* d3dDevice,
             }
             
             // HTTPヘッダーコンテキストを作成
-            m_impl->httpHeaderCtx = new HttpHeaderContext();
+            m_impl->httpHeaderCtx = std::make_unique<HttpHeaderContext>();
             for (const auto& [key, value] : httpHeaders) {
                 m_impl->httpHeaderCtx->headers += key + ": " + value + "\r\n";
             }
-            
+
             // カスタムio_openコールバックを設定
-            m_impl->formatCtx->opaque = m_impl->httpHeaderCtx;
+            m_impl->formatCtx->opaque = m_impl->httpHeaderCtx.get();
             m_impl->formatCtx->io_open = custom_io_open;
             
             LOG_INFO("Custom io_open callback set for HLS stream to propagate HTTP headers");
@@ -263,11 +265,8 @@ bool VideoDecoder::Open(const std::string& filePath, ID3D11Device* d3dDevice,
         av_dict_free(&opts);
         if (ret < 0) {
             m_impl->ReportError("Failed to open input: " + FFmpegErrorToString(ret));
-            // httpHeaderCtxをクリーンアップ
-            if (m_impl->httpHeaderCtx) {
-                delete m_impl->httpHeaderCtx;
-                m_impl->httpHeaderCtx = nullptr;
-            }
+            // httpHeaderCtxをクリーンアップ（unique_ptrのためreset()で解放）
+            m_impl->httpHeaderCtx.reset();
             return false;
         }
     }
@@ -856,11 +855,8 @@ void VideoDecoder::CloseInternal() {
         avformat_close_input(&m_impl->formatCtx);
     }
     
-    // HLS HTTPヘッダーコンテキストの解放
-    if (m_impl->httpHeaderCtx) {
-        delete m_impl->httpHeaderCtx;
-        m_impl->httpHeaderCtx = nullptr;
-    }
+    // HLS HTTPヘッダーコンテキストの解放（unique_ptrのためreset()で解放）
+    m_impl->httpHeaderCtx.reset();
     
     // 内部CustomIOContext解放
     if (m_impl->customIOContext) {
@@ -877,10 +873,74 @@ void VideoDecoder::CloseInternal() {
     m_impl->isHardwareAccelerated = false;
     m_impl->currentFrameNumber = 0;
     m_impl->videoInfo = VideoInfo{};
+
+    // MED-2: 次回Open時にHWデコードを再度試みられるようフォールバック状態をリセットする
+    m_impl->hwFallbackAttempted = false;
 }
 
 bool VideoDecoder::IsOpen() const {
     return m_impl->isOpen;
+}
+
+// =============================================================================
+// MED-2: 実行時HWデコード失敗時のソフトウェアフォールバック
+// =============================================================================
+
+bool VideoDecoder::ReinitializeCodecAsSoftware() {
+    // 注意: このメソッドはDecodeNextFrame()内、mutex取得済みの状態で呼ばれる想定
+
+    if (!m_impl->formatCtx || m_impl->videoStreamIndex < 0) {
+        return false;
+    }
+
+    LOG_WARN("Hardware decoding failed at runtime; attempting one-time fallback to software decoding");
+
+    AVStream* videoStream = m_impl->formatCtx->streams[m_impl->videoStreamIndex];
+
+    const AVCodec* codec = avcodec_find_decoder(videoStream->codecpar->codec_id);
+    if (!codec) {
+        m_impl->ReportError("ReinitializeCodecAsSoftware: decoder not found");
+        return false;
+    }
+
+    AVCodecContext* newCodecCtx = avcodec_alloc_context3(codec);
+    if (!newCodecCtx) {
+        m_impl->ReportError("ReinitializeCodecAsSoftware: failed to allocate codec context");
+        return false;
+    }
+
+    int ret = avcodec_parameters_to_context(newCodecCtx, videoStream->codecpar);
+    if (ret < 0) {
+        m_impl->ReportError("ReinitializeCodecAsSoftware: failed to copy codec parameters: " +
+                             FFmpegErrorToString(ret));
+        avcodec_free_context(&newCodecCtx);
+        return false;
+    }
+
+    // hw_device_ctx/get_formatは設定しない（純粋なソフトウェアデコードとして開く）
+    ret = avcodec_open2(newCodecCtx, codec, nullptr);
+    if (ret < 0) {
+        m_impl->ReportError("ReinitializeCodecAsSoftware: failed to open decoder: " +
+                             FFmpegErrorToString(ret));
+        avcodec_free_context(&newCodecCtx);
+        return false;
+    }
+
+    // 旧コンテキスト（HW）を破棄し、新しいSWコンテキストに置き換える
+    if (m_impl->codecCtx) {
+        avcodec_free_context(&m_impl->codecCtx);
+    }
+    m_impl->codecCtx = newCodecCtx;
+
+    // HWアクセラレーションコンテキストを破棄してSWモードへ確定的に切り替える
+    m_impl->hwAccelCtx.reset();
+    m_impl->isHardwareAccelerated = false;
+    m_impl->hwFallbackAttempted = true;
+
+    LOG_WARN("Switched to software decoding after hardware decode failure (one-time fallback; "
+             "will not retry hardware decoding for this session)");
+
+    return true;
 }
 
 // =============================================================================
@@ -923,25 +983,42 @@ bool VideoDecoder::DecodeNextFrame() {
         // パケットをデコーダーに送信
         ret = avcodec_send_packet(m_impl->codecCtx, m_impl->packet);
         av_packet_unref(m_impl->packet);
-        
+
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN)) {
                 // フレームを先に受け取る必要がある
             } else {
                 LOG_WARN("Error sending packet: {}", FFmpegErrorToString(ret));
+
+                // MED-2: HWデコード開始直後の数フレームで失敗する場合、
+                // 環境非互換の可能性が高いためSWへ一度だけフォールバックする
+                if (m_impl->isHardwareAccelerated && !m_impl->hwFallbackAttempted &&
+                    m_impl->currentFrameNumber < kMaxHwFailureFramesForFallback) {
+                    ReinitializeCodecAsSoftware();
+                }
                 continue;
             }
         }
-        
+
         // フレームを受け取る
         AVFrame* targetFrame = m_impl->isHardwareAccelerated ? m_impl->hwFrame : m_impl->frame;
         ret = avcodec_receive_frame(m_impl->codecCtx, targetFrame);
-        
+
         if (ret == AVERROR(EAGAIN)) {
             // 次のパケットが必要
             continue;
         } else if (ret < 0) {
             LOG_WARN("Error receiving frame: {}", FFmpegErrorToString(ret));
+
+            // MED-2: HWデコード（get_format/hwフレーム転送を含む）が実行時に失敗した場合、
+            // 初期の数フレーム以内であれば一度だけSWデコードへ切り替えて再生を継続する。
+            // 切り替え後は次のパケット読み取りからやり直す（無限リトライはしない）。
+            if (m_impl->isHardwareAccelerated && !m_impl->hwFallbackAttempted &&
+                m_impl->currentFrameNumber < kMaxHwFailureFramesForFallback) {
+                if (ReinitializeCodecAsSoftware()) {
+                    continue;
+                }
+            }
             return false;
         }
         
@@ -968,11 +1045,20 @@ AVFrame* VideoDecoder::GetCurrentFrame() const {
 }
 
 double VideoDecoder::GetCurrentPTS() const {
-    AVFrame* frame = GetCurrentFrame();
-    if (!frame || frame->pts == AV_NOPTS_VALUE) {
+    double pts = 0.0;
+    if (!TryGetCurrentPTS(pts)) {
         return 0.0;
     }
-    return av_q2d(m_impl->timeBase) * frame->pts;
+    return pts;
+}
+
+bool VideoDecoder::TryGetCurrentPTS(double& outPts) const {
+    AVFrame* frame = GetCurrentFrame();
+    if (!frame || frame->pts == AV_NOPTS_VALUE) {
+        return false;
+    }
+    outPts = av_q2d(m_impl->timeBase) * frame->pts;
+    return true;
 }
 
 int64_t VideoDecoder::GetCurrentFrameNumber() const {

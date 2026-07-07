@@ -13,6 +13,7 @@
 
 #include <string>
 #include <cstring>
+#include <limits>
 
 // =============================================================================
 // バージョン情報テスト
@@ -362,6 +363,49 @@ TEST_SUITE("C API - Cache Status") {
         CHECK(true);
         
         ytdlpspout_destroy(handle);
+    }
+}
+
+// =============================================================================
+// P-5: 例外安全性テスト
+// =============================================================================
+// エクスポート関数はC ABI境界を越えて例外を漏らしてはならず、
+// 不正・境界値の引数に対してもエラー値を返すのみで例外を投げないことを確認する。
+
+TEST_SUITE("C API - Exception Safety") {
+    TEST_CASE("Exported functions do not throw for edge-case arguments") {
+        YtdlpSpoutHandle handle = ytdlpspout_create();
+        REQUIRE(handle != nullptr);
+
+        CHECK_NOTHROW(ytdlpspout_seek(handle, std::numeric_limits<double>::quiet_NaN()));
+        CHECK_NOTHROW(ytdlpspout_seek(handle, std::numeric_limits<double>::infinity()));
+        CHECK_NOTHROW(ytdlpspout_pause(handle));
+        CHECK_NOTHROW(ytdlpspout_resume(handle));
+        CHECK_NOTHROW(ytdlpspout_process_frame(handle));
+
+        YtdlpSpoutVideoInfo info{};
+        CHECK_NOTHROW(ytdlpspout_get_video_info(handle, &info));
+
+        YtdlpSpoutHlsCacheStats hlsStats{};
+        CHECK_NOTHROW(ytdlpspout_get_hls_cache_stats(handle, &hlsStats));
+
+        CHECK_NOTHROW(ytdlpspout_stop(handle));
+
+        ytdlpspout_destroy(handle);
+    }
+
+    TEST_CASE("Exported functions do not throw for nullptr handle") {
+        CHECK_NOTHROW(ytdlpspout_stop(nullptr));
+        CHECK_NOTHROW(ytdlpspout_pause(nullptr));
+        CHECK_NOTHROW(ytdlpspout_resume(nullptr));
+        CHECK_NOTHROW(ytdlpspout_seek(nullptr, 0.0));
+        CHECK_NOTHROW(ytdlpspout_process_frame(nullptr));
+        CHECK_NOTHROW(ytdlpspout_get_state(nullptr));
+
+        YtdlpSpoutVideoInfo info{};
+        int result = -999;
+        CHECK_NOTHROW(result = ytdlpspout_get_video_info(nullptr, &info));
+        CHECK(result != 0);  // 例外ではなくエラー値が返ること
     }
 }
 

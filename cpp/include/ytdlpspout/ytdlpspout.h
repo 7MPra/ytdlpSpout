@@ -99,6 +99,7 @@ typedef struct YtdlpSpoutConfigEx {
     YtdlpSpoutYtDlpConfig ytdlp;      ///< yt-dlp設定
     const YtdlpSpoutHttpHeader* httpHeaders;  ///< HTTPヘッダー配列（NULL=なし）
     int httpHeadersCount;             ///< HTTPヘッダー数
+    int isHlsHint;                    ///< HLS判定ヒント（-1=自動判定、0=非HLS、1=HLS。yt-dlp側の判定結果を伝搬する用途）
 } YtdlpSpoutConfigEx;
 
 /// @brief 再生状態

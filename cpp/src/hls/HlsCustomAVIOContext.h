@@ -124,6 +124,15 @@ public:
     /// @param callback シーク時に呼び出されるコールバック (引数: 新しいセグメントインデックス)
     void SetOnSeekCallback(std::function<void(int64_t)> callback);
 
+    /// @brief セグメント再ダウンロード要求コールバックを設定
+    ///
+    /// 恒久的にダウンロード失敗したとマークされたセグメントを読み取ろうとした際、
+    /// 一度だけ自動復旧を試みるために呼び出される（引数: 再ダウンロードすべきセグメントインデックス）。
+    /// コールバック側は失敗マークの解除（HlsSegmentCache::ClearSegmentFailed）と
+    /// 再ダウンロード要求（ChunkDownloader::RequestSegment等）を行うことを想定している。
+    /// @param callback 再ダウンロード要求コールバック
+    void SetOnSegmentRetryCallback(std::function<void(int64_t)> callback);
+
 private:
     // =========================================================================
     // FFmpegコールバック

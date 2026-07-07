@@ -367,6 +367,35 @@ void TestResolveUrl_TrailingSlash() {
     TEST_END()
 }
 
+void TestResolveUrl_QueryStringWithSlash() {
+    TEST_CASE("ResolveUrl - base URL with slash inside query string (issue L-1b)")
+    {
+        // クエリ文字列内に'/'を含むベースURL（署名トークン等でよくあるパターン）
+        std::string base = "https://example.com/video/playlist.m3u8?token=abc/def&sig=xyz";
+
+        std::string resolved = M3U8Parser::ResolveUrl(base, "segment0.ts");
+        // クエリ内の'/'に惑わされず、正しく"video/"までがベースパスになること
+        ASSERT_EQ(resolved, "https://example.com/video/segment0.ts");
+    }
+    TEST_END()
+}
+
+void TestResolveUrl_SchemeRelative() {
+    TEST_CASE("ResolveUrl - scheme-relative URL (//host/path) (issue L-1a)")
+    {
+        std::string base = "https://example.com/video/playlist.m3u8";
+
+        std::string resolved = M3U8Parser::ResolveUrl(base, "//cdn.example.com/seg0.ts");
+        ASSERT_EQ(resolved, "https://cdn.example.com/seg0.ts");
+
+        // httpベースの場合はhttpスキームが付与されること
+        std::string httpBase = "http://example.com/video/playlist.m3u8";
+        resolved = M3U8Parser::ResolveUrl(httpBase, "//cdn.example.com/seg0.ts");
+        ASSERT_EQ(resolved, "http://cdn.example.com/seg0.ts");
+    }
+    TEST_END()
+}
+
 void TestRelativeUrlM3U8Parse() {
     TEST_CASE("Relative URL resolution in m3u8")
     {
@@ -475,6 +504,85 @@ segment1.ts
     TEST_END()
 }
 
+void TestSampleAesMethodParse() {
+    TEST_CASE("EXT-X-KEY with METHOD=SAMPLE-AES is preserved (issue L-2b)")
+    {
+        const char* sampleAes = R"(#EXTM3U
+#EXT-X-VERSION:5
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="https://example.com/key.bin",IV=0x00000000000000000000000000000001
+#EXTINF:10.0,
+segment0.ts
+#EXT-X-ENDLIST
+)";
+        auto result = M3U8Parser::Parse(sampleAes, "https://example.com/");
+        ASSERT_TRUE(result.has_value());
+        ASSERT_TRUE(result->encryptionKey.has_value());
+        // SAMPLE-AESはAES-128とは異なる方式として保持される（呼び出し側でフォールバック判断に使う）
+        ASSERT_EQ(result->encryptionKey->method, "SAMPLE-AES");
+        ASSERT_FALSE(result->hasKeyRotation);
+    }
+    TEST_END()
+}
+
+void TestKeyRotationDetected() {
+    TEST_CASE("Key rotation is detected when EXT-X-KEY changes mid-playlist (issue L-2c)")
+    {
+        // 途中でURIが変わる（ローテーションする）プレイリスト
+        auto result = M3U8Parser::Parse(R"(#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/key1.bin",IV=0x00000000000000000000000000000001
+#EXTINF:10.0,
+segment0.ts
+#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/key2.bin",IV=0x00000000000000000000000000000002
+#EXTINF:10.0,
+segment1.ts
+#EXT-X-ENDLIST
+)", "https://example.com/");
+        ASSERT_TRUE(result.has_value());
+        ASSERT_TRUE(result->hasKeyRotation);
+    }
+    TEST_END()
+}
+
+void TestKeyRotationNotDetectedWhenSame() {
+    TEST_CASE("Key rotation is NOT flagged when repeated EXT-X-KEY is identical")
+    {
+        // 同じURI/IVの#EXT-X-KEYが繰り返し出現しても、ローテーションとは見なさない
+        auto result = M3U8Parser::Parse(R"(#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/key1.bin",IV=0x00000000000000000000000000000001
+#EXTINF:10.0,
+segment0.ts
+#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/key1.bin",IV=0x00000000000000000000000000000001
+#EXTINF:10.0,
+segment1.ts
+#EXT-X-ENDLIST
+)", "https://example.com/");
+        ASSERT_TRUE(result.has_value());
+        ASSERT_FALSE(result->hasKeyRotation);
+    }
+    TEST_END()
+}
+
+void TestLiveM3U8HasNoKeyRotationByDefault() {
+    TEST_CASE("Live playlist without ENDLIST is flagged isLive (issue L-2a, parser-level check)")
+    {
+        auto result = M3U8Parser::Parse(LIVE_M3U8, "https://example.com/");
+        ASSERT_TRUE(result.has_value());
+        // ライブ判定（#EXT-X-ENDLISTがない）はHlsSliceLoadingManager::Open()の
+        // フォールバック判断に使われる
+        ASSERT_TRUE(result->isLive);
+        ASSERT_FALSE(result->hasKeyRotation);
+    }
+    TEST_END()
+}
+
 void TestByteRangeWithoutOffset() {
     TEST_CASE("EXT-X-BYTERANGE without offset (sequential)")
     {
@@ -530,15 +638,21 @@ int main(int argc, char* argv[]) {
     TestResolveUrl_AbsolutePath();
     TestResolveUrl_FullUrl();
     TestResolveUrl_TrailingSlash();
+    TestResolveUrl_QueryStringWithSlash();
+    TestResolveUrl_SchemeRelative();
     TestRelativeUrlM3U8Parse();
-    
+
     std::cout << "\n[Edge Case Tests]" << std::endl;
     TestCaseInsensitiveTags();
     TestExtinfWithTitle();
     TestKeyMethodNone();
     TestMultipleKeys();
+    TestSampleAesMethodParse();
+    TestKeyRotationDetected();
+    TestKeyRotationNotDetectedWhenSame();
+    TestLiveM3U8HasNoKeyRotationByDefault();
     TestByteRangeWithoutOffset();
-    
+
     std::cout << "\n=== Test Summary ===" << std::endl;
     std::cout << "  Passed: " << s_testsPassed << std::endl;
     std::cout << "  Failed: " << s_testsFailed << std::endl;

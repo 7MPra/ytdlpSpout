@@ -7,6 +7,7 @@
 #include "utils/Logger.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <list>
 #include <mutex>
 #include <condition_variable>
@@ -63,17 +64,32 @@ struct HlsSegmentCache::Impl {
     // 保護対象セグメント（再生中）
     int64_t protectedStart = -1;
     int64_t protectedEnd = -1;
-    
+
+    // 恒久的にダウンロードが失敗したとマークされたセグメント
+    std::unordered_set<int64_t> failedSegments;
+
     // -------------------------------------------------------------------------
     // 同期
     // -------------------------------------------------------------------------
     mutable std::mutex mutex;
     std::condition_variable segmentAvailableCv;
-    
+
     // -------------------------------------------------------------------------
     // ヘルパー関数
     // -------------------------------------------------------------------------
-    
+
+    /// @brief セグメントインデックスが有効か確認
+    /// -1（初期化セグメント）は常に許可。それ以外は [0, 総セグメント数) の範囲のみ許可。
+    bool IsValidSegmentIndex(int64_t index) const {
+        if (index == -1) {
+            return true;
+        }
+        if (index < -1) {
+            return false;
+        }
+        return static_cast<size_t>(index) < playlist.segments.size();
+    }
+
     /// @brief LRUリストでセグメントを最新に移動
     void TouchSegment(int64_t index) {
         auto it = lruMap.find(index);
@@ -261,7 +277,8 @@ void HlsSegmentCache::Initialize(const M3U8Playlist& playlist) {
     m_impl->cachedCount = 0;
     m_impl->protectedStart = -1;
     m_impl->protectedEnd = -1;
-    
+    m_impl->failedSegments.clear();
+
     // プレイリストを保存
     m_impl->playlist = playlist;
     m_impl->initialized = true;
@@ -350,12 +367,15 @@ bool HlsSegmentCache::WriteSegment(int64_t segmentIndex, std::vector<uint8_t>&& 
     m_impl->cache[segmentIndex] = std::move(cachedSeg);
     m_impl->memoryUsed += dataSize;
     m_impl->cachedCount++;
-    
+
     m_impl->TouchSegment(segmentIndex);
-    
-    LOG_DEBUG("HlsSegmentCache: Wrote segment {} ({} bytes, encrypted={})", 
+
+    // 成功した書き込みは失敗マークを解除する（再ダウンロード成功時の復旧など）
+    m_impl->failedSegments.erase(segmentIndex);
+
+    LOG_DEBUG("HlsSegmentCache: Wrote segment {} ({} bytes, encrypted={})",
               segmentIndex, dataSize, isEncrypted);
-    
+
     // 待機中のスレッドに通知
     LOG_DEBUG("HlsSegmentCache: Notifying waiting threads for segment {}", segmentIndex);
     m_impl->segmentAvailableCv.notify_all();
@@ -379,9 +399,15 @@ std::optional<std::vector<uint8_t>> HlsSegmentCache::ReadSegment(int64_t segment
     
     // キャッシュを検索
     auto it = m_impl->cache.find(segmentIndex);
-    
+
     // キャッシュにない場合の待機処理
     while (it == m_impl->cache.end()) {
+        // 恒久失敗としてマーク済みの場合は、タイムアウトを待たずに即座に失敗を返す
+        if (m_impl->failedSegments.find(segmentIndex) != m_impl->failedSegments.end()) {
+            LOG_WARN("ReadSegment: Segment {} is marked as permanently failed", segmentIndex);
+            return std::nullopt;
+        }
+
         if (timeoutMs == 0) {
             // 即時リターン
             return std::nullopt;
@@ -441,35 +467,95 @@ bool HlsSegmentCache::WaitForSegment(int64_t segmentIndex, int timeoutMs) {
         LOG_DEBUG("WaitForSegment: Segment {} already cached, returning immediately", segmentIndex);
         return true;
     }
-    
+
+    // 既に恒久失敗としてマーク済みの場合は、タイムアウトを待たずに即座にfalse
+    if (m_impl->failedSegments.find(segmentIndex) != m_impl->failedSegments.end()) {
+        LOG_WARN("WaitForSegment: Segment {} is marked as permanently failed, returning immediately", segmentIndex);
+        return false;
+    }
+
     LOG_DEBUG("WaitForSegment: Segment {} not in cache, waiting...", segmentIndex);
-    
-    // 待機ループ
+
+    // 待機ループ（キャッシュ済み、または失敗マーク済みのいずれかで起床する）
     auto predicate = [this, segmentIndex]() {
-        return m_impl->cache.find(segmentIndex) != m_impl->cache.end();
+        return m_impl->cache.find(segmentIndex) != m_impl->cache.end() ||
+               m_impl->failedSegments.find(segmentIndex) != m_impl->failedSegments.end();
     };
-    
+
     if (timeoutMs <= 0) {
         // 無制限待機
         LOG_DEBUG("WaitForSegment: Waiting indefinitely for segment {}", segmentIndex);
         m_impl->segmentAvailableCv.wait(lock, predicate);
-        LOG_DEBUG("WaitForSegment: Segment {} now available after indefinite wait", segmentIndex);
-        return true;
+
+        bool cached = m_impl->cache.find(segmentIndex) != m_impl->cache.end();
+        if (cached) {
+            LOG_DEBUG("WaitForSegment: Segment {} now available after indefinite wait", segmentIndex);
+        } else {
+            LOG_WARN("WaitForSegment: Segment {} marked as permanently failed after indefinite wait", segmentIndex);
+        }
+        return cached;
     } else {
         // タイムアウト付き待機
         LOG_DEBUG("WaitForSegment: Waiting up to {}ms for segment {}", timeoutMs, segmentIndex);
-        bool result = m_impl->segmentAvailableCv.wait_for(
-            lock, 
+        bool woke = m_impl->segmentAvailableCv.wait_for(
+            lock,
             std::chrono::milliseconds(timeoutMs),
             predicate
         );
-        if (result) {
+
+        if (!woke) {
+            LOG_WARN("WaitForSegment: Timeout waiting for segment {} after {}ms", segmentIndex, timeoutMs);
+            return false;
+        }
+
+        bool cached = m_impl->cache.find(segmentIndex) != m_impl->cache.end();
+        if (cached) {
             LOG_DEBUG("WaitForSegment: Segment {} became available", segmentIndex);
         } else {
-            LOG_WARN("WaitForSegment: Timeout waiting for segment {} after {}ms", segmentIndex, timeoutMs);
+            LOG_WARN("WaitForSegment: Segment {} marked as permanently failed", segmentIndex);
         }
-        return result;
+        return cached;
     }
+}
+
+// =============================================================================
+// 失敗マーク管理（恒久ダウンロード失敗の伝搬）
+// =============================================================================
+
+void HlsSegmentCache::MarkSegmentFailed(int64_t segmentIndex) {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
+    if (!m_impl->initialized || !m_impl->IsValidSegmentIndex(segmentIndex)) {
+        LOG_WARN("MarkSegmentFailed: Invalid or uninitialized segment index {}", segmentIndex);
+        return;
+    }
+
+    m_impl->failedSegments.insert(segmentIndex);
+    LOG_WARN("HlsSegmentCache: Segment {} marked as permanently failed", segmentIndex);
+
+    // 待機中のスレッド（WaitForSegment/ReadSegment）を起床させる
+    m_impl->segmentAvailableCv.notify_all();
+}
+
+bool HlsSegmentCache::IsSegmentFailed(int64_t segmentIndex) const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
+    if (!m_impl->initialized || !m_impl->IsValidSegmentIndex(segmentIndex)) {
+        return false;
+    }
+
+    return m_impl->failedSegments.find(segmentIndex) != m_impl->failedSegments.end();
+}
+
+void HlsSegmentCache::ClearSegmentFailed(int64_t segmentIndex) {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
+    if (!m_impl->initialized || !m_impl->IsValidSegmentIndex(segmentIndex)) {
+        return;
+    }
+
+    m_impl->failedSegments.erase(segmentIndex);
+    LOG_DEBUG("HlsSegmentCache: Cleared failed mark for segment {}", segmentIndex);
 }
 
 const HlsSegment* HlsSegmentCache::GetSegmentInfo(int64_t index) const {

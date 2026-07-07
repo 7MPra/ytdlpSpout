@@ -50,6 +50,31 @@ enum class IOSourceType {
     HttpUrl
 };
 
+/// @brief 内部実装用の純粋関数群（ユニットテストのために公開）
+namespace detail {
+
+/// @brief Content-Rangeヘッダーの値から総バイト数をパースする
+/// @param contentRangeValue Content-Rangeヘッダーの値（例: "bytes 0-0/12345", "bytes 0-0/*"）
+/// @return 総バイト数（"*"や不正な値等、不明な場合は-1）
+int64_t ParseContentRangeTotalSize(const std::string& contentRangeValue);
+
+/// @brief HTTPステータスコードとヘッダーから、コンテンツ長とシーク可否を判定する
+/// @param statusCode HTTPステータスコード（206または200を想定。それ以外は何もしない）
+/// @param headers レスポンスヘッダー（キーは小文字に正規化されている前提）
+/// @param outContentLength [in,out] 判定できた場合のみコンテンツ長で上書きする（それ以外は変更しない）
+/// @param outSeekable [in,out] 判定できた場合のみシーク可否で上書きする（それ以外は変更しない）
+/// @details HEADリクエストが使えない場合のGET Range 0-0フォールバック用。
+///          206の場合はcontent-rangeヘッダーから総バイト数を取得しseekable=trueとする。
+///          200の場合はcontent-lengthヘッダーからサイズを取得しseekable=false
+///          （Rangeが無視されたとみなす）とする。それ以外のステータスでは何もしない。
+void DetermineContentLengthAndSeekable(
+    int statusCode,
+    const std::map<std::string, std::string>& headers,
+    int64_t& outContentLength,
+    bool& outSeekable);
+
+} // namespace detail
+
 /// @brief CustomIOContextクラス
 /// @details HTTP URLからのストリーミング再生をサポートするカスタムAVIOContext
 class CustomIOContext {

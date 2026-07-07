@@ -54,6 +54,12 @@ struct SparseFileCacheConfig {
 /// @param size チャンクサイズ
 using ChunkRequestCallback = std::function<void(int64_t chunkIndex, int64_t byteOffset, size_t size)>;
 
+/// @brief チャンクの再試行上限回数
+/// @details この回数を超えてError状態に遷移したチャンク（GetChunkFailCount() > kMaxChunkFailCount）は
+///          恒久的失敗とみなす。PrefetchSchedulerはこれを超えたチャンクを再リクエストせず、
+///          SparseFileCache::Read()はタイムアウトを待たず即座にエラーを返す。
+constexpr int kMaxChunkFailCount = 2;
+
 /// @brief スパースファイルキャッシュクラス
 class SparseFileCache {
 public:
@@ -92,6 +98,11 @@ public:
     /// @param chunkIndex チャンクインデックス
     /// @param state 新しい状態
     void SetChunkState(int64_t chunkIndex, ChunkState state);
+
+    /// @brief チャンクの失敗回数を取得
+    /// @param chunkIndex チャンクインデックス
+    /// @return Error状態への累積遷移回数（WriteChunk成功時に0にリセットされる）
+    int GetChunkFailCount(int64_t chunkIndex) const;
 
     /// @brief チャンクデータを書き込み
     /// @param chunkIndex チャンクインデックス

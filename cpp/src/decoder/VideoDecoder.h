@@ -106,8 +106,13 @@ public:
     AVFrame* GetCurrentFrame() const;
 
     /// @brief 現在のフレームのPTS（表示時刻）を取得
-    /// @return 秒単位の表示時刻
+    /// @return 秒単位の表示時刻（未確定=AV_NOPTS_VALUEの場合は0.0）
     double GetCurrentPTS() const;
+
+    /// @brief 現在のフレームのPTSを取得（未確定時は失敗を返す）
+    /// @param outPts 出力: 秒単位の表示時刻
+    /// @return PTSが確定している場合true、AV_NOPTS_VALUEの場合false
+    bool TryGetCurrentPTS(double& outPts) const;
 
     /// @brief 現在のフレーム番号を取得
     /// @return フレーム番号（0始まり）
@@ -160,6 +165,13 @@ public:
 private:
     /// @brief 内部クローズ処理（mutex取得済みの状態で呼ぶ）
     void CloseInternal();
+
+    /// @brief MED-2: 実行時にハードウェアデコードが失敗した場合、
+    ///        同じストリームに対してソフトウェアデコーダを開き直す（一度限りのフォールバック）
+    /// @details mutex取得済みの状態（DecodeNextFrame内）から呼ばれる想定。
+    ///          呼び出し元は成功時のみデコードループを継続すること。
+    /// @return ソフトウェアデコーダへの切り替えに成功した場合true
+    bool ReinitializeCodecAsSoftware();
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;

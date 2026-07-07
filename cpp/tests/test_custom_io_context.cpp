@@ -9,6 +9,8 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
+#include <map>
+#include <string>
 #include "io/CustomIOContext.h"
 #include "io/SparseFileCache.h"
 #include "io/ChunkDownloader.h"
@@ -128,6 +130,124 @@ void TestDetectSourceTypeEmpty() {
     TEST_CASE("DetectSourceType with empty string")
     {
         ASSERT_EQ(CustomIOContext::DetectSourceType(""), IOSourceType::Unknown);
+    }
+    TEST_END()
+}
+
+// =============================================================================
+// Content-Rangeパースロジックテスト (H-7: detail::ParseContentRangeTotalSize)
+// =============================================================================
+
+void TestParseContentRangeTotalSizeNormal() {
+    TEST_CASE("ParseContentRangeTotalSize parses total size from a normal Content-Range value")
+    {
+        ASSERT_EQ(detail::ParseContentRangeTotalSize("bytes 0-0/12345"), 12345);
+    }
+    TEST_END()
+}
+
+void TestParseContentRangeTotalSizeUnknownTotal() {
+    TEST_CASE("ParseContentRangeTotalSize returns -1 for an unknown total size (\"*\")")
+    {
+        ASSERT_EQ(detail::ParseContentRangeTotalSize("bytes 0-0/*"), -1);
+    }
+    TEST_END()
+}
+
+void TestParseContentRangeTotalSizeMissingSlash() {
+    TEST_CASE("ParseContentRangeTotalSize returns -1 when there is no '/' separator")
+    {
+        ASSERT_EQ(detail::ParseContentRangeTotalSize("bytes 0-0"), -1);
+    }
+    TEST_END()
+}
+
+void TestParseContentRangeTotalSizeMalformed() {
+    TEST_CASE("ParseContentRangeTotalSize returns -1 for a malformed total size")
+    {
+        ASSERT_EQ(detail::ParseContentRangeTotalSize("bytes 0-0/notanumber"), -1);
+    }
+    TEST_END()
+}
+
+// =============================================================================
+// HEADフォールバック判定ロジックテスト (Issue E: detail::DetermineContentLengthAndSeekable)
+// =============================================================================
+
+void TestDetermineContentLengthAndSeekable206WithContentRange() {
+    TEST_CASE("DetermineContentLengthAndSeekable: 206 with content-range sets size and seekable=true")
+    {
+        std::map<std::string, std::string> headers;
+        headers["content-range"] = "bytes 0-0/123456";
+        int64_t contentLength = -1;
+        bool seekable = false;
+
+        detail::DetermineContentLengthAndSeekable(206, headers, contentLength, seekable);
+
+        ASSERT_EQ(contentLength, 123456);
+        ASSERT_TRUE(seekable);
+    }
+    TEST_END()
+}
+
+void TestDetermineContentLengthAndSeekable206MissingHeader() {
+    TEST_CASE("DetermineContentLengthAndSeekable: 206 without content-range leaves values unchanged")
+    {
+        std::map<std::string, std::string> headers;
+        int64_t contentLength = -1;
+        bool seekable = false;
+
+        detail::DetermineContentLengthAndSeekable(206, headers, contentLength, seekable);
+
+        ASSERT_EQ(contentLength, -1);
+        ASSERT_FALSE(seekable);
+    }
+    TEST_END()
+}
+
+void TestDetermineContentLengthAndSeekable200WithContentLength() {
+    TEST_CASE("DetermineContentLengthAndSeekable: 200 with content-length sets size and seekable=false (Range ignored)")
+    {
+        std::map<std::string, std::string> headers;
+        headers["content-length"] = "654321";
+        int64_t contentLength = -1;
+        bool seekable = true;  // 上書きされることを確認するためtrueで初期化
+
+        detail::DetermineContentLengthAndSeekable(200, headers, contentLength, seekable);
+
+        ASSERT_EQ(contentLength, 654321);
+        ASSERT_FALSE(seekable);
+    }
+    TEST_END()
+}
+
+void TestDetermineContentLengthAndSeekable200MissingHeader() {
+    TEST_CASE("DetermineContentLengthAndSeekable: 200 without content-length leaves size unchanged but sets seekable=false")
+    {
+        std::map<std::string, std::string> headers;
+        int64_t contentLength = -1;
+        bool seekable = true;
+
+        detail::DetermineContentLengthAndSeekable(200, headers, contentLength, seekable);
+
+        ASSERT_EQ(contentLength, -1);
+        ASSERT_FALSE(seekable);
+    }
+    TEST_END()
+}
+
+void TestDetermineContentLengthAndSeekableOtherStatusLeavesValuesUnchanged() {
+    TEST_CASE("DetermineContentLengthAndSeekable: other status codes (e.g. 404) leave values unchanged")
+    {
+        std::map<std::string, std::string> headers;
+        headers["content-length"] = "999";
+        int64_t contentLength = -1;
+        bool seekable = false;
+
+        detail::DetermineContentLengthAndSeekable(404, headers, contentLength, seekable);
+
+        ASSERT_EQ(contentLength, -1);
+        ASSERT_FALSE(seekable);
     }
     TEST_END()
 }
@@ -294,7 +414,22 @@ int main() {
     TestDetectSourceTypeHttps();
     TestDetectSourceTypeLocalFile();
     TestDetectSourceTypeEmpty();
-    
+
+    // Content-Rangeパーステスト
+    std::cout << "\n[Content-Range Parsing Tests]" << std::endl;
+    TestParseContentRangeTotalSizeNormal();
+    TestParseContentRangeTotalSizeUnknownTotal();
+    TestParseContentRangeTotalSizeMissingSlash();
+    TestParseContentRangeTotalSizeMalformed();
+
+    // HEADフォールバック判定ロジックテスト
+    std::cout << "\n[HEAD Fallback Determination Tests]" << std::endl;
+    TestDetermineContentLengthAndSeekable206WithContentRange();
+    TestDetermineContentLengthAndSeekable206MissingHeader();
+    TestDetermineContentLengthAndSeekable200WithContentLength();
+    TestDetermineContentLengthAndSeekable200MissingHeader();
+    TestDetermineContentLengthAndSeekableOtherStatusLeavesValuesUnchanged();
+
     // 初期化・終了テスト
     std::cout << "\n[Initialization Tests]" << std::endl;
     TestInitializeWithInvalidUrl();

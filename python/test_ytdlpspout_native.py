@@ -387,7 +387,7 @@ class TestSliceLoadingStructures:
     def test_config_ex_structure_exists(self):
         """YtdlpSpoutConfigEx 構造体が存在することを確認"""
         from python.ytdlpspout_native import YtdlpSpoutConfigEx
-        
+
         config = YtdlpSpoutConfigEx()
         assert hasattr(config, 'source')
         assert hasattr(config, 'senderName')
@@ -398,6 +398,165 @@ class TestSliceLoadingStructures:
         assert hasattr(config, 'verbose')
         assert hasattr(config, 'slice')
         assert hasattr(config, 'ytdlp')
+
+
+@pytest.mark.skipif(DLL_PATH is None, reason=SKIP_REASON)
+class TestHlsHintConfig:
+    """HLS判定ヒント（FFI拡張、P-1）のテスト"""
+
+    def test_config_ex_has_is_hls_hint_field(self):
+        """YtdlpSpoutConfigEx構造体にisHlsHintフィールドが存在する"""
+        from python.ytdlpspout_native import YtdlpSpoutConfigEx
+
+        config = YtdlpSpoutConfigEx()
+        assert hasattr(config, 'isHlsHint')
+
+    def test_start_ex_accepts_is_hls_argument(self):
+        """start_ex()がis_hls引数を受け取れる（デフォルトNone=自動判定で完全後方互換）"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+        import inspect
+
+        player = YtdlpSpoutNative(DLL_PATH)
+        sig = inspect.signature(player.start_ex)
+        assert 'is_hls' in sig.parameters
+        assert sig.parameters['is_hls'].default is None
+
+    def _capture_is_hls_hint(self, player):
+        """start_exがDLLへ渡すconfig.isHlsHintを横取りするヘルパー
+
+        注: ytdlpspout_start_ex自体はC++側の再生処理まで到達するため、
+        DLL呼び出しをモックしてPython側（ytdlpspout_native.py）の
+        isHlsHint設定ロジックのみを検証する（C++側の再ビルドは不要）。
+        """
+        import ctypes
+        from python.ytdlpspout_native import YtdlpSpoutConfigEx
+
+        captured = {}
+
+        def fake_start_ex(handle, config_ref):
+            ptr = ctypes.cast(config_ref, ctypes.POINTER(YtdlpSpoutConfigEx))
+            captured['isHlsHint'] = ptr.contents.isHlsHint
+            return 0
+
+        player._lib.ytdlpspout_start_ex = fake_start_ex
+        return captured
+
+    def test_start_ex_default_is_hls_none_sets_auto_hint(self):
+        """is_hls省略時はC側にisHlsHint=-1（自動判定）を渡す（完全後方互換）"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+
+        player = YtdlpSpoutNative(DLL_PATH)
+        captured = self._capture_is_hls_hint(player)
+        player.start_ex(source="test.mp4")
+        assert captured['isHlsHint'] == -1
+
+    def test_start_ex_is_hls_true_sets_hint(self):
+        """is_hls=Trueを指定するとC側にisHlsHint=1を渡す"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+
+        player = YtdlpSpoutNative(DLL_PATH)
+        captured = self._capture_is_hls_hint(player)
+        player.start_ex(source="test.mp4", is_hls=True)
+        assert captured['isHlsHint'] == 1
+
+    def test_start_ex_is_hls_false_sets_hint(self):
+        """is_hls=Falseを指定するとC側にisHlsHint=0を渡す"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+
+        player = YtdlpSpoutNative(DLL_PATH)
+        captured = self._capture_is_hls_hint(player)
+        player.start_ex(source="test.mp4", is_hls=False)
+        assert captured['isHlsHint'] == 0
+
+
+@pytest.mark.skipif(DLL_PATH is None, reason=SKIP_REASON)
+class TestStartExSliceDefaults:
+    """PLY-2: start_ex()のスライス関連引数が未指定時にC++側の
+    チューニング済み既定値（ytdlpspout_config_ex_init()が設定する値）を
+    上書きしないことを検証する。
+    """
+
+    def _capture_slice_config(self, player):
+        """start_exがDLLへ渡すconfig.slice構造体を横取りするヘルパー
+
+        _capture_is_hls_hintと同様、ytdlpspout_start_ex自体をモックして
+        Python側（ytdlpspout_native.py）のconfig構築ロジックのみを検証する
+        （C++側の再ビルドは不要）。
+        """
+        import ctypes
+        from python.ytdlpspout_native import YtdlpSpoutConfigEx
+
+        captured = {}
+
+        def fake_start_ex(handle, config_ref):
+            ptr = ctypes.cast(config_ref, ctypes.POINTER(YtdlpSpoutConfigEx))
+            slice_cfg = ptr.contents.slice
+            captured['chunkSize'] = slice_cfg.chunkSize
+            captured['maxCacheMemory'] = slice_cfg.maxCacheMemory
+            captured['maxConcurrentDownloads'] = slice_cfg.maxConcurrentDownloads
+            captured['prefetchChunksAhead'] = slice_cfg.prefetchChunksAhead
+            captured['criticalChunksAhead'] = slice_cfg.criticalChunksAhead
+            captured['enableContinuousDownload'] = slice_cfg.enableContinuousDownload
+            return 0
+
+        player._lib.ytdlpspout_start_ex = fake_start_ex
+        return captured
+
+    def test_start_ex_signature_defaults_slice_args_to_none(self):
+        """start_ex()のスライス関連引数のデフォルトがNone（未指定）である"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+        import inspect
+
+        player = YtdlpSpoutNative(DLL_PATH)
+        sig = inspect.signature(player.start_ex)
+        for name in (
+            'chunk_size', 'max_cache_memory',
+            'max_concurrent_downloads', 'prefetch_chunks_ahead',
+        ):
+            assert name in sig.parameters
+            assert sig.parameters[name].default is None
+
+    def test_start_ex_unspecified_slice_args_keep_cpp_defaults(self):
+        """スライス引数を省略した場合、ytdlpspout_config_ex_init()が設定する
+        C++側のチューニング済み既定値（chunkSize=2MB, maxCacheMemory=256MB,
+        maxConcurrentDownloads=6, prefetchChunksAhead=24等）が維持される"""
+        import ctypes
+        from python.ytdlpspout_native import YtdlpSpoutNative, YtdlpSpoutConfigEx
+
+        player = YtdlpSpoutNative(DLL_PATH)
+
+        # config_ex_initが実際に設定する既定値を先に取得（DLL依存の値をハードコードしない）
+        default_config = YtdlpSpoutConfigEx()
+        player._lib.ytdlpspout_config_ex_init(ctypes.byref(default_config))
+
+        captured = self._capture_slice_config(player)
+        player.start_ex(source="test.mp4")
+
+        assert captured['chunkSize'] == default_config.slice.chunkSize
+        assert captured['maxCacheMemory'] == default_config.slice.maxCacheMemory
+        assert captured['maxConcurrentDownloads'] == default_config.slice.maxConcurrentDownloads
+        assert captured['prefetchChunksAhead'] == default_config.slice.prefetchChunksAhead
+        assert captured['criticalChunksAhead'] == default_config.slice.criticalChunksAhead
+        assert captured['enableContinuousDownload'] == default_config.slice.enableContinuousDownload
+
+    def test_start_ex_explicit_slice_args_override_cpp_defaults(self):
+        """スライス引数を明示的に指定した場合、その値がconfigに反映される"""
+        from python.ytdlpspout_native import YtdlpSpoutNative
+
+        player = YtdlpSpoutNative(DLL_PATH)
+        captured = self._capture_slice_config(player)
+        player.start_ex(
+            source="test.mp4",
+            chunk_size=512 * 1024,
+            max_cache_memory=64 * 1024 * 1024,
+            max_concurrent_downloads=2,
+            prefetch_chunks_ahead=3,
+        )
+
+        assert captured['chunkSize'] == 512 * 1024
+        assert captured['maxCacheMemory'] == 64 * 1024 * 1024
+        assert captured['maxConcurrentDownloads'] == 2
+        assert captured['prefetchChunksAhead'] == 3
 
 
 # スタンドアロン実行用

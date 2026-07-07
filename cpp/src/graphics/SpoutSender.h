@@ -75,9 +75,14 @@ public:
     /// @return 成功した場合true
     bool SetSenderName(const std::string& name);
 
-    /// @brief 送信サイズを変更
-    /// @param width 新しい幅
-    /// @param height 新しい高さ
+    /// @brief 次回のSendTexture呼び出しでSender/共有テクスチャの再作成を強制する
+    /// @details このメソッドはキャッシュ無効化専用であり、width/heightの値自体は
+    ///          保存されない。実際に送信されるサイズは次回 SendTexture() 呼び出し時に
+    ///          渡されたテクスチャの実サイズから決定される。渡す値は「現在のサイズと
+    ///          比較して再作成要否を判定するための値」であり、次回送信サイズの予約
+    ///          ではない点に注意。
+    /// @param width 比較用の幅（現在値と異なる場合に再作成をトリガー）
+    /// @param height 比較用の高さ（現在値と異なる場合に再作成をトリガー）
     /// @return 成功した場合true
     bool SetSize(unsigned int width, unsigned int height);
 

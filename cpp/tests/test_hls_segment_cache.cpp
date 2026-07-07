@@ -339,6 +339,38 @@ bool TestSegmentInfo() {
     TEST_PASS("TestSegmentInfo");
 }
 
+/// @brief セグメント情報にバイトレンジが含まれることのテスト（問題L-3: RequestSegmentへのbyteRange伝搬の前提確認）
+bool TestSegmentInfoIncludesByteRange() {
+    HlsSegmentCacheConfig config;
+    HlsSegmentCache cache(config);
+
+    // バイトレンジ付きのプレイリストを作成
+    M3U8Playlist playlist = CreateTestPlaylist(3, 10.0);
+    playlist.segments[0].byteRangeStart = 0;
+    playlist.segments[0].byteRangeLength = 500000;
+    playlist.segments[1].byteRangeStart = 500000;
+    playlist.segments[1].byteRangeLength = 600000;
+    // セグメント2はバイトレンジ指定なし（-1/0のまま）
+
+    cache.Initialize(playlist);
+
+    const HlsSegment* seg0 = cache.GetSegmentInfo(0);
+    TEST_ASSERT(seg0 != nullptr, "Segment 0 info should exist");
+    TEST_ASSERT(seg0->byteRangeStart == 0, "Segment 0 byteRangeStart should be 0");
+    TEST_ASSERT(seg0->byteRangeLength == 500000, "Segment 0 byteRangeLength should be 500000");
+
+    const HlsSegment* seg1 = cache.GetSegmentInfo(1);
+    TEST_ASSERT(seg1 != nullptr, "Segment 1 info should exist");
+    TEST_ASSERT(seg1->byteRangeStart == 500000, "Segment 1 byteRangeStart should be 500000");
+    TEST_ASSERT(seg1->byteRangeLength == 600000, "Segment 1 byteRangeLength should be 600000");
+
+    const HlsSegment* seg2 = cache.GetSegmentInfo(2);
+    TEST_ASSERT(seg2 != nullptr, "Segment 2 info should exist");
+    TEST_ASSERT(seg2->byteRangeStart == -1, "Segment 2 byteRangeStart should be -1 (unspecified)");
+
+    TEST_PASS("TestSegmentInfoIncludesByteRange");
+}
+
 /// @brief OptimizeForPlaybackテスト
 bool TestOptimizeForPlayback() {
     HlsSegmentCacheConfig config;
@@ -390,29 +422,183 @@ bool TestReadWithTimeout() {
     TEST_PASS("TestReadWithTimeout");
 }
 
-/// @brief 負のインデックスのハンドリングテスト
+/// @brief 負のインデックス・範囲外インデックスのハンドリングテスト
+///
+/// 契約: -1 はfMP4初期化セグメント用の予約値として常に許可される。
+/// -2以下、および総セグメント数以上のインデックスは無効として拒否される。
 bool TestInvalidIndices() {
     HlsSegmentCacheConfig config;
     HlsSegmentCache cache(config);
-    
+
     auto playlist = CreateTestPlaylist(5);
     cache.Initialize(playlist);
-    
-    // 負のインデックス
-    TEST_ASSERT(!cache.IsSegmentCached(-1), "Negative index should not be cached");
-    TEST_ASSERT(cache.GetSegmentInfo(-1) == nullptr, "Negative index should return nullptr");
-    
+
+    // -1 は初期化セグメント専用の正当なインデックス
+    TEST_ASSERT(!cache.IsSegmentCached(-1), "Init segment index -1 should not be cached yet");
+    TEST_ASSERT(cache.GetSegmentInfo(-1) == nullptr,
+                "Index -1 has no playlist HlsSegment info (it's the init segment, not a playlist entry)");
+
+    auto initData = CreateTestSegmentData(100);
+    TEST_ASSERT(cache.WriteSegment(-1, std::move(initData), false),
+                "Writing to index -1 (init segment) should succeed");
+    TEST_ASSERT(cache.IsSegmentCached(-1), "Init segment (-1) should be cached after write");
+
+    auto readInit = cache.ReadSegment(-1, 0);
+    TEST_ASSERT(readInit.has_value(), "ReadSegment(-1) should return the init segment data");
+
+    // -2以下は無効なインデックスとして拒否される
+    TEST_ASSERT(!cache.IsSegmentCached(-2), "Index -2 should not be cached");
     auto data = CreateTestSegmentData(100);
-    TEST_ASSERT(!cache.WriteSegment(-1, std::move(data), false), 
-                "Writing to negative index should fail");
-    
-    // 範囲外のインデックス
+    TEST_ASSERT(!cache.WriteSegment(-2, std::move(data), false),
+                "Writing to index -2 should fail");
+
+    // 範囲外のインデックス（総セグメント数以上）
     TEST_ASSERT(!cache.IsSegmentCached(100), "Out-of-range index should not be cached");
     data = CreateTestSegmentData(100);
     TEST_ASSERT(!cache.WriteSegment(100, std::move(data), false),
                 "Writing to out-of-range index should fail");
-    
+
+    // 境界値：総セグメント数と同じインデックスも範囲外
+    data = CreateTestSegmentData(100);
+    TEST_ASSERT(!cache.WriteSegment(5, std::move(data), false),
+                "Writing to index == total segment count should fail");
+
     TEST_PASS("TestInvalidIndices");
+}
+
+/// @brief 失敗マークAPIの基本テスト（マーク→即時失敗、クリア→通常動作）
+bool TestSegmentFailedMarking() {
+    HlsSegmentCacheConfig config;
+    HlsSegmentCache cache(config);
+
+    auto playlist = CreateTestPlaylist(5);
+    cache.Initialize(playlist);
+
+    // 初期状態では失敗マークされていない
+    TEST_ASSERT(!cache.IsSegmentFailed(0), "Segment 0 should not be marked failed initially");
+
+    // セグメント0を失敗マーク
+    cache.MarkSegmentFailed(0);
+    TEST_ASSERT(cache.IsSegmentFailed(0), "Segment 0 should be marked failed after MarkSegmentFailed");
+
+    // 失敗マーク済みセグメントへのWaitForSegmentはタイムアウトを待たずに即座にfalse
+    auto start = std::chrono::steady_clock::now();
+    bool waitResult = cache.WaitForSegment(0, 5000);  // 5秒タイムアウトだが即時返るはず
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    TEST_ASSERT(!waitResult, "WaitForSegment should return false for a failed segment");
+    TEST_ASSERT(elapsed < 500, "WaitForSegment should return immediately for a failed segment, not wait for timeout");
+
+    // ReadSegmentも同様に即座にnulloptを返す
+    start = std::chrono::steady_clock::now();
+    auto readResult = cache.ReadSegment(0, 5000);
+    elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    TEST_ASSERT(!readResult.has_value(), "ReadSegment should return nullopt for a failed segment");
+    TEST_ASSERT(elapsed < 500, "ReadSegment should return immediately for a failed segment, not wait for timeout");
+
+    // 失敗マークを解除すると通常動作に戻る
+    cache.ClearSegmentFailed(0);
+    TEST_ASSERT(!cache.IsSegmentFailed(0), "Segment 0 should not be marked failed after ClearSegmentFailed");
+
+    // クリア後に書き込めば正常にキャッシュされる
+    auto data = CreateTestSegmentData(1024, 0x11);
+    TEST_ASSERT(cache.WriteSegment(0, std::move(data), false),
+                "WriteSegment should succeed after clearing the failed mark");
+    TEST_ASSERT(cache.IsSegmentCached(0), "Segment 0 should be cached after successful write");
+
+    auto readData = cache.ReadSegment(0, 0);
+    TEST_ASSERT(readData.has_value(), "ReadSegment should succeed after clearing the failed mark and writing");
+
+    TEST_PASS("TestSegmentFailedMarking");
+}
+
+/// @brief 失敗マーク後、別スレッドで待機中のWaitForSegment/ReadSegmentが起床することのテスト
+bool TestSegmentFailedWakesWaiters() {
+    HlsSegmentCacheConfig config;
+    HlsSegmentCache cache(config);
+
+    auto playlist = CreateTestPlaylist(5);
+    cache.Initialize(playlist);
+
+    std::atomic<bool> waitStarted{false};
+    std::atomic<bool> waitCompleted{false};
+    std::atomic<bool> waitResultValue{true};
+    std::atomic<int64_t> elapsedMs{0};
+
+    std::thread waitThread([&]() {
+        waitStarted = true;
+        auto start = std::chrono::steady_clock::now();
+        bool result = cache.WaitForSegment(1, 10000);  // 10秒タイムアウト
+        elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        waitResultValue = result;
+        waitCompleted = true;
+    });
+
+    while (!waitStarted) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    TEST_ASSERT(!waitCompleted, "WaitForSegment should still be waiting before MarkSegmentFailed");
+
+    // 別スレッドから失敗マークを行い、待機中のスレッドを起床させる
+    cache.MarkSegmentFailed(1);
+
+    waitThread.join();
+
+    TEST_ASSERT(waitCompleted, "WaitForSegment should complete after MarkSegmentFailed");
+    TEST_ASSERT(!waitResultValue, "WaitForSegment should return false since the segment failed permanently");
+    TEST_ASSERT(elapsedMs < 2000, "WaitForSegment should wake up quickly after failure mark, not wait for full timeout");
+
+    TEST_PASS("TestSegmentFailedWakesWaiters");
+}
+
+/// @brief WriteSegmentの成功が失敗マークを解除することのテスト（自動復旧の前提条件）
+bool TestSuccessfulWriteClearsFailedMark() {
+    HlsSegmentCacheConfig config;
+    HlsSegmentCache cache(config);
+
+    auto playlist = CreateTestPlaylist(5);
+    cache.Initialize(playlist);
+
+    cache.MarkSegmentFailed(2);
+    TEST_ASSERT(cache.IsSegmentFailed(2), "Segment 2 should be marked failed");
+
+    // 再ダウンロードが成功して書き込まれた場合、失敗マークは自動的に解除される
+    auto data = CreateTestSegmentData(512, 0x99);
+    TEST_ASSERT(cache.WriteSegment(2, std::move(data), false), "WriteSegment should succeed");
+    TEST_ASSERT(!cache.IsSegmentFailed(2), "Successful WriteSegment should clear the failed mark");
+    TEST_ASSERT(cache.IsSegmentCached(2), "Segment 2 should now be cached");
+
+    TEST_PASS("TestSuccessfulWriteClearsFailedMark");
+}
+
+/// @brief 失敗マークAPIの無効インデックスに対する挙動テスト
+bool TestSegmentFailedInvalidIndices() {
+    HlsSegmentCacheConfig config;
+    HlsSegmentCache cache(config);
+
+    auto playlist = CreateTestPlaylist(5);
+    cache.Initialize(playlist);
+
+    // -1（初期化セグメント）は失敗マークAPIでも有効
+    cache.MarkSegmentFailed(-1);
+    TEST_ASSERT(cache.IsSegmentFailed(-1), "Index -1 (init segment) should support failed marking");
+    cache.ClearSegmentFailed(-1);
+    TEST_ASSERT(!cache.IsSegmentFailed(-1), "Index -1 failed mark should be clearable");
+
+    // -2以下・範囲外は無効なインデックスとして扱われ、常にfalseを返す
+    cache.MarkSegmentFailed(-2);
+    TEST_ASSERT(!cache.IsSegmentFailed(-2), "Index -2 is invalid; IsSegmentFailed should always return false");
+
+    cache.MarkSegmentFailed(100);
+    TEST_ASSERT(!cache.IsSegmentFailed(100), "Out-of-range index is invalid; IsSegmentFailed should always return false");
+
+    TEST_PASS("TestSegmentFailedInvalidIndices");
 }
 
 /// @brief WaitForSegmentテスト - 即時利用可能
@@ -568,6 +754,7 @@ int main() {
     runTest(TestThreadSafety, "TestThreadSafety");
     runTest(TestMemoryLimit, "TestMemoryLimit");
     runTest(TestSegmentInfo, "TestSegmentInfo");
+    runTest(TestSegmentInfoIncludesByteRange, "TestSegmentInfoIncludesByteRange");
     runTest(TestOptimizeForPlayback, "TestOptimizeForPlayback");
     runTest(TestReadWithTimeout, "TestReadWithTimeout");
     runTest(TestInvalidIndices, "TestInvalidIndices");
@@ -575,6 +762,10 @@ int main() {
     runTest(TestWaitForSegmentTimeout, "TestWaitForSegmentTimeout");
     runTest(TestWaitForSegmentWakeOnWrite, "TestWaitForSegmentWakeOnWrite");
     runTest(TestWaitForSegmentNoTimeout, "TestWaitForSegmentNoTimeout");
+    runTest(TestSegmentFailedMarking, "TestSegmentFailedMarking");
+    runTest(TestSegmentFailedWakesWaiters, "TestSegmentFailedWakesWaiters");
+    runTest(TestSuccessfulWriteClearsFailedMark, "TestSuccessfulWriteClearsFailedMark");
+    runTest(TestSegmentFailedInvalidIndices, "TestSegmentFailedInvalidIndices");
     
     std::cout << std::endl;
     std::cout << "=== Test Results ===" << std::endl;

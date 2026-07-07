@@ -35,6 +35,7 @@ struct SparseFileCache::Impl {
         std::vector<uint8_t> data;
         ChunkState state = ChunkState::Empty;
         int64_t lastAccessTime = 0;  // ミリ秒単位のタイムスタンプ
+        int failCount = 0;          // Error状態への累積遷移回数（WriteChunk成功時にリセット）
     };
     
     // チャンクデータマップ（chunkIndex -> ChunkData）
@@ -216,9 +217,34 @@ void SparseFileCache::SetChunkState(int64_t chunkIndex, ChunkState state) {
     auto& chunk = m_impl->chunks[chunkIndex];
     ChunkState oldState = chunk.state;
     chunk.state = state;
-    
+
+    if (state == ChunkState::Error) {
+        // 失敗回数を記録する。WriteChunk成功（Cached）まで保持される
+        chunk.failCount++;
+    }
+
     LOG_TRACE("Chunk {} state changed: {} -> {}",
               chunkIndex, static_cast<int>(oldState), static_cast<int>(state));
+
+    if (state == ChunkState::Error) {
+        // Error遷移を待機中のRead/WaitForChunkへ即座に伝え、
+        // タイムアウトまで無駄に待たせないようにする
+        m_impl->chunkAvailableCv.notify_all();
+    }
+}
+
+int SparseFileCache::GetChunkFailCount(int64_t chunkIndex) const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
+    if (!m_impl->initialized || chunkIndex < 0 || chunkIndex >= m_impl->chunkCount) {
+        return 0;
+    }
+
+    auto it = m_impl->chunks.find(chunkIndex);
+    if (it == m_impl->chunks.end()) {
+        return 0;
+    }
+    return it->second.failCount;
 }
 
 // =============================================================================
@@ -286,7 +312,8 @@ bool SparseFileCache::WriteChunk(int64_t chunkIndex, const uint8_t* data, size_t
     chunk.data.assign(data, data + size);
     chunk.state = ChunkState::Cached;
     chunk.lastAccessTime = Impl::GetCurrentTimeMs();
-    
+    chunk.failCount = 0;  // 成功したので失敗カウントをリセット
+
     m_impl->memoryUsed += size;
     m_impl->cachedChunkCount++;
     
@@ -363,6 +390,16 @@ int64_t SparseFileCache::Read(int64_t offset, uint8_t* buffer, size_t size, int 
         // チャンクがキャッシュされるまで待機
         auto it = m_impl->chunks.find(chunkIndex);
         while (it == m_impl->chunks.end() || it->second.state != ChunkState::Cached) {
+            // 再試行上限を超えて恒久的に失敗したチャンクは、タイムアウトを待たず
+            // 即座にエラーを返す（無限リトライ・無限EAGAINストールを防ぐ）
+            if (it != m_impl->chunks.end() &&
+                it->second.state == ChunkState::Error &&
+                it->second.failCount > kMaxChunkFailCount) {
+                LOG_ERROR("Read: chunk {} permanently failed (failCount={}), aborting read",
+                          chunkIndex, it->second.failCount);
+                return bytesRead > 0 ? static_cast<int64_t>(bytesRead) : -1;
+            }
+
             if (timeoutMs == 0) {
                 // タイムアウトなし - 無限待機
                 m_impl->chunkAvailableCv.wait(lock);

@@ -138,6 +138,10 @@ public:
     // =========================================================================
 
     /// @brief URLがyt-dlp対応かどうか判定
+    /// @details http(s) URLで、既知サイトのドメインまたはパス末尾が既知の直接メディア
+    ///          拡張子（.mp4/.m3u8等）でないものをyt-dlp解決対象とする
+    ///          （python/ytdlp_resolver.py の is_ytdlp_url と同じ反転ロジック）。
+    ///          ローカルパスや非http(s)スキームは常にfalse。
     /// @param url URL
     /// @return 対応している場合true
     static bool IsSupportedUrl(const std::string& url);
@@ -146,6 +150,15 @@ public:
     /// @param pathOrUrl パスまたはURL
     /// @return ソースタイプ
     static SourceType GetSourceType(const std::string& pathOrUrl);
+
+    /// @brief Windows CreateProcess用のコマンドライン引数クオート
+    /// @details MSDN「Parsing C++ Command-Line Arguments」のCommandLineToArgvW互換規則に
+    ///          従い、引数を必ず " で囲み、内部の \ と " を正しくエスケープする。
+    ///          これにより引数中のスペース/"/&/^/%等がコマンドラインを破壊せず
+    ///          単一の引数として子プロセスに渡る（コマンド/引数インジェクション対策）。
+    /// @param arg クオート対象の引数（未加工文字列）
+    /// @return クオート・エスケープ済みの引数文字列（前後の"を含む）
+    static std::string QuoteWinArg(const std::string& arg);
 
 private:
     /// @brief yt-dlpコマンドを実行

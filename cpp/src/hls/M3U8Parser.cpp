@@ -99,6 +99,13 @@ std::optional<M3U8Playlist> M3U8Parser::Parse(
             auto key = ParseKeyTag(line, baseUrl);
             if (key.has_value()) {
                 if (key->method != "NONE") {
+                    // 既に鍵が設定済みで、URIまたはIVが異なる場合は鍵ローテーションとみなす
+                    // （スライスローダーは単一鍵前提のため、検出時はフォールバックの判断材料にする）
+                    if (playlist.encryptionKey.has_value() &&
+                        (playlist.encryptionKey->keyUrl != key->keyUrl ||
+                         playlist.encryptionKey->iv != key->iv)) {
+                        playlist.hasKeyRotation = true;
+                    }
                     playlist.encryptionKey = key;
                 } else {
                     // METHOD=NONEは暗号化なしを意味する
@@ -238,6 +245,12 @@ std::string M3U8Parser::ResolveUrl(
                    [](unsigned char c) { return std::tolower(c); });
     if (lowerUrl.find("http://") == 0 || lowerUrl.find("https://") == 0) {
         return relativeUrl;
+    }
+
+    // スキーム相対URL（//host/path） - baseUrlのスキームを付与する
+    // （ルート相対パス判定より先に行う必要がある。"//"は"/"で始まるため）
+    if (relativeUrl.size() >= 2 && relativeUrl[0] == '/' && relativeUrl[1] == '/') {
+        return GetUrlScheme(baseUrl) + relativeUrl;
     }
 
     // ルート相対パス（/で始まる）
@@ -430,27 +443,45 @@ std::vector<uint8_t> M3U8Parser::ParseHexString(const std::string& hexStr) {
 }
 
 std::string M3U8Parser::GetBasePath(const std::string& url) {
+    // クエリ文字列('?')やフラグメント('#')以降を先に除去してから処理する
+    // （クエリ内に'/'が含まれる場合、rfind('/')がそこに引っかかってしまうため）
+    size_t pathEnd = url.find_first_of("?#");
+    std::string pathPart = (pathEnd == std::string::npos) ? url : url.substr(0, pathEnd);
+
     // 最後の/までのパスを取得
-    size_t lastSlash = url.rfind('/');
+    size_t lastSlash = pathPart.rfind('/');
     if (lastSlash != std::string::npos && lastSlash > 8) {
-        return url.substr(0, lastSlash + 1);
+        return pathPart.substr(0, lastSlash + 1);
     }
-    return url;
+    return pathPart;
 }
 
 std::string M3U8Parser::GetUrlOrigin(const std::string& url) {
+    // クエリ文字列やフラグメント以降を先に除去してから処理する
+    size_t pathEnd = url.find_first_of("?#");
+    std::string pathPart = (pathEnd == std::string::npos) ? url : url.substr(0, pathEnd);
+
     // スキーム（http:// または https://）の後の最初の/を探す
-    size_t schemeEnd = url.find("://");
+    size_t schemeEnd = pathPart.find("://");
     if (schemeEnd == std::string::npos) {
         return "";
     }
 
-    size_t pathStart = url.find('/', schemeEnd + 3);
+    size_t pathStart = pathPart.find('/', schemeEnd + 3);
     if (pathStart == std::string::npos) {
-        return url;
+        return pathPart;
     }
 
-    return url.substr(0, pathStart);
+    return pathPart.substr(0, pathStart);
+}
+
+std::string M3U8Parser::GetUrlScheme(const std::string& url) {
+    // "https://..." -> "https:"（コロンを含み、スラッシュ2つは含まない）
+    size_t schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos) {
+        return "https:";  // スキームが見つからない場合のフォールバック
+    }
+    return url.substr(0, schemeEnd + 1);
 }
 
 // =============================================================================

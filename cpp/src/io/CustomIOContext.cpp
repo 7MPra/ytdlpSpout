@@ -28,6 +28,67 @@ namespace io {
 static constexpr size_t DEFAULT_AVIO_BUFFER_SIZE = 32 * 1024;  // 32KB
 
 // =============================================================================
+// テスト可能な純粋関数（detail名前空間、宣言はCustomIOContext.h参照）
+// =============================================================================
+
+namespace detail {
+
+int64_t ParseContentRangeTotalSize(const std::string& contentRangeValue) {
+    size_t slashPos = contentRangeValue.find('/');
+    if (slashPos == std::string::npos) {
+        return -1;
+    }
+
+    std::string totalStr = contentRangeValue.substr(slashPos + 1);
+    while (!totalStr.empty() && totalStr.front() == ' ') {
+        totalStr.erase(0, 1);
+    }
+    while (!totalStr.empty() && totalStr.back() == ' ') {
+        totalStr.pop_back();
+    }
+
+    if (totalStr.empty() || totalStr == "*") {
+        return -1;
+    }
+
+    try {
+        return std::stoll(totalStr);
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+void DetermineContentLengthAndSeekable(
+    int statusCode,
+    const std::map<std::string, std::string>& headers,
+    int64_t& outContentLength,
+    bool& outSeekable)
+{
+    if (statusCode == 206) {
+        auto it = headers.find("content-range");
+        int64_t total = (it != headers.end())
+            ? ParseContentRangeTotalSize(it->second)
+            : -1;
+        if (total > 0) {
+            outContentLength = total;
+            outSeekable = true;
+        }
+    } else if (statusCode == 200) {
+        auto it = headers.find("content-length");
+        if (it != headers.end()) {
+            try {
+                outContentLength = std::stoll(it->second);
+            } catch (const std::exception&) {
+                outContentLength = -1;
+            }
+        }
+        outSeekable = false;  // Rangeが無視されたためシーク不可扱い
+    }
+}
+
+} // namespace detail
+
+// =============================================================================
 // 実装クラス
 // =============================================================================
 struct CustomIOContext::Impl {
@@ -146,23 +207,46 @@ bool CustomIOContext::InitializeHttp() {
     // HEADリクエストでContent-Lengthを取得（ヘッダー付き）
     LOG_DEBUG("Fetching content info via HEAD request...");
     HttpResponse headResponse = m_impl->httpClient->Head(m_impl->url);
-    
-    if (!headResponse.success) {
-        LOG_ERROR("HEAD request failed: {}", headResponse.errorMessage);
-        return false;
+
+    if (headResponse.success && headResponse.contentLength > 0) {
+        m_impl->contentLength = headResponse.contentLength;
+        m_impl->seekable = headResponse.acceptsRanges;
+    } else {
+        // HEAD非対応（405/403を返す等）またはContent-Length不明なCDN向けのフォールバック:
+        // GET Range 0-0 を発行し、レスポンスからサイズとシーク可否を判定する。
+        // ここではGetRangeStreamingを使い、ボディは破棄（メモリに蓄積しない）しつつ、
+        // 最初のデータ到着時点で転送を打ち切る。これにより、Rangeを無視して
+        // 200+全ボディを返すサーバーでも、巨大な動画ファイル全体をメモリにバッファ
+        // したり、ダウンロード完了まで待たされたりすることを防ぐ。
+        // ステータス/ヘッダー（content-range/content-length）はボディ受信前に
+        // 確定しているため、中断してもサイズ判定には支障がない。
+        LOG_WARN("HEAD request failed or contentLength unknown ({}), falling back to GET Range 0-0 (streaming)",
+                 headResponse.errorMessage);
+
+        auto discardDataCallback = [](const uint8_t* /*data*/, size_t /*size*/) {
+            // ボディ内容は不要。ステータス/ヘッダーのみ使用するため破棄する。
+        };
+        auto abortAfterFirstByteCallback = [](int64_t downloaded, int64_t /*total*/) -> bool {
+            // ヘッダーは既に取得済みのはずなので、ボディが流れ始めたら即座に中断する
+            return downloaded == 0;
+        };
+
+        HttpResponse rangeResponse = m_impl->httpClient->GetRangeStreaming(
+            m_impl->url, 0, 0, discardDataCallback, abortAfterFirstByteCallback);
+
+        detail::DetermineContentLengthAndSeekable(
+            rangeResponse.statusCode, rangeResponse.headers,
+            m_impl->contentLength, m_impl->seekable);
     }
-    
-    m_impl->contentLength = headResponse.contentLength;
-    m_impl->seekable = headResponse.acceptsRanges;
-    
-    LOG_INFO("Content-Length: {}, Seekable: {}", 
+
+    LOG_INFO("Content-Length: {}, Seekable: {}",
              m_impl->contentLength, m_impl->seekable);
-    
+
     if (m_impl->contentLength <= 0) {
         LOG_ERROR("Invalid content length: {}", m_impl->contentLength);
         return false;
     }
-    
+
     // SparseFileCacheを初期化
     SparseFileCacheConfig cacheConfig;
     cacheConfig.chunkSize = m_impl->config.chunkSize;

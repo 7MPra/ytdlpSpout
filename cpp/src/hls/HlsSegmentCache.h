@@ -8,6 +8,12 @@
 //   - AES-128-CBC復号のサポート
 //   - 時間→セグメントインデックス変換
 //   - スレッドセーフな読み書き
+//   - 恒久ダウンロード失敗の伝搬（MarkSegmentFailed等）
+//
+// セグメントインデックスの契約:
+//   - 0以上: プレイリスト上の通常セグメント（GetTotalSegmentCount()未満であること）
+//   - -1  : fMP4初期化セグメント（#EXT-X-MAP）を表す特別な予約値。常に許可される。
+//   - -2以下、または総セグメント数以上: 無効なインデックス。書き込み/読み取りは失敗する。
 //
 // 使用例:
 //   HlsSegmentCacheConfig config;
@@ -96,32 +102,54 @@ public:
     // =========================================================================
     
     /// @brief セグメントデータを書き込み
-    /// @param segmentIndex セグメントインデックス（0始まり）
+    /// @param segmentIndex セグメントインデックス（0始まり。-1はfMP4初期化セグメント用の予約値として許可）
     /// @param data 暗号化されたまたは生データ
     /// @param isEncrypted 暗号化済みデータかどうか
-    /// @return 成功時true
+    /// @return 成功時true（-2以下または総セグメント数以上のインデックスはfalse）
     bool WriteSegment(int64_t segmentIndex, std::vector<uint8_t>&& data, bool isEncrypted);
-    
+
     /// @brief セグメントデータを読み取り（復号済み、LRU更新）
-    /// @param segmentIndex セグメントインデックス
+    /// @param segmentIndex セグメントインデックス（-1は初期化セグメント）
     /// @param timeoutMs 待機タイムアウト（0=即時、-1=無制限）
-    /// @return データ（キャッシュミス/タイムアウト時nullopt）
+    /// @return データ（キャッシュミス/タイムアウト/失敗マーク済み/無効インデックス時nullopt）
     std::optional<std::vector<uint8_t>> ReadSegment(int64_t segmentIndex, int timeoutMs = 0);
-    
+
     // =========================================================================
     // 状態確認
     // =========================================================================
-    
+
     /// @brief キャッシュ済みか確認
-    /// @param segmentIndex セグメントインデックス
+    /// @param segmentIndex セグメントインデックス（-1は初期化セグメント）
     /// @return キャッシュ済みならtrue
     bool IsSegmentCached(int64_t segmentIndex) const;
-    
+
     /// @brief 指定セグメントがキャッシュされるまで待機
-    /// @param segmentIndex セグメントインデックス
+    /// @param segmentIndex セグメントインデックス（-1は初期化セグメント）
     /// @param timeoutMs タイムアウト（0=無制限、正の値=タイムアウト）
-    /// @return キャッシュされたらtrue、タイムアウトでfalse
+    /// @return キャッシュされたらtrue、タイムアウト・失敗マーク済み・無効インデックスでfalse
+    ///         （恒久失敗としてマークされている場合はタイムアウトを待たずに即座にfalseを返す）
     bool WaitForSegment(int64_t segmentIndex, int timeoutMs = 0);
+
+    // =========================================================================
+    // 失敗マーク管理（恒久ダウンロード失敗の伝搬）
+    // =========================================================================
+
+    /// @brief セグメントを恒久的なダウンロード失敗としてマークする
+    ///
+    /// ダウンロードのリトライが尽きて最終的に失敗した場合に呼び出す。
+    /// 待機中の WaitForSegment() / ReadSegment() を即座に起床させ、
+    /// タイムアウトを待たずに失敗を通知できるようにする。
+    /// @param segmentIndex セグメントインデックス（-1は初期化セグメント）
+    void MarkSegmentFailed(int64_t segmentIndex);
+
+    /// @brief セグメントが恒久失敗としてマーク済みか確認
+    /// @param segmentIndex セグメントインデックス（-1は初期化セグメント）
+    /// @return マーク済みならtrue
+    bool IsSegmentFailed(int64_t segmentIndex) const;
+
+    /// @brief セグメントの失敗マークを解除する（再ダウンロード試行時に使用）
+    /// @param segmentIndex セグメントインデックス（-1は初期化セグメント）
+    void ClearSegmentFailed(int64_t segmentIndex);
     
     /// @brief セグメント情報を取得
     /// @param index セグメントインデックス

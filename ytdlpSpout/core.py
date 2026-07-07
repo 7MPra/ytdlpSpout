@@ -260,7 +260,20 @@ class Streamer:
         # ... (このメソッドは変更なし)
         os.makedirs("data", exist_ok=True)
         cookie_file = os.path.join("data", "cookies.txt")
-        format_str, codec_info = get_optimal_format_string()
+
+        # python/ytdlp_resolver.py の実装（single-format-first判定・Referer付与・
+        # Cookieドメインスコープ）を共有し、二重実装による乖離を防ぐ
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        if YtDlpAsyncResolver._use_single_format_first(self.video_url):
+            # HLSのみ提供するサイト（ニコニコ動画など）向け：bestvideo+bestaudioの
+            # 合成フォーマットが使えず「Requested format is not available」になるため、
+            # best優先のフォーマット文字列を使う
+            format_str = YtDlpAsyncResolver.SINGLE_FORMAT_FIRST_FORMAT_STRING
+            codec_info = "単一フォーマット優先（HLS単体配信サイト向け）"
+        else:
+            format_str, codec_info = get_optimal_format_string()
+
         if self.verbose:
             self.log(f"コーデック対応状況: {codec_info}")
             self.log(f"Cookieファイルとして'{cookie_file}'を使用します。")
@@ -296,22 +309,7 @@ class Streamer:
             return False
 
         self.stream_url = info.get("url")
-        self.http_headers = info.get("http_headers", {})
-        
-        # Cookieをヘッダーに追加
-        if hasattr(ydl, 'cookiejar'):
-            cookies = []
-            for cookie in ydl.cookiejar:
-                cookies.append(f"{cookie.name}={cookie.value}")
-            if cookies:
-                cookie_header = "; ".join(cookies)
-                # 既存のCookieがあれば維持しつつ追加（上書きせず）
-                if 'Cookie' in self.http_headers:
-                     self.log(f"既存のCookieヘッダーが見つかりました、今回取得したCookieで更新します。")
-                     self.http_headers['Cookie'] = cookie_header # ここではシンプルに置き換えを選択（通常yt-dlpが正）
-                else:
-                    self.http_headers['Cookie'] = cookie_header
-                # self.log(f"Cookieをヘッダーに注入しました: {len(cookies)}個")
+        self.http_headers = info.get("http_headers", {}) or {}
 
         if not self.stream_url:
             rf = info.get("requested_formats")
@@ -321,6 +319,24 @@ class Streamer:
                         self.stream_url = f.get("url")
                         self.http_headers = f.get("http_headers", {}) or self.http_headers
                         break
+
+        # Cookieをヘッダーに追加
+        # yt-dlpが既にCookieヘッダーを計算している場合はそれを尊重し上書きしない。
+        # ない場合のみ、stream_urlのホストにドメインマッチするCookieだけを連結する
+        # （cookiejar全体をドメイン無視で連結すると他サイトのCookieが漏えいしたり、
+        #  yt-dlp計算済みのCookieヘッダーを壊してしまうため）
+        if self.stream_url and 'Cookie' not in self.http_headers and hasattr(ydl, 'cookiejar'):
+            cookie_header = YtDlpAsyncResolver._build_cookie_header(
+                ydl.cookiejar, YtDlpAsyncResolver._host_for_url(self.stream_url)
+            )
+            if cookie_header:
+                self.http_headers['Cookie'] = cookie_header
+
+        # 参照元ヘッダーが必要なソースのみ付与（例: ニコニコ動画CDNは要Referer、無いと403）
+        if self.stream_url:
+            referer = YtDlpAsyncResolver._referer_for_url(self.video_url)
+            if referer and "Referer" not in self.http_headers:
+                self.http_headers["Referer"] = referer
 
         self.is_live = bool(info.get("is_live"))
         self.duration = info.get('duration', 0.0)
@@ -433,9 +449,54 @@ class Streamer:
 
     def stop(self):
         self.stop_event.set()
+        # run()のメインループが self.proc.stdout.read() 等でブロックしている場合、
+        # スレッド経由の自然終了（run()のfinallyでのcleanup()呼び出し）だけに頼ると
+        # thread.join()がタイムアウトしてもffmpegプロセスが生き残り、ゾンビ化・
+        # 停止遅延の原因になる。そのためここでプロセスを直接terminate/killで
+        # 確実に終了させる（cleanup()側でも同じ処理を行うが、poll()チェックにより
+        # 二重kill/waitにはならない）。
+        if self.proc:
+            self._terminate_ffmpeg_process(self.proc)
         if self.thread:
             self.thread.join(timeout=2)
         self.thread = None
+
+    def _terminate_ffmpeg_process(self, proc: subprocess.Popen, terminate_timeout: float = 2.0, kill_timeout: float = 2.0) -> None:
+        """
+        ffmpegサブプロセスを確実に終了させる（terminate -> 生存していればkillにエスカレーション）。
+
+        各段階でwait(timeout=)を使い、パイプが満杯で書き込みブロックしているような
+        場合でも無期限に待機せず、必要なら次の段階（kill）に進んで確実にプロセスを
+        回収する。
+        """
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return  # 既に終了済み
+
+        try:
+            proc.terminate()
+        except Exception as e:
+            self.log(f"ffmpegプロセスのterminateに失敗: {e}")
+
+        try:
+            proc.wait(timeout=terminate_timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as e:
+            self.log(f"ffmpegプロセスの終了待機(terminate)に失敗: {e}")
+
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception as e:
+                self.log(f"ffmpegプロセスのkillに失敗: {e}")
+
+            try:
+                proc.wait(timeout=kill_timeout)
+            except Exception as e:
+                self.log(f"ffmpegプロセスの終了待機(kill)に失敗: {e}")
 
     def run(self):
         """メインループ"""
@@ -641,7 +702,6 @@ class Streamer:
                     except Exception: pass
                 if self._stop_cb: self._stop_cb()
                 return False
-                return False
             # Spout init
             if self.owns_spout:
                 import SpoutGL  # 遅延インポート（C++ DLLとの競合回避）
@@ -737,12 +797,8 @@ class Streamer:
     def cleanup(self):
         """リソースのクリーンアップ"""
         self.stop_event.set()
-        try:
-            if self.proc:
-                self.proc.kill()
-                self.proc.wait(timeout=1)
-        except Exception as e:
-            self.log(f"ffmpegプロセスの終了に失敗: {e}")
+        if self.proc:
+            self._terminate_ffmpeg_process(self.proc)
         if self.container:
             try:
                 self.container.close()

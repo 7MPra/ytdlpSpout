@@ -26,6 +26,23 @@ BIN_DIR = "bin"
 CPP_BUILD_DIR = Path("cpp/build")
 PYTHON_DIR = Path("python")
 
+# 配布に必要なC++依存DLL（cpp/build/bin/Release から収集）。
+# gtest.dll / gtest_main.dll（テストフレームワーク用）や、fmtd.dll等のDebugビルド
+# 成果物は配布に含めない（そもそもReleaseビルド出力には含まれない）。
+DIST_REQUIRED_DLLS = [
+    "ytdlpspout.dll",
+    "avcodec-61.dll",
+    "avformat-61.dll",
+    "avutil-59.dll",
+    "swscale-8.dll",
+    "swresample-5.dll",
+    "libcurl.dll",
+    "spdlog.dll",
+    "fmt.dll",
+    "zlib1.dll",
+    "Spout.dll",
+]
+
 
 def build_cpp_dll(skip_if_exists=False):
     """C++ DLL (ytdlpspout.dll) をビルド"""
@@ -60,6 +77,41 @@ def build_cpp_dll(skip_if_exists=False):
         return False
     
     return True
+
+
+def copy_cpp_dependency_dlls():
+    """配布に必要なC++依存DLLを cpp/build/bin/Release から配布ディレクトリへコピー
+
+    PyInstallerのonefileビルド（ytdlpSpout.spec）は python/*.dll を拾って
+    exe自体に埋め込むが、python/ フォルダには開発中に残ったDebugビルドや
+    テスト用DLL（fmtd.dll, gtest*.dll等）が混在し得るため、常に最新かつ
+    Releaseビルドのみを含む cpp/build/bin/Release から明示的にコピーし、
+    配布フォルダ直下（exeと同じ階層）にも配置しておく。
+    """
+    print("C++依存DLLを配布ディレクトリにコピー中...")
+
+    release_dir = CPP_BUILD_DIR / "bin" / "Release"
+    if not release_dir.exists():
+        print(f"警告: C++ Releaseビルドディレクトリが見つかりません: {release_dir.resolve()}")
+        return False
+
+    dist_path = Path(DIST_DIR)
+    dist_path.mkdir(parents=True, exist_ok=True)
+
+    missing = []
+    for dll_name in DIST_REQUIRED_DLLS:
+        src = release_dir / dll_name
+        if src.exists():
+            shutil.copy2(src, dist_path / dll_name)
+            print(f"DLLを配置: {dist_path / dll_name}")
+        else:
+            missing.append(dll_name)
+
+    if missing:
+        print(f"警告: 以下のDLLが {release_dir} に見つかりませんでした: {missing}")
+        print("  C++ Releaseビルドが完了しているか確認してください。")
+
+    return len(missing) == 0
 
 
 def download_ffmpeg():
@@ -129,40 +181,37 @@ def download_yt_dlp():
         raise
 
 def build_exe():
-    """PyInstallerでexeをビルド"""
+    """PyInstallerでexeをビルド
+
+    リポジトリ直下の ytdlpSpout.spec は、1つのspecファイルから
+    GUI版（ytdlpSpoutGUI.exe）・CLI版（ytdlpSpoutCLI.exe）の両方を
+    一括ビルドする（gui.pyを共通のエントリーポイントとして使用し、
+    console=False/Trueの違いでexeを分ける）。
+    """
     print("PyInstallerでexeをビルド中...")
-    
+
     # 既存のdist, buildを削除
     for dir_name in ["dist", "build"]:
         if os.path.exists(dir_name):
             shutil.rmtree(dir_name)
-    
-    # GUI版をビルド
-    print("GUI版をビルド中...")
-    cmd_gui = [
+
+    spec_path = Path("ytdlpSpout.spec")
+    if not spec_path.exists():
+        print(f"エラー: specファイルが見つかりません: {spec_path.resolve()}")
+        return False
+
+    print("GUI版・CLI版をビルド中...")
+    cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
-        "ytdlpSpoutGUI.spec"
+        str(spec_path)
     ]
-    
-    result = subprocess.run(cmd_gui, capture_output=True, text=True)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"GUI版PyInstallerエラー: {result.stderr}")
+        print(f"PyInstallerエラー: {result.stderr}")
         return False
-    
-    # CLI版をビルド
-    print("CLI版をビルド中...")
-    cmd_cli = [
-        sys.executable, "-m", "PyInstaller",
-        "--noconfirm",
-        "ytdlpSpoutCLI.spec"
-    ]
-    
-    result = subprocess.run(cmd_cli, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"CLI版PyInstallerエラー: {result.stderr}")
-        return False
-    
+
     print("exeビルド完了")
     return True
 
@@ -199,15 +248,19 @@ def create_distribution():
         print(f"ライセンスファイルを配置: {dist_path / 'LICENSE.txt'}")
     else:
         print("警告: LICENSEファイルが見つかりません")
-    
 
-    
+    # C++依存DLL（ytdlpspout.dll, ffmpeg, Spout等）をコピー
+    copy_cpp_dependency_dlls()
+
     # READMEを作成
     readme_content = """# ytdlpSpout - YouTube to Spout Streamer
 
 ## 含まれるファイル
 - ytdlpSpoutGUI.exe (GUI版アプリケーション)
 - ytdlpSpoutCLI.exe (コマンドライン版)
+- ytdlpspout.dll / avcodec-61.dll / avformat-61.dll / avutil-59.dll / swscale-8.dll /
+  swresample-5.dll / libcurl.dll / spdlog.dll / fmt.dll / zlib1.dll / Spout.dll
+  (C++ネイティブバックエンドとその依存ライブラリ。exeと同じフォルダに配置してください)
 - bin/ffmpeg.exe (動画処理用)
 - bin/yt-dlp.exe (動画ダウンロード用)
 - bin/*.dll (ffmpeg依存ライブラリ)
@@ -248,7 +301,7 @@ ytdlpSpoutCLI.exe --help
 - Visual C++ Redistributable 2019以降
 
 ## 注意事項
-- binフォルダとexeは同じディレクトリに配置してください
+- binフォルダ・DLLファイル・exeはすべて同じディレクトリに配置してください
 - Spout対応アプリケーション（OBS Studio等）で受信できます
 - yt-dlpはexeに埋め込まれているため、別途インストール不要です
 

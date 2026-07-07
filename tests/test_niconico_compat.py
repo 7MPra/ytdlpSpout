@@ -1,10 +1,9 @@
 """
-test_niconico_compat.py - ニコニコ動画互換性テスト
+test_niconico_compat.py - フォーマット別・互換性テスト
 
-Issue #15: ニコニコ動画再生サポート
-- フォーマット選択ロジックのAAC音声対応テスト
-- Cookie検証テスト
-- HLSストリーム対応テスト
+- 単一フォーマット優先／汎用フォールバックのフォーマット選択
+- Cookie・Referer・HLSストリーム対応
+- 複数サイトのURL検出（yt-dlp対応ドメイン）
 """
 
 import pytest
@@ -61,11 +60,47 @@ class TestFormatSelectionLogic:
             f"YouTube向け優先フォーマットが最初に来ていない: {format_str}"
 
 
-class TestNiconicoUrlDetection:
-    """ニコニコ動画URL検出テスト"""
+class TestSingleFormatFirstSelection:
+    """単一フォーマット優先（フォーマット別特別処理）のテスト"""
     
-    def test_nicovideo_url_detected(self):
-        """ニコニコ動画のURLが正しく検出される"""
+    def test_single_format_first_url_uses_best_leading_format(self):
+        """単一フォーマット優先のURLではフォーマット文字列が best で始まる"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+        
+        resolver = YtDlpAsyncResolver()
+        ydl_opts = resolver._get_ydl_opts("https://www.nicovideo.jp/watch/sm12345678")
+        format_str = ydl_opts.get('format', '')
+        
+        assert format_str.startswith('best/') or format_str == 'best', \
+            f"単一フォーマット優先時は best 先頭であること: {format_str}"
+    
+    def test_other_url_uses_default_format(self):
+        """単一フォーマット優先でないURLでは従来のフォーマット文字列を使う"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+        
+        resolver = YtDlpAsyncResolver()
+        ydl_opts = resolver._get_ydl_opts("https://www.youtube.com/watch?v=test")
+        format_str = ydl_opts.get('format', '')
+        
+        assert format_str.startswith('bestvideo[ext=mp4]+bestaudio[ext=m4a]'), \
+            f"デフォルトは bestvideo+bestaudio 優先: {format_str}"
+    
+    def test_use_single_format_first_detection(self):
+        """_use_single_format_first が対象ホストを正しく判定する"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+        
+        assert YtDlpAsyncResolver._use_single_format_first("https://www.nicovideo.jp/watch/sm1") is True
+        assert YtDlpAsyncResolver._use_single_format_first("https://nico.ms/sm1") is True
+        assert YtDlpAsyncResolver._use_single_format_first("https://live.nicovideo.jp/watch/lv1") is True
+        assert YtDlpAsyncResolver._use_single_format_first("https://www.youtube.com/watch?v=1") is False
+        assert YtDlpAsyncResolver._use_single_format_first("") is False
+
+
+class TestYtdlpUrlDetection:
+    """yt-dlp対象URL検出テスト"""
+    
+    def test_video_site_urls_detected(self):
+        """動画サイトのURLがyt-dlp対象として検出される"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
         
         # 通常の動画URL
@@ -75,11 +110,10 @@ class TestNiconicoUrlDetection:
         # 短縮URL
         assert YtDlpAsyncResolver.is_ytdlp_url("https://nico.ms/sm12345678") is True
     
-    def test_niconico_live_url_detected(self):
-        """ニコニコ生放送のURLが正しく検出される"""
+    def test_live_domain_detected(self):
+        """ライブ配信ドメインのURLが検出される"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
         
-        # ニコ生URL（live.nicovideo.jp）
         assert YtDlpAsyncResolver.is_ytdlp_url("https://live.nicovideo.jp/watch/lv12345678") is True
 
 
@@ -108,7 +142,7 @@ class TestHlsProtocolDetection:
                 'duration': 120.0,
                 'width': 1280,
                 'height': 720,
-                'title': 'ニコニコ動画テスト',
+                'title': 'Test',
                 'protocol': 'm3u8_native'
             }
             mock_ydl_class.return_value = mock_ydl
@@ -118,11 +152,48 @@ class TestHlsProtocolDetection:
             
             assert result is not None
             assert 'm3u8' in result.stream_url or result.stream_url.endswith('.m3u8')
+    
+    def test_referer_added_for_some_sources(self):
+        """参照元ヘッダーが必要なソースでRefererが含まれる"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+        
+        with patch('yt_dlp.YoutubeDL') as mock_ydl_class:
+            mock_ydl = MagicMock()
+            mock_ydl.__enter__ = Mock(return_value=mock_ydl)
+            mock_ydl.__exit__ = Mock(return_value=False)
+            mock_ydl.extract_info.return_value = {
+                'url': 'https://delivery.domand.nicovideo.jp/.../playlist.m3u8',
+                'duration': 60.0,
+                'width': 640,
+                'height': 360,
+                'title': 'テスト',
+                'http_headers': {},
+            }
+            mock_ydl.cookiejar = []
+            mock_ydl_class.return_value = mock_ydl
+            
+            resolver = YtDlpAsyncResolver()
+            result = resolver.resolve_sync("https://www.nicovideo.jp/watch/sm12345678")
+            
+            assert result is not None
+            assert result.http_headers.get('Referer')
 
 
 class TestCookieValidation:
     """Cookie検証テスト"""
-    
+
+    def test_get_default_cookie_file_returns_first_existing(self):
+        """get_default_cookie_file は基準ディレクトリから最初に存在する候補を返す"""
+        from python.ytdlp_resolver import YtDlpAsyncResolver
+
+        # 存在しないディレクトリなら None
+        result = YtDlpAsyncResolver.get_default_cookie_file(Path(__file__).parent / "nonexistent_dir_12345")
+        assert result is None
+        # プロジェクトルートで data/cookies.txt か cookies.txt があればパスが返る（どちらも無ければ None）
+        result = YtDlpAsyncResolver.get_default_cookie_file(Path(__file__).parent.parent)
+        if result is not None:
+            assert "cookies.txt" in result
+
     def test_cookie_file_used_when_provided(self):
         """Cookieファイルが提供された場合に使用される"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
@@ -134,11 +205,11 @@ class TestCookieValidation:
         ydl_opts = resolver._get_ydl_opts()
         assert ydl_opts.get('cookiefile') == cookie_path
     
-    def test_cookie_file_not_set_when_not_provided(self):
-        """Cookieファイルが提供されない場合は設定されない"""
+    def test_cookie_file_not_set_when_disabled(self):
+        """cookie_file='' の場合はCookieを使わない"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
         
-        resolver = YtDlpAsyncResolver()
+        resolver = YtDlpAsyncResolver(cookie_file="")
         ydl_opts = resolver._get_ydl_opts()
         
         assert ydl_opts.get('cookiefile') is None
@@ -181,22 +252,20 @@ class TestCookieValidation:
                 'session_id=', 'user_session=', 'nicosid=', 'SAPISID=', 'SID='
             ]), f"Cookieの内容がログに含まれている: {msg}"
     
-    def test_niconico_cookie_detection_log_removed(self):
-        """ニコニコ動画用Cookie検出ログが削除されていること"""
+    def test_cookie_log_does_not_contain_sensitive_or_service_names(self):
+        """Cookieログに機密や特定サービス名を含まない"""
         from python.ytdlp_resolver import YtDlpAsyncResolver
         
         log_messages = []
         def log_cb(msg):
             log_messages.append(msg)
         
-        cookie_path = "data/cookies.txt"
-        resolver = YtDlpAsyncResolver(cookie_file=cookie_path, log_cb=log_cb)
+        resolver = YtDlpAsyncResolver(cookie_file="data/cookies.txt", log_cb=log_cb)
         resolver._log_cookie_info()
         
-        # 「ニコニコ動画用Cookieを検出」のログが出力されないことを確認
         for msg in log_messages:
-            assert "ニコニコ動画用Cookieを検出" not in msg, \
-                f"削除されるべきログメッセージが見つかりました: {msg}"
+            assert "ニコニコ" not in msg and "niconico" not in msg.lower(), \
+                f"サービス名をログに含めない: {msg}"
 
 
 class TestNativeStreamerWrapperFormat:

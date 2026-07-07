@@ -132,7 +132,14 @@ struct HlsSliceLoadingManager::Impl {
     /// @brief セグメントダウンロードコールバック
     void OnSegmentDownloaded(int64_t index, std::vector<uint8_t>&& data, bool success) {
         if (!success) {
-            LOG_WARN("Segment {} download failed", index);
+            // ChunkDownloader側でリトライ上限（MAX_DOWNLOAD_ATTEMPTS）に達した恒久失敗。
+            // ここで握りつぶすとFFmpeg読み出し側が無限にタイムアウト待ちを繰り返すため、
+            // キャッシュに失敗マークを付け、待機中のHlsCustomAVIOContext::ReadPacketを
+            // タイムアウトを待たずに起床させる。
+            LOG_WARN("Segment {} download failed permanently (retries exhausted), marking as failed", index);
+            if (cache) {
+                cache->MarkSegmentFailed(index);
+            }
             return;
         }
         
@@ -172,14 +179,6 @@ struct HlsSliceLoadingManager::Impl {
         }
     }
     
-    /// @brief URLからベースURLを取得
-    static std::string GetBaseUrl(const std::string& url) {
-        size_t pos = url.rfind('/');
-        if (pos != std::string::npos) {
-            return url.substr(0, pos + 1);
-        }
-        return url;
-    }
 };
 
 // =============================================================================
@@ -243,7 +242,7 @@ bool HlsSliceLoadingManager::Open(const std::string& hlsUrl, const HlsSliceConfi
         if (M3U8Parser::IsMasterPlaylist(m3u8Content)) {
             LOG_INFO("Detected master playlist, selecting best variant...");
             
-            std::string baseUrl = Impl::GetBaseUrl(currentUrl);
+            std::string baseUrl = M3U8Parser::GetBasePath(currentUrl);
             auto masterPlaylist = M3U8Parser::ParseMaster(m3u8Content, baseUrl);
             if (!masterPlaylist || masterPlaylist->variants.empty()) {
                 LOG_ERROR("Failed to parse master playlist or no variants found");
@@ -275,7 +274,7 @@ bool HlsSliceLoadingManager::Open(const std::string& hlsUrl, const HlsSliceConfi
         
         // 3. メディアプレイリストをパース
         LOG_DEBUG("Parsing media playlist content...");
-        std::string baseUrl = Impl::GetBaseUrl(currentUrl);
+        std::string baseUrl = M3U8Parser::GetBasePath(currentUrl);
         auto parsedPlaylist = M3U8Parser::Parse(m3u8Content, baseUrl);
         if (!parsedPlaylist) {
             LOG_ERROR("Failed to parse media playlist");
@@ -292,8 +291,29 @@ bool HlsSliceLoadingManager::Open(const std::string& hlsUrl, const HlsSliceConfi
         
         LOG_INFO("Parsed playlist: {} segments, total duration: {:.2f}s",
                  m_impl->playlist.segments.size(), m_impl->playlist.totalDuration);
-    
-        
+
+        // スライスローダーが正しく扱えないHLSの特性を検出した場合は、ここで明示的に失敗させる。
+        // 呼び出し元(VideoPlayer)はOpen()失敗時にFFmpegネイティブHLSデマクサへフォールバックするため、
+        // ライブ/SAMPLE-AES/鍵ローテーションはFFmpeg側に任せた方が正しく再生できる。
+        if (m_impl->playlist.isLive) {
+            LOG_INFO("HLS slice loading does not support live playlists (no #EXT-X-ENDLIST); "
+                      "falling back to FFmpeg native HLS");
+            return false;
+        }
+
+        if (m_impl->playlist.encryptionKey.has_value() &&
+            m_impl->playlist.encryptionKey->method != "AES-128") {
+            LOG_INFO("HLS slice loading does not support encryption method '{}'; "
+                      "falling back to FFmpeg native HLS", m_impl->playlist.encryptionKey->method);
+            return false;
+        }
+
+        if (m_impl->playlist.hasKeyRotation) {
+            LOG_INFO("HLS slice loading does not support key rotation (#EXT-X-KEY changes mid-playlist); "
+                      "falling back to FFmpeg native HLS");
+            return false;
+        }
+
         // 4. 暗号化キーがある場合はダウンロード
         if (m_impl->playlist.encryptionKey.has_value() &&
             m_impl->playlist.encryptionKey->method == "AES-128") {
@@ -398,25 +418,32 @@ bool HlsSliceLoadingManager::Open(const std::string& hlsUrl, const HlsSliceConfi
             // 必要なセグメントを特定するためのロック
             bool needsRequest = false;
             std::string url;
+            int64_t byteRangeStart = -1;
+            int64_t byteRangeLength = 0;
+            io::ChunkDownloader* downloaderPtr = nullptr;
             {
                 std::lock_guard<std::mutex> lock(m_impl->mutex);
-                if (!m_impl->isOpen || !m_impl->cache) return;
-                
+                if (!m_impl->isOpen || !m_impl->cache || !m_impl->downloader) return;
+
                 if (!m_impl->cache->IsSegmentCached(segmentIndex)) {
                     const auto* info = m_impl->cache->GetSegmentInfo(segmentIndex);
                     if (info) {
                         url = info->url;
+                        byteRangeStart = info->byteRangeStart;
+                        byteRangeLength = info->byteRangeLength;
                         needsRequest = true;
                     }
                 }
-                
+                downloaderPtr = m_impl->downloader.get();
+
                 // プリフェッチのために再生位置更新も行うが、これは非同期で行いたい
                 // ここではとりあえず緊急のターゲットセグメントだけリクエストする
             }
-            
+
             if (needsRequest && !url.empty()) {
                 LOG_DEBUG("FFmpeg seek to segment {}, requesting download (Priority: Critical)", segmentIndex);
-                m_impl->downloader->RequestSegment(url, segmentIndex, io::ChunkPriority::Critical);
+                downloaderPtr->RequestSegment(url, segmentIndex, io::ChunkPriority::Critical,
+                                               byteRangeStart, byteRangeLength);
                 
                 // 周辺セグメントのプリフェッチもトリガー（別スレッドでやると良いかもだが、ここでは簡易的に）
                 // ただしUpdatePlaybackPositionはロックを取るので、ここから呼ぶとデッドロックのリスクがあるか確認が必要
@@ -434,7 +461,57 @@ bool HlsSliceLoadingManager::Open(const std::string& hlsUrl, const HlsSliceConfi
                 UpdatePlaybackPosition(time);
             }
         });
-        
+
+        // セグメント再ダウンロード要求コールバックを設定
+        // （HlsCustomAVIOContext::ReadPacketが恒久失敗セグメントを検出した際、
+        //   タイムアウトを待たずに1回だけ自動復旧を試みるために呼ばれる）
+        m_impl->avioContext->SetOnSegmentRetryCallback([this](int64_t segmentIndex) {
+            // このコールバックはAVIOContext::ReadPacket内から、AVIOContext自身のロックを
+            // 保持していない状態で呼ばれる（ReadPacket側でロックを解放してから呼び出す設計）。
+            // そのため、ここでManagerのロックを取得しても安全（デッドロックしない）。
+
+            HlsSegmentCache* cachePtr = nullptr;
+            io::ChunkDownloader* downloaderPtr = nullptr;
+            std::string url;
+            int64_t byteRangeStart = -1;
+            int64_t byteRangeLength = 0;
+            bool needsRequest = false;
+
+            {
+                std::lock_guard<std::mutex> lock(m_impl->mutex);
+                if (!m_impl->isOpen || !m_impl->cache || !m_impl->downloader) return;
+
+                cachePtr = m_impl->cache.get();
+                downloaderPtr = m_impl->downloader.get();
+
+                if (segmentIndex == -1) {
+                    // 初期化セグメント（fMP4ヘッダー）の再ダウンロード
+                    if (m_impl->playlist.map.has_value()) {
+                        url = m_impl->playlist.map->url;
+                        byteRangeStart = m_impl->playlist.map->byteRangeStart;
+                        byteRangeLength = m_impl->playlist.map->byteRangeLength;
+                        needsRequest = true;
+                    }
+                } else if (segmentIndex >= 0 &&
+                           segmentIndex < static_cast<int64_t>(m_impl->playlist.segments.size())) {
+                    const auto& info = m_impl->playlist.segments[segmentIndex];
+                    url = info.url;
+                    byteRangeStart = info.byteRangeStart;
+                    byteRangeLength = info.byteRangeLength;
+                    needsRequest = true;
+                }
+            }
+
+            if (needsRequest && !url.empty()) {
+                LOG_WARN("Segment {} permanently failed, clearing failure mark and requesting "
+                         "one-time automatic re-download (Priority: Critical)", segmentIndex);
+                // ロック外でキャッシュ・ダウンローダーを操作
+                cachePtr->ClearSegmentFailed(segmentIndex);
+                downloaderPtr->RequestSegment(url, segmentIndex, io::ChunkPriority::Critical,
+                                               byteRangeStart, byteRangeLength);
+            }
+        });
+
         // 8. 先頭セグメントのダウンロードを開始し、完了を待機
         LOG_INFO("Requesting first segment with highest priority...");
         
@@ -446,7 +523,8 @@ bool HlsSliceLoadingManager::Open(const std::string& hlsUrl, const HlsSliceConfi
             const auto& firstSegment = m_impl->playlist.segments[0];
             LOG_INFO("First segment URL: {}...", firstSegment.url.substr(0, std::min(firstSegment.url.length(), size_t(80))));
             LOG_INFO("First segment duration: {:.2f}s", firstSegment.duration);
-            m_impl->downloader->RequestSegment(firstSegment.url, 0, io::ChunkPriority::Critical);
+            m_impl->downloader->RequestSegment(firstSegment.url, 0, io::ChunkPriority::Critical,
+                                                firstSegment.byteRangeStart, firstSegment.byteRangeLength);
             LOG_INFO("First segment request queued");
         }
         
@@ -549,6 +627,7 @@ bool HlsSliceLoadingManager::IsOpen() const {
 // =============================================================================
 
 AVIOContext* HlsSliceLoadingManager::GetAVIOContext() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen || !m_impl->avioContext) {
         return nullptr;
     }
@@ -563,10 +642,10 @@ bool HlsSliceLoadingManager::IsHlsUrl(const std::string& url) {
     if (url.empty()) {
         return false;
     }
-    
+
     // 小文字に変換して比較
     std::string lower = Impl::ToLower(url);
-    
+
     // .m3u8 または .m3u が含まれるか
     if (lower.find(".m3u8") != std::string::npos) {
         return true;
@@ -574,7 +653,22 @@ bool HlsSliceLoadingManager::IsHlsUrl(const std::string& url) {
     if (lower.find(".m3u") != std::string::npos) {
         return true;
     }
-    
+
+    // クエリパラメータでHLS形式を指定しているケース（例: yt-dlp形式のURL）。
+    // "format=m3u8xxx" のような値の誤検知を避けるため、値の終端（'&'・'#'・文字列末尾）も確認する
+    size_t formatPos = lower.find("format=m3u8");
+    if (formatPos != std::string::npos) {
+        size_t afterPos = formatPos + std::string("format=m3u8").length();
+        if (afterPos >= lower.size() || lower[afterPos] == '&' || lower[afterPos] == '#') {
+            return true;
+        }
+    }
+
+    // MIMEタイプでHLSを指定しているケース
+    if (lower.find("mime=application%2fvnd.apple.mpegurl") != std::string::npos) {
+        return true;
+    }
+
     return false;
 }
 
@@ -583,6 +677,7 @@ bool HlsSliceLoadingManager::IsHlsUrl(const std::string& url) {
 // =============================================================================
 
 double HlsSliceLoadingManager::GetDuration() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen) {
         return 0.0;
     }
@@ -594,20 +689,22 @@ double HlsSliceLoadingManager::GetDuration() const {
 // =============================================================================
 
 double HlsSliceLoadingManager::GetDownloadProgress() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen || !m_impl->cache) {
         return 0.0;
     }
-    
+
     size_t total = m_impl->cache->GetTotalSegmentCount();
     if (total == 0) {
         return 0.0;
     }
-    
+
     size_t cached = m_impl->cache->GetCachedSegmentCount();
     return static_cast<double>(cached) / static_cast<double>(total);
 }
 
 double HlsSliceLoadingManager::GetBandwidth() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen || !m_impl->downloader) {
         return 0.0;
     }
@@ -615,15 +712,17 @@ double HlsSliceLoadingManager::GetBandwidth() const {
 }
 
 bool HlsSliceLoadingManager::IsFullyCached() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen || !m_impl->cache) {
         return false;
     }
-    
-    return m_impl->cache->GetCachedSegmentCount() == 
+
+    return m_impl->cache->GetCachedSegmentCount() ==
            m_impl->cache->GetTotalSegmentCount();
 }
 
 size_t HlsSliceLoadingManager::GetCachedSegmentCount() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen || !m_impl->cache) {
         return 0;
     }
@@ -631,6 +730,7 @@ size_t HlsSliceLoadingManager::GetCachedSegmentCount() const {
 }
 
 size_t HlsSliceLoadingManager::GetTotalSegmentCount() const {
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     if (!m_impl->isOpen || !m_impl->cache) {
         return 0;
     }
@@ -642,29 +742,36 @@ size_t HlsSliceLoadingManager::GetTotalSegmentCount() const {
 // =============================================================================
 
 void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
-    if (!m_impl->isOpen || !m_impl->cache || !m_impl->downloader) {
-        return;
-    }
-    
     // リクエスト対象のセグメント情報を収集（ロック内）
-    std::vector<std::tuple<std::string, int64_t, io::ChunkPriority>> segmentsToRequest;
+    // isOpen/cache/downloaderの確認とアクセスは同一ロック内で行い、
+    // Close()によるunique_ptrのreset()との競合（use-after-free）を防ぐ。
+    std::vector<std::tuple<std::string, int64_t, io::ChunkPriority, int64_t, int64_t>> segmentsToRequest;
     int64_t currentSegment;
     int prefetchAhead;
-    
+    HlsSegmentCache* cachePtr = nullptr;
+    io::ChunkDownloader* downloaderPtr = nullptr;
+
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
-        
-        currentSegment = m_impl->cache->GetSegmentIndexFromTime(seconds);
+
+        if (!m_impl->isOpen || !m_impl->cache || !m_impl->downloader) {
+            return;
+        }
+
+        cachePtr = m_impl->cache.get();
+        downloaderPtr = m_impl->downloader.get();
+
+        currentSegment = cachePtr->GetSegmentIndexFromTime(seconds);
         int64_t totalSegments = static_cast<int64_t>(m_impl->playlist.segments.size());
         prefetchAhead = m_impl->config.prefetchSegmentsAhead;
-        
+
         // 現在位置から prefetchSegmentsAhead 個先までリクエスト対象を収集
-        for (int64_t i = currentSegment; 
-             i < currentSegment + prefetchAhead && i < totalSegments; 
+        for (int64_t i = currentSegment;
+             i < currentSegment + prefetchAhead && i < totalSegments;
              ++i) {
             if (i < 0) continue;
-            
-            if (!m_impl->cache->IsSegmentCached(i)) {
+
+            if (!cachePtr->IsSegmentCached(i)) {
                 // 優先度を設定
                 io::ChunkPriority priority;
                 if (i == currentSegment) {
@@ -674,55 +781,58 @@ void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
                 } else {
                     priority = io::ChunkPriority::Medium;
                 }
-                
-                const auto* segmentInfo = m_impl->cache->GetSegmentInfo(i);
+
+                const auto* segmentInfo = cachePtr->GetSegmentInfo(i);
                 if (segmentInfo) {
-                    segmentsToRequest.emplace_back(segmentInfo->url, i, priority);
+                    segmentsToRequest.emplace_back(segmentInfo->url, i, priority,
+                                                    segmentInfo->byteRangeStart, segmentInfo->byteRangeLength);
                 }
             }
         }
     }
-    
-    // ロック外でリクエストを発行
-    for (const auto& [url, index, priority] : segmentsToRequest) {
-        m_impl->downloader->RequestSegment(url, index, priority);
+
+    // ロック外でリクエストを発行（ロック内で取得済みのポインタを使用）
+    for (const auto& [url, index, priority, byteRangeStart, byteRangeLength] : segmentsToRequest) {
+        downloaderPtr->RequestSegment(url, index, priority, byteRangeStart, byteRangeLength);
     }
-    
+
     // ロック外でキャッシュ最適化
-    m_impl->cache->OptimizeForPlayback(currentSegment, prefetchAhead);
+    cachePtr->OptimizeForPlayback(currentSegment, prefetchAhead);
 }
 
 void HlsSliceLoadingManager::NotifySeek(double seconds) {
-    if (!m_impl->isOpen || !m_impl->cache || !m_impl->downloader) {
-        return;
-    }
-    
-    LOG_DEBUG("Seek to {:.2f}s", seconds);
-    
-    // 既存キューをクリア（ロック外で）
-    m_impl->downloader->ClearSegmentQueue();
-    
     // リクエスト対象のセグメント情報を収集（ロック内）
-    std::vector<std::tuple<std::string, int64_t, io::ChunkPriority>> segmentsToRequest;
+    // isOpen/cache/downloaderの確認とアクセスは同一ロック内で行い、
+    // Close()によるunique_ptrのreset()との競合（use-after-free）を防ぐ。
+    std::vector<std::tuple<std::string, int64_t, io::ChunkPriority, int64_t, int64_t>> segmentsToRequest;
     int64_t targetSegment;
     int prefetchAhead;
+    HlsSegmentCache* cachePtr = nullptr;
+    io::ChunkDownloader* downloaderPtr = nullptr;
     HlsCustomAVIOContext* avioContext = nullptr;
-    
+
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
-        
-        targetSegment = m_impl->cache->GetSegmentIndexFromTime(seconds);
+
+        if (!m_impl->isOpen || !m_impl->cache || !m_impl->downloader) {
+            return;
+        }
+
+        cachePtr = m_impl->cache.get();
+        downloaderPtr = m_impl->downloader.get();
+        avioContext = m_impl->avioContext.get();
+
+        targetSegment = cachePtr->GetSegmentIndexFromTime(seconds);
         int64_t totalSegments = static_cast<int64_t>(m_impl->playlist.segments.size());
         prefetchAhead = m_impl->config.prefetchSegmentsAhead;
-        avioContext = m_impl->avioContext.get();
-        
+
         // シーク先から優先ダウンロード対象を収集
         for (int64_t i = targetSegment;
              i < targetSegment + static_cast<int64_t>(prefetchAhead) && i < totalSegments;
              ++i) {
             if (i < 0) continue;
-            
-            if (!m_impl->cache->IsSegmentCached(i)) {
+
+            if (!cachePtr->IsSegmentCached(i)) {
                 io::ChunkPriority priority;
                 if (i == targetSegment) {
                     priority = io::ChunkPriority::Critical;
@@ -731,24 +841,32 @@ void HlsSliceLoadingManager::NotifySeek(double seconds) {
                 } else {
                     priority = io::ChunkPriority::Medium;
                 }
-                
-                const auto* segmentInfo = m_impl->cache->GetSegmentInfo(i);
+
+                const auto* segmentInfo = cachePtr->GetSegmentInfo(i);
                 if (segmentInfo) {
-                    segmentsToRequest.emplace_back(segmentInfo->url, i, priority);
+                    segmentsToRequest.emplace_back(segmentInfo->url, i, priority,
+                                                    segmentInfo->byteRangeStart, segmentInfo->byteRangeLength);
                 }
             }
         }
     }
-    
+
+    LOG_DEBUG("Seek to {:.2f}s", seconds);
+
+    // ロック外でキューをクリア（ロック内で取得済みのポインタを使用）
+    downloaderPtr->ClearSegmentQueue();
+
     // ロック外でリクエストを発行
-    for (const auto& [url, index, priority] : segmentsToRequest) {
-        m_impl->downloader->RequestSegment(url, index, priority);
+    for (const auto& [url, index, priority, byteRangeStart, byteRangeLength] : segmentsToRequest) {
+        downloaderPtr->RequestSegment(url, index, priority, byteRangeStart, byteRangeLength);
     }
-    
+
     // ロック外でキャッシュ最適化
-    m_impl->cache->OptimizeForPlayback(targetSegment, prefetchAhead);
-    
+    cachePtr->OptimizeForPlayback(targetSegment, prefetchAhead);
+
     // ロック外でAVIOにシークを通知
+    // (SeekToTimeはOnSeekCallback→UpdatePlaybackPositionを同一スレッドで再入させる可能性があるため、
+    //  ここでManagerのロックを保持したまま呼び出すとデッドロックする)
     if (avioContext) {
         avioContext->SeekToTime(seconds);
     }

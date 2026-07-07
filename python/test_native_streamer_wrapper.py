@@ -165,12 +165,18 @@ class TestNativeStreamerWrapperCompatibility:
 
 # SpoutGLが存在するかチェック
 def check_spoutgl_available():
-    """SpoutGLが利用可能かチェック"""
-    try:
-        import SpoutGL
-        return True
-    except ImportError:
-        return False
+    """
+    SpoutGLが利用可能かチェック
+
+    注意: ここで実際に `import SpoutGL` すると、SpoutGL同梱のSpout.dllが
+    プロセスにロードされる。本テストスイートは同一プロセス内でytdlpspout.dll
+    （独自のSpout.dllに依存）も後からロードするため、同名DLLの衝突により
+    ytdlpspout.dllのロードがWinError 127（procedure not found）で失敗する
+    （テスト実行順序に依存する既知のWindows DLL名衝突）。
+    可用性の確認だけなら実import不要のため、find_specで代替する。
+    """
+    import importlib.util
+    return importlib.util.find_spec("SpoutGL") is not None
 
 
 HAS_SPOUTGL = check_spoutgl_available()
@@ -253,12 +259,18 @@ class TestNativeStreamerWrapperSpout:
     
     @pytest.mark.skipif(not HAS_SPOUTGL, reason=SPOUTGL_SKIP_REASON)
     def test_spout_initialized_in_run(self):
-        """_run()でSpoutSenderが初期化される（owns_spout=Trueの場合）"""
-        from python.native_streamer_wrapper import NativeStreamerWrapper
-        
-        # 注: 実際の再生は行わない（DLLテスト）ため、このテストはSpoutGLのインポートのみ確認
-        import SpoutGL
-        assert SpoutGL is not None
+        """
+        _run()でSpoutSenderが初期化される（owns_spout=Trueの場合）
+
+        注: 実際の再生は行わない（DLLテスト）ため、このテストはSpoutGLの
+        可用性のみ確認する。`import SpoutGL` を実際に行うと、同梱の
+        Spout.dllが本テストスイートが後でロードするytdlpspout.dll側の
+        Spout.dllと名前衝突し、WinError 127でytdlpspout.dllのロードが
+        失敗する（check_spoutgl_availableのコメント参照）ため、
+        find_specによる可用性確認に留める。
+        """
+        import importlib.util
+        assert importlib.util.find_spec("SpoutGL") is not None
     
     def test_stop_releases_spout_when_owns(self):
         """stop()でSpoutSenderが解放される（owns_spout=Trueの場合）"""
@@ -350,6 +362,134 @@ class TestNativeStreamerWrapperSliceLoading:
 
 
 @pytest.mark.skipif(DLL_PATH is None, reason=SKIP_REASON)
+class TestNativeStreamerWrapperPreviewEnabled:
+    """Issue F: preview_enabled連動によるプレビュー変換のスキップ／スロットリング"""
+
+    def test_preview_enabled_default_true(self):
+        """preview_enabledはデフォルトTrue（完全後方互換）"""
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+
+        assert wrapper.preview_enabled is True
+
+    def test_preview_enabled_setter_toggles_value(self):
+        """preview_enabledはスレッドセーフに読み書きできる"""
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+
+        wrapper.preview_enabled = False
+        assert wrapper.preview_enabled is False
+
+        wrapper.preview_enabled = True
+        assert wrapper.preview_enabled is True
+
+    def test_update_preview_frame_skipped_when_preview_disabled(self):
+        """preview_enabled=Falseの間、get_current_frame/変換が一切呼ばれない"""
+        from unittest.mock import Mock
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+        wrapper.preview_enabled = False
+
+        mock_native = Mock()
+        mock_native.get_current_frame = Mock(return_value="should_not_be_read")
+
+        wrapper._update_preview_frame(mock_native)
+
+        mock_native.get_current_frame.assert_not_called()
+        assert wrapper.latest_frame_bgr is None
+
+    def test_update_preview_frame_updates_latest_frame_bgr_when_enabled(self):
+        """preview_enabled=True（デフォルト）の場合、latest_frame_bgrが更新される"""
+        import numpy as np
+        from unittest.mock import Mock
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+        wrapper._width = 4
+        wrapper._height = 4
+        wrapper._output_width = 4
+        wrapper._output_height = 4
+
+        frame_bgra = np.zeros((4, 4, 4), dtype=np.uint8)
+        mock_native = Mock()
+        mock_native.get_current_frame = Mock(return_value=frame_bgra)
+
+        wrapper._update_preview_frame(mock_native)
+
+        mock_native.get_current_frame.assert_called_once()
+        assert wrapper.latest_frame_bgr is not None
+        assert wrapper.latest_frame_bgr.shape == (4, 4, 3)  # BGRA->BGR変換後
+
+    def test_update_preview_frame_throttles_conversion_rate(self):
+        """短時間に連続呼び出しても、スロットリング間隔未満ならget_current_frameは呼ばれない"""
+        import numpy as np
+        from unittest.mock import Mock
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+        wrapper._width = 4
+        wrapper._height = 4
+        wrapper._output_width = 4
+        wrapper._output_height = 4
+
+        frame_bgra = np.zeros((4, 4, 4), dtype=np.uint8)
+        mock_native = Mock()
+        mock_native.get_current_frame = Mock(return_value=frame_bgra)
+
+        # 1回目：変換実行（初回は前回変換時刻が0.0のため必ず通過）
+        wrapper._update_preview_frame(mock_native)
+        # 2回目：直後に呼んでもスロットリング間隔（1/30秒）未満のためスキップされる
+        wrapper._update_preview_frame(mock_native)
+
+        assert mock_native.get_current_frame.call_count == 1
+
+    def test_update_preview_frame_resumes_after_throttle_interval(self):
+        """スロットリング間隔が経過すれば、再度get_current_frameが呼ばれる"""
+        import numpy as np
+        from unittest.mock import Mock
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+        import python.native_streamer_wrapper as wrapper_module
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+        wrapper._width = 4
+        wrapper._height = 4
+        wrapper._output_width = 4
+        wrapper._output_height = 4
+
+        frame_bgra = np.zeros((4, 4, 4), dtype=np.uint8)
+        mock_native = Mock()
+        mock_native.get_current_frame = Mock(return_value=frame_bgra)
+
+        # 前回変換時刻を十分過去に設定し、スロットリング間隔経過済みの状態を再現
+        wrapper._last_preview_convert_time = -wrapper_module._PREVIEW_CONVERT_MIN_INTERVAL * 10
+
+        wrapper._update_preview_frame(mock_native)
+
+        assert mock_native.get_current_frame.call_count == 1
+
+
+@pytest.mark.skipif(DLL_PATH is None, reason=SKIP_REASON)
 class TestNativeStreamerWrapperPreResolvedUrl:
     """事前解決済みURL機能のテスト"""
     
@@ -371,13 +511,37 @@ class TestNativeStreamerWrapperPreResolvedUrl:
     def test_pre_resolved_url_default_none(self):
         """pre_resolved_urlはデフォルトでNone"""
         from python.native_streamer_wrapper import NativeStreamerWrapper
-        
+
         wrapper = NativeStreamerWrapper(
             video_url="test.mp4",
             sender_name="TestSender"
         )
-        
+
         assert wrapper._pre_resolved_url is None
+
+    def test_pre_resolved_is_hls_property_exists(self):
+        """pre_resolved_is_hls引数が正しく保存される"""
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="https://www.youtube.com/watch?v=test123",
+            sender_name="TestSender",
+            pre_resolved_is_hls=True
+        )
+
+        assert hasattr(wrapper, '_pre_resolved_is_hls')
+        assert wrapper._pre_resolved_is_hls is True
+
+    def test_pre_resolved_is_hls_default_none(self):
+        """pre_resolved_is_hlsはデフォルトでNone（自動判定=完全後方互換）"""
+        from python.native_streamer_wrapper import NativeStreamerWrapper
+
+        wrapper = NativeStreamerWrapper(
+            video_url="test.mp4",
+            sender_name="TestSender"
+        )
+
+        assert wrapper._pre_resolved_is_hls is None
 
 
 # スタンドアロン実行用

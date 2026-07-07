@@ -8,6 +8,7 @@
 #include <chrono>
 #include <atomic>
 #include <vector>
+#include <curl/curl.h>
 #include "io/HttpClient.h"
 #include "utils/Logger.h"
 
@@ -112,6 +113,122 @@ void TestIsHttpUrl() {
 }
 
 // =============================================================================
+// リトライ判定ロジックテスト (H-1: detail::ShouldRetryRequest)
+// =============================================================================
+
+void TestShouldRetryRequestOnCurlError() {
+    TEST_CASE("ShouldRetryRequest retries on generic curl-level error")
+    {
+        ASSERT_TRUE(detail::ShouldRetryRequest(static_cast<int>(CURLE_COULDNT_CONNECT), 0));
+        ASSERT_TRUE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OPERATION_TIMEDOUT), 0));
+    }
+    TEST_END()
+}
+
+void TestShouldRetryRequestNotOnUserCancel() {
+    TEST_CASE("ShouldRetryRequest does not retry on user cancellation (CURLE_ABORTED_BY_CALLBACK)")
+    {
+        ASSERT_FALSE(detail::ShouldRetryRequest(static_cast<int>(CURLE_ABORTED_BY_CALLBACK), 0));
+    }
+    TEST_END()
+}
+
+void TestShouldRetryRequestOn5xxAnd429() {
+    TEST_CASE("ShouldRetryRequest retries on HTTP 5xx and 429")
+    {
+        ASSERT_TRUE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OK), 500));
+        ASSERT_TRUE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OK), 503));
+        ASSERT_TRUE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OK), 429));
+    }
+    TEST_END()
+}
+
+void TestShouldRetryRequestNotOnClientErrorOrSuccess() {
+    TEST_CASE("ShouldRetryRequest does not retry on 4xx (except 429) or success")
+    {
+        ASSERT_FALSE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OK), 403));
+        ASSERT_FALSE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OK), 404));
+        ASSERT_FALSE(detail::ShouldRetryRequest(static_cast<int>(CURLE_OK), 200));
+    }
+    TEST_END()
+}
+
+// =============================================================================
+// Rangeレスポンス検証ロジックテスト (H-3: detail::IsValidRangeResponse)
+// =============================================================================
+
+void TestIsValidRangeResponseAccepts206() {
+    TEST_CASE("IsValidRangeResponse accepts 206 Partial Content")
+    {
+        ASSERT_TRUE(detail::IsValidRangeResponse(206, 100, 50, 50));
+    }
+    TEST_END()
+}
+
+void TestIsValidRangeResponseRejects200WithNonZeroStart() {
+    TEST_CASE("IsValidRangeResponse rejects 200 when startByte > 0 (server ignored Range)")
+    {
+        ASSERT_FALSE(detail::IsValidRangeResponse(200, 100, 1000, 50));
+    }
+    TEST_END()
+}
+
+void TestIsValidRangeResponseRejects200OversizedBody() {
+    TEST_CASE("IsValidRangeResponse rejects 200 with body larger than requested range")
+    {
+        ASSERT_FALSE(detail::IsValidRangeResponse(200, 0, 10000, 100));
+    }
+    TEST_END()
+}
+
+void TestIsValidRangeResponseAccepts200ValidSlice() {
+    TEST_CASE("IsValidRangeResponse accepts 200 when startByte==0 and body fits requested length")
+    {
+        ASSERT_TRUE(detail::IsValidRangeResponse(200, 0, 100, 100));
+    }
+    TEST_END()
+}
+
+// =============================================================================
+// ヘッダーパースロジックテスト (H-4: detail::IsHttpStatusLine / ParseHeaderLine)
+// =============================================================================
+
+void TestIsHttpStatusLine() {
+    TEST_CASE("IsHttpStatusLine detects HTTP status lines")
+    {
+        ASSERT_TRUE(detail::IsHttpStatusLine("HTTP/1.1 200 OK\r\n"));
+        ASSERT_TRUE(detail::IsHttpStatusLine("HTTP/2 301 Moved Permanently"));
+        ASSERT_FALSE(detail::IsHttpStatusLine("Content-Length: 100"));
+        ASSERT_FALSE(detail::IsHttpStatusLine(""));
+    }
+    TEST_END()
+}
+
+void TestParseHeaderLineLowercasesKey() {
+    TEST_CASE("ParseHeaderLine normalizes header keys to lowercase")
+    {
+        std::string key, value;
+        ASSERT_TRUE(detail::ParseHeaderLine("Content-Length: 12345\r\n", key, value));
+        ASSERT_EQ(key, "content-length");
+        ASSERT_EQ(value, "12345");
+
+        ASSERT_TRUE(detail::ParseHeaderLine("ACCEPT-RANGES: bytes", key, value));
+        ASSERT_EQ(key, "accept-ranges");
+        ASSERT_EQ(value, "bytes");
+    }
+    TEST_END()
+}
+
+void TestParseHeaderLineRejectsNonHeaderLine() {
+    TEST_CASE("ParseHeaderLine returns false for a line without a colon")
+    {
+        std::string key, value;
+        ASSERT_FALSE(detail::ParseHeaderLine("not a header line", key, value));
+    }
+    TEST_END()
+}
+
+// =============================================================================
 // HTTPリクエストテスト（実ネットワーク使用）
 // =============================================================================
 
@@ -186,8 +303,10 @@ void TestGetRangeRequest() {
         config.readTimeoutMs = 10000;
         
         HttpClient client(config);
-        // httpbin.orgのbytesエンドポイントを使用
-        auto response = client.GetRange("https://httpbin.org/bytes/1000", 0, 99);
+        // httpbin.orgの /bytes/N はRangeヘッダーを無視して常に200+全ボディを返すため
+        // 部分レンジ取得の検証には使えない（H-3のIsValidRangeResponseにより弾かれる）。
+        // Rangeを正しくサポートする /range/N エンドポイントを使用する。
+        auto response = client.GetRange("https://httpbin.org/range/1000", 0, 99);
         
         // 206 Partial Content または 200 OKを期待
         ASSERT_TRUE(response.statusCode == 206 || response.statusCode == 200);
@@ -290,9 +409,12 @@ void TestTimeoutHandling() {
         HttpClientConfig config;
         config.connectTimeoutMs = 2000;
         config.readTimeoutMs = 2000;
-        
+        // このテストは単発のタイムアウト検出を検証するものであり、
+        // リトライ(H-1)によるバックオフ加算で elapsed < 10 が崩れないようにする
+        config.maxRetries = 0;
+
         HttpClient client(config);
-        
+
         // httpbin.orgのdelayエンドポイントで遅延をシミュレート
         auto start = std::chrono::steady_clock::now();
         auto response = client.Get("https://httpbin.org/delay/10");  // 10秒遅延
@@ -455,7 +577,24 @@ int main() {
     TestConfigure();
     TestIsHttpUrl();
     TestCurlGlobalInit();
-    
+
+    std::cout << std::endl << "[Retry Logic Tests]" << std::endl;
+    TestShouldRetryRequestOnCurlError();
+    TestShouldRetryRequestNotOnUserCancel();
+    TestShouldRetryRequestOn5xxAnd429();
+    TestShouldRetryRequestNotOnClientErrorOrSuccess();
+
+    std::cout << std::endl << "[Range Response Validation Tests]" << std::endl;
+    TestIsValidRangeResponseAccepts206();
+    TestIsValidRangeResponseRejects200WithNonZeroStart();
+    TestIsValidRangeResponseRejects200OversizedBody();
+    TestIsValidRangeResponseAccepts200ValidSlice();
+
+    std::cout << std::endl << "[Header Parsing Tests]" << std::endl;
+    TestIsHttpStatusLine();
+    TestParseHeaderLineLowercasesKey();
+    TestParseHeaderLineRejectsNonHeaderLine();
+
     std::cout << std::endl << "[HTTP Request Tests]" << std::endl;
     TestHeadRequest();
     TestGetRequest();

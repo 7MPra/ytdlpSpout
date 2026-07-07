@@ -23,25 +23,18 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
-#include <cctype>
-
-// =============================================================================
-// ヘルパー関数
-// =============================================================================
-
-/// @brief URLがHLSストリームかどうかを判定
-/// @param url 判定するURL
-/// @return HLSストリームの場合true
-static bool IsHlsUrl(const std::string& url) {
-    std::string lower = url;
-    std::transform(lower.begin(), lower.end(), lower.begin(), 
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return (lower.find(".m3u8") != std::string::npos) ||
-           (lower.find("format=m3u8") != std::string::npos) ||
-           (lower.find("/hls/") != std::string::npos);
-}
 
 namespace ytdlpspout {
+
+namespace {
+// P-10: GUI側からの直近フレーム取得要求時刻からの経過時間判定に使用
+int64_t NowNanos() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// 直近このウィンドウ内にフレーム取得要求があった場合のみ非同期リードバックを行う
+constexpr int64_t kReadbackActiveWindowNanos = 3LL * 1000 * 1000 * 1000;  // 3秒
+}  // namespace
 
 // =============================================================================
 // 内部実装クラス
@@ -55,7 +48,9 @@ struct VideoPlayer::Impl {
 #if YTDLPSPOUT_ENABLE_SPOUT
     std::unique_ptr<SpoutSender> spoutSender;
 #endif
-    std::unique_ptr<TexturePool> texturePool;
+    // Issue C: PooledTextureがweak_ptrでプールを参照するため、TexturePoolは
+    // shared_ptr管理下で生成する必要がある（TexturePool.h参照）。
+    std::shared_ptr<TexturePool> texturePool;
     std::unique_ptr<FrameTimer> frameTimer;
     std::unique_ptr<io::SliceLoadingManager> sliceManager;  // スライス読み込みマネージャー
     std::unique_ptr<hls::HlsSliceLoadingManager> hlsManager;  // HLSスライス読み込みマネージャー
@@ -89,6 +84,16 @@ struct VideoPlayer::Impl {
     
     // HLSストリームフラグ（シーク処理の最適化に使用、FFmpegネイティブHLS含む）
     bool isHlsStream = false;
+
+    // シーク後タイマー再同期（最初のフレームの実際のPTSでFrameTimerを合わせる＝シーク加速防止）
+    bool timerResyncPending = false;
+
+    // 直近の有効PTS（NOPTSフレーム時の近似値算出に使用。0秒への誤同期を防ぐ）
+    double lastValidPts = 0.0;
+
+    // GUI側からの直近フレーム取得要求時刻（P-10: 未使用時のGPU→CPUリードバック省略に使用）
+    // 初期値は0のためStart()完了時に現在時刻で初期化し、起動直後は必ずreadbackが有効になるようにする
+    std::atomic<int64_t> lastFrameRequestNanos{ 0 };
 
     // スレッド同期
     std::mutex mutex;
@@ -152,10 +157,16 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
     
     ID3D11Device* device = config.useHardwareAccel ? m_impl->d3dContext->GetDevice() : nullptr;
     
-    // HLS判定
-    bool isHls = IsHlsUrl(source) || hls::HlsSliceLoadingManager::IsHlsUrl(source);
-    LOG_INFO("HLS detection - IsHlsUrl: {}, HlsSliceLoadingManager::IsHlsUrl: {}, final: {}",
-             IsHlsUrl(source), hls::HlsSliceLoadingManager::IsHlsUrl(source), isHls);
+    // HLS判定: FFI経由のヒント（yt-dlp側の判定結果）があればそれを優先し、
+    // 未指定（-1）の場合のみURLヒューリスティックで自動判定する
+    bool isHls;
+    if (config.isHlsHint >= 0) {
+        isHls = (config.isHlsHint != 0);
+        LOG_INFO("HLS detection - using FFI hint: {}", isHls);
+    } else {
+        isHls = hls::HlsSliceLoadingManager::IsHlsUrl(source);
+        LOG_INFO("HLS detection - HlsSliceLoadingManager::IsHlsUrl: {}", isHls);
+    }
     LOG_INFO("Source URL preview: {}...", source.substr(0, std::min(source.length(), size_t(80))));
     LOG_INFO("Slice loading enabled in config: {}", config.slice.enabled);
     LOG_INFO("HTTP headers count: {}", config.httpHeaders.size());
@@ -163,7 +174,11 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
     // スライスローディング使用判定
     bool useHlsSliceLoading = config.slice.enabled && isHls;
     bool useSliceLoading = config.slice.enabled && !isHls;
-    
+
+    // HLSプレイリストの総時間（decoder側でduration/totalFramesが取得できない場合の
+    // フォールバックに使用。videoInfo代入より後段で参照するためここで保持する）
+    double hlsDuration = 0.0;
+
     // HLSフラグを保存（シーク処理の最適化に使用）
     m_impl->isHlsStream = isHls;
     m_impl->isHlsMode = false;
@@ -212,14 +227,9 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
             
             m_impl->isHlsMode = true;
             LOG_INFO("Using HLS slice loading with AVIOContext for: {}", source);
-            
-            // HLSの総時間をVideoInfoに設定
-            double hlsDuration = m_impl->hlsManager->GetDuration();
-            if (hlsDuration > 0) {
-                m_impl->videoInfo = m_impl->decoder->GetVideoInfo();
-                // 注: VideoInfoはコピーなので直接変更できない
-                // HLS durationはGetDuration()で別途取得可能
-            }
+
+            // HLSプレイリストの総時間を取得（後段でvideoInfo.durationのフォールバックに使用）
+            hlsDuration = m_impl->hlsManager->GetDuration();
         }
     } else if (useSliceLoading) {
         // スライス読み込みを使用（非HLSの場合のみ）
@@ -265,8 +275,11 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
         }
     } else {
         // 従来の方法でオープン + HTTPヘッダー
-        // HLSの場合: FFmpegネイティブHTTPハンドラが内部リクエストにヘッダーを継承
+        // HLSの場合: FFmpegネイティブHTTPハンドラ（スライス読み込みは未使用）
         // 非HLSの場合: スライスローディングが無効
+        if (isHls) {
+            LOG_INFO("Using FFmpeg native HLS (no HLS slice loading for this source)");
+        }
         if (!m_impl->decoder->Open(source, device, config.httpHeaders)) {
             m_impl->ReportError("Failed to open video source: " + source);
             return false;
@@ -274,6 +287,17 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
     }
 
     m_impl->videoInfo = m_impl->decoder->GetVideoInfo();
+
+    // HLSスライス再生時、decoder側でduration/totalFramesが取得できない場合は
+    // プレイリスト総時間で補完する（GUI側のVOD判定・シークバー表示に必要）
+    if (m_impl->videoInfo.duration <= 0.0 && hlsDuration > 0.0) {
+        m_impl->videoInfo.duration = hlsDuration;
+        if (m_impl->videoInfo.fps > 0.0) {
+            m_impl->videoInfo.totalFrames = static_cast<int64_t>(hlsDuration * m_impl->videoInfo.fps);
+        }
+        LOG_INFO("HLS duration fallback applied: duration={:.2f}s, totalFrames={}",
+                 m_impl->videoInfo.duration, m_impl->videoInfo.totalFrames);
+    }
 
     // フレームコンバーター初期化
     m_impl->converter = std::make_unique<FrameConverter>();
@@ -283,7 +307,7 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
     }
 
     // テクスチャプール初期化
-    m_impl->texturePool = std::make_unique<TexturePool>();
+    m_impl->texturePool = std::make_shared<TexturePool>();
     TexturePool::Config poolConfig;
     poolConfig.width = m_impl->videoInfo.width;
     poolConfig.height = m_impl->videoInfo.height;
@@ -313,6 +337,12 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
     m_impl->currentTime = 0.0;
     m_impl->currentFrame = 0;
     m_impl->sentFrameCount = 0;
+    m_impl->lastValidPts = 0.0;
+    m_impl->timerResyncPending = false;
+
+    // P-10: 起動直後はGUI側の初回フレーム取得を待たずreadbackを有効にしておく
+    // （プレビューが空白のまま固まるのを防ぐための猶予期間）
+    m_impl->lastFrameRequestNanos = NowNanos();
 
     LOG_INFO("Video player started: {}x{} @ {:.2f}fps, duration: {:.2f}s",
              m_impl->videoInfo.width, m_impl->videoInfo.height,
@@ -322,10 +352,12 @@ bool VideoPlayer::Start(const PlayerConfig& config) {
 }
 
 void VideoPlayer::Stop() {
-    {
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        m_impl->stopRequested = true;
-    }
+    // P-4: decoder/converter/texturePool/frameTimer等の破棄をProcessFrame()の
+    // デコーダーアクセス区間・Seek()と同一のmutexで保護し、解放済みリソースへの
+    // 並行アクセス（use-after-free）を防ぐ。ProcessFrame()はスリープ/送信中は
+    // このロックを保持しないため、ここで最後まで保持してもシーク応答性は損なわれない。
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    m_impl->stopRequested = true;
 
     // ペンディングの非同期リードバックをクリーンアップ
     if (m_impl->hasPendingReadback && m_impl->d3dContext) {
@@ -432,8 +464,10 @@ bool VideoPlayer::Seek(double seconds) {
     m_impl->lastBeatIndex = -1;  // シーク時にビートインデックスをリセット
 
     if (m_impl->frameTimer) {
-        // シーク時はタイマーをPTSに合わせてオフセット
+        // シーク時はタイマーを要求位置で仮合わせ。実際のPTSは次のProcessFrameで取得するまで不明なため、
+        // 最初の1フレームで timerResyncPending により実際のPTSへ再同期する（シーク後の加速防止）。
         m_impl->frameTimer->SeekTo(seconds);
+        m_impl->timerResyncPending = true;
     }
 
     return true;
@@ -459,20 +493,15 @@ int VideoPlayer::RunLoop() {
     while (!m_impl->stopRequested) {
         if (!ProcessFrame()) {
             // EOF または エラー
+            // Issue A: ループ再生(config.loop==true)はProcessFrame()内で完結して処理される
+            // ようになったため（DLL経路でProcessFrame()が直接呼ばれるGUIでもループが効くように
+            // するための変更）、ここに到達するのはEOFかつloop=false時（＝再生完了）、またはエラーのみ。
             if (m_impl->decoder && m_impl->decoder->IsEOF()) {
-                if (m_impl->config.loop) {
-                    LOG_DEBUG("Looping video");
-                    m_impl->decoder->SeekToStart();
-                    m_impl->currentTime = 0.0;
-                    m_impl->currentFrame = 0;
-                    continue;
-                } else {
-                    LOG_INFO("Playback completed");
-                    if (m_impl->completionCallback) {
-                        m_impl->completionCallback();
-                    }
-                    break;
+                LOG_INFO("Playback completed");
+                if (m_impl->completionCallback) {
+                    m_impl->completionCallback();
                 }
+                break;
             } else if (m_impl->state == PlayerState::Error) {
                 return 1;
             }
@@ -494,66 +523,144 @@ bool VideoPlayer::ProcessFrame() {
         return false;
     }
 
-    // フレームをデコード
-    if (!m_impl->decoder->DecodeNextFrame()) {
-        return false;
-    }
+    // =========================================================================
+    // P-4: デコーダーアクセス区間（Decode〜GetCurrentFrame〜Convert完了まで）を
+    // Seek()/Stop()と同一のmutexで保護する。これにより、デコーダーが解放済み
+    // （Stop()によるreset()）またはシーク中（Seek()によるavcodec_flush_buffers等）の
+    // 状態でアクセスされることを防ぐ。FrameTimer::WaitUntilPTS（スリープ）と
+    // Spout送信・readbackは、シーク応答性を維持するためロック外で行う
+    // （変換済みテクスチャはプール所有でありデコーダーとは独立しているため安全）。
+    // =========================================================================
+    double waitPts = 0.0;
+    double actualPts = 0.0;
+    int64_t frameNumber = 0;
+    PooledTexture pooledTexture;
 
-    // フレームを取得
-    AVFrame* frame = m_impl->decoder->GetCurrentFrame();
-    if (!frame) {
-        return false;
-    }
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
 
-    // フレームタイミング待機（デコード後、送信前）
-    // PTSに基づいた同期
+        if (m_impl->state != PlayerState::Playing || !m_impl->decoder ||
+            !m_impl->texturePool || !m_impl->converter) {
+            return false;
+        }
+
+        // フレームをデコード
+        if (!m_impl->decoder->DecodeNextFrame()) {
+            // Issue A: DLL経路(GUI)ではPython側がProcessFrame()を毎フレーム直接呼び出し、
+            // RunLoop()を経由しないため、ループ再生(config.loop)はここで完結させる必要がある
+            // （RunLoop()内のEOFハンドリングはCLI専用でDLL経路には効かない）。
+            if (m_impl->decoder->IsEOF() && m_impl->config.loop) {
+                LOG_DEBUG("Looping video (ProcessFrame)");
+                m_impl->decoder->SeekToStart();
+                m_impl->currentTime = 0.0;
+                m_impl->currentFrame = 0;
+                m_impl->lastValidPts = 0.0;
+                // シーク/ループ時と同様にFrameTimerをリセットしないと、WaitUntilPTSの基準時刻が
+                // ずれたままになり2周目以降がペーシングなしの全速再生になる
+                if (m_impl->frameTimer) {
+                    m_impl->frameTimer->SeekTo(0.0);
+                }
+                m_impl->timerResyncPending = true;
+                return true;  // このフレームはスキップし、次回呼び出しで先頭から再開
+            }
+            return false;
+        }
+
+        // フレームを取得
+        AVFrame* frame = m_impl->decoder->GetCurrentFrame();
+        if (!frame) {
+            return false;
+        }
+
+        // P-6: PTSが未確定（AV_NOPTS_VALUE）の場合に0秒へ誤同期しないようにする。
+        // タイマー再同期はTryGetCurrentPTSが成功するフレームまで持ち越し（timerResyncPending維持）、
+        // 待機時刻は直前の有効PTS + フレーム間隔で近似する。
+        double pts = 0.0;
+        if (m_impl->decoder->TryGetCurrentPTS(pts)) {
+            actualPts = pts;
+            m_impl->lastValidPts = pts;
+            if (m_impl->timerResyncPending && m_impl->frameTimer) {
+                // シーク直後は要求位置と実際のキーフレームPTSがずれているため、最初の1フレームで
+                // タイマーを実際のPTSに再同期する。これがないと WaitUntilPTS(pts) が常に負になり加速する。
+                m_impl->frameTimer->SeekTo(pts);
+                m_impl->timerResyncPending = false;
+            }
+            waitPts = pts;
+        } else {
+            actualPts = 0.0;  // GetCurrentPTS()の従来仕様（NOPTS時0.0）を維持
+            double frameInterval = (m_impl->videoInfo.fps > 0.0) ? (1.0 / m_impl->videoInfo.fps) : (1.0 / 30.0);
+            waitPts = m_impl->lastValidPts + frameInterval;
+        }
+
+        frameNumber = m_impl->decoder->GetCurrentFrameNumber();
+
+        // テクスチャプールから取得
+        pooledTexture = m_impl->texturePool->Acquire();
+        if (!pooledTexture.IsValid()) {
+            LOG_WARN("No available texture in pool");
+            return true;  // スキップして続行
+        }
+
+        // フレームをテクスチャに変換
+        if (!m_impl->converter->Convert(frame, pooledTexture.Get())) {
+            LOG_WARN("Frame conversion failed");
+            return true;  // スキップして続行
+        }
+    }  // ロック解放（以降デコーダーにはアクセスしない）
+
+    // フレームタイミング待機（デコード後、送信前。ロック外でシーク応答性を維持）
     if (m_impl->frameTimer) {
-        double pts = m_impl->decoder->GetCurrentPTS();
-        m_impl->frameTimer->WaitUntilPTS(pts);
+        m_impl->frameTimer->WaitUntilPTS(waitPts);
     }
 
-    // テクスチャプールから取得
-    auto pooledTexture = m_impl->texturePool->Acquire();
-    if (!pooledTexture.IsValid()) {
-        LOG_WARN("No available texture in pool");
-        return true;  // スキップして続行
-    }
-
-    // フレームをテクスチャに変換
-    if (!m_impl->converter->Convert(frame, pooledTexture.Get())) {
-        LOG_WARN("Frame conversion failed");
-        return true;  // スキップして続行
+    // 送信・統計更新区間もStop()と同一mutexで保護する（スリープを含まないため
+    // シーク応答性は損なわれない）。Python側のstop()はスレッドjoinが3秒で
+    // タイムアウトするとProcessFrame実行中でもStop()を呼びうるため、
+    // WaitUntilPTS中にStop()が完了した場合はここで検知してフレームを破棄する。
+    // 注: beat/progressコールバックはPython側から同期的にseek()等を呼び返す
+    // 可能性があるため、このロックの外（関数末尾）で発火する。
+    {
+    std::lock_guard<std::mutex> postLock(m_impl->mutex);
+    if (m_impl->state != PlayerState::Playing || !m_impl->d3dContext) {
+        return false;
     }
 
     // フレームバッファにコピー（GUI連携用） - 非同期ダブルバッファリング
+    // P-10: 直近kReadbackActiveWindowNanos以内にGUI側からフレーム取得要求があった場合のみ実行し、
+    // 未使用時のGPU→CPUリードバックを省略して電力・帯域を節約する
     {
         std::lock_guard<std::mutex> frameLock(m_impl->frameBufferMutex);
-        int width = m_impl->videoInfo.width;
-        int height = m_impl->videoInfo.height;
-        size_t bufferSize = static_cast<size_t>(width) * height * 4;
-        
-        if (m_impl->lastFrameBuffer.size() != bufferSize) {
-            m_impl->lastFrameBuffer.resize(bufferSize);
-        }
-        
-        // 前フレームの非同期リードバックが完了していれば結果を取得
-        if (m_impl->hasPendingReadback) {
-            if (m_impl->d3dContext->IsReadbackComplete(m_impl->pendingReadback)) {
-                if (m_impl->d3dContext->CompleteAsyncReadback(
-                        m_impl->pendingReadback,
-                        m_impl->lastFrameBuffer.data(),
-                        bufferSize)) {
-                    m_impl->hasValidFrame = true;
-                }
-                m_impl->hasPendingReadback = false;
+        bool readbackActive = (NowNanos() - m_impl->lastFrameRequestNanos.load(std::memory_order_relaxed))
+                               < kReadbackActiveWindowNanos;
+
+        if (readbackActive) {
+            int width = m_impl->videoInfo.width;
+            int height = m_impl->videoInfo.height;
+            size_t bufferSize = static_cast<size_t>(width) * height * 4;
+
+            if (m_impl->lastFrameBuffer.size() != bufferSize) {
+                m_impl->lastFrameBuffer.resize(bufferSize);
             }
-            // 完了していなければ次のフレームへ（ダブルバッファリング）
-        }
-        
-        // 新しい非同期リードバックを開始（ペンディングがなければ）
-        if (!m_impl->hasPendingReadback) {
-            m_impl->pendingReadback = m_impl->d3dContext->BeginAsyncReadback(pooledTexture.Get());
-            m_impl->hasPendingReadback = m_impl->pendingReadback.valid;
+
+            // 前フレームの非同期リードバックが完了していれば結果を取得
+            if (m_impl->hasPendingReadback) {
+                if (m_impl->d3dContext->IsReadbackComplete(m_impl->pendingReadback)) {
+                    if (m_impl->d3dContext->CompleteAsyncReadback(
+                            m_impl->pendingReadback,
+                            m_impl->lastFrameBuffer.data(),
+                            bufferSize)) {
+                        m_impl->hasValidFrame = true;
+                    }
+                    m_impl->hasPendingReadback = false;
+                }
+                // 完了していなければ次のフレームへ（ダブルバッファリング）
+            }
+
+            // 新しい非同期リードバックを開始（ペンディングがなければ）
+            if (!m_impl->hasPendingReadback) {
+                m_impl->pendingReadback = m_impl->d3dContext->BeginAsyncReadback(pooledTexture.Get());
+                m_impl->hasPendingReadback = m_impl->pendingReadback.valid;
+            }
         }
     }
 
@@ -569,9 +676,9 @@ bool VideoPlayer::ProcessFrame() {
     m_impl->sentFrameCount++;
 #endif
 
-    // 時刻を更新
-    m_impl->currentTime = m_impl->decoder->GetCurrentPTS();
-    m_impl->currentFrame = m_impl->decoder->GetCurrentFrameNumber();
+    // 時刻を更新（ロック区間内で取得済みの値を使用。デコーダーへの再アクセスはしない）
+    m_impl->currentTime = actualPts;
+    m_impl->currentFrame = frameNumber;
 
     // HLSスライス読み込みマネージャーに再生位置を通知（プリフェッチ最適化用）
     if (m_impl->isHlsMode && m_impl->hlsManager) {
@@ -582,6 +689,7 @@ bool VideoPlayer::ProcessFrame() {
     if (m_impl->sliceManager) {
         m_impl->sliceManager->UpdatePlaybackPosition(m_impl->currentTime);
     }
+    }  // postLock解放（以降のコールバックはPython側へ再入しうるためロック外で発火）
 
     // ビートイベント発火
     if (m_impl->beatMap && m_impl->beatCallback) {
@@ -671,50 +779,63 @@ uint64_t VideoPlayer::GetSentFrameCount() const {
 // =============================================================================
 
 double VideoPlayer::GetDownloadProgress() const {
+    // PLY-1: Stop()がm_impl->mutex保持下でsliceManager/hlsManagerをreset()するため、
+    // ここでも同じmutexを取得してからポインタを参照する（use-after-free防止）。
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
     // 動画が読み込まれていない場合は0.0を返す
     if (m_impl->state == PlayerState::Stopped && !m_impl->sliceManager && !m_impl->hlsManager) {
         return 0.0;
     }
-    
+
     // HLSスライス読み込みモード
     if (m_impl->isHlsMode && m_impl->hlsManager) {
         return m_impl->hlsManager->GetDownloadProgress();
     }
-    
+
     // 通常スライス読み込み
     if (m_impl->sliceManager) {
         return m_impl->sliceManager->GetDownloadProgress();
     }
-    
+
     return 1.0;  // スライス読み込み無効時は100%
 }
 
 bool VideoPlayer::IsFullyCached() const {
+    // PLY-1: Stop()と同一のmutexで保護し、reset()済みポインタの参照を防ぐ。
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
     // 動画が読み込まれていない場合はfalseを返す
     if (m_impl->state == PlayerState::Stopped && !m_impl->sliceManager && !m_impl->hlsManager) {
         return false;
     }
-    
+
     // HLSスライス読み込みモード
     if (m_impl->isHlsMode && m_impl->hlsManager) {
         return m_impl->hlsManager->IsFullyCached();
     }
-    
+
     // 通常スライス読み込み
     if (m_impl->sliceManager) {
         return m_impl->sliceManager->IsFullyCached();
     }
-    
+
     return true;  // スライス読み込み無効時は常にtrue
 }
 
 bool VideoPlayer::IsHlsMode() const {
+    // PLY-1: isHlsModeはStop()がmutex保持下で書き換えるため、読み取り側も同期する。
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
     return m_impl->isHlsMode;
 }
 
 VideoPlayer::HlsCacheStats VideoPlayer::GetHlsCacheStats() const {
+    // PLY-1: Stop()と同一のmutexで保護し、reset()済みのhlsManager/sliceManagerへの
+    // 並行アクセス（use-after-free）を防ぐ。破棄済み/未使用時は既定値（空stats）を返す。
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+
     HlsCacheStats stats;
-    
+
     // HLSモードの場合
     if (m_impl->isHlsMode && m_impl->hlsManager) {
         stats.cachedSegments = static_cast<int>(m_impl->hlsManager->GetCachedSegmentCount());
@@ -742,7 +863,7 @@ VideoPlayer::HlsCacheStats VideoPlayer::GetHlsCacheStats() const {
         stats.isFullyCached = (m_impl->state != PlayerState::Stopped);
         stats.isHlsMode = false;
     }
-    
+
     return stats;
 }
 
@@ -843,6 +964,10 @@ int VideoPlayer::GetFrameBufferSize() const {
 }
 
 int VideoPlayer::GetCurrentFrameData(uint8_t* buffer, int bufferSize, int* outWidth, int* outHeight) {
+    // P-10: GUI側がフレームを要求したことを記録し、ProcessFrame()側の
+    // GPU→CPU非同期リードバックを直近この要求から一定時間だけ有効にする
+    m_impl->lastFrameRequestNanos = NowNanos();
+
     if (!buffer || bufferSize <= 0) {
         return -1;  // Invalid buffer
     }

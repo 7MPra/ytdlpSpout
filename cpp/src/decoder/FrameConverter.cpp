@@ -30,6 +30,9 @@ struct FrameConverter::Impl {
     int lastSrcWidth = 0;
     int lastSrcHeight = 0;
     AVPixelFormat lastSrcFormat = AV_PIX_FMT_NONE;
+    // MED-3: 出力(dst)解像度の変化も再生成条件に含めるため記録する
+    int lastDstWidth = 0;
+    int lastDstHeight = 0;
     
     // 出力設定
     int outputWidth = 0;
@@ -159,13 +162,20 @@ bool FrameConverter::ConvertSoftware(AVFrame* frame, ID3D11Texture2D* dstTexture
     }
 
     // SwsContext を更新
+    // MED-3: 入力(src)側だけでなく出力(dst)解像度の変化もチェックする。
+    // dstのみが変化した場合に再生成をスキップすると、古いdst解像度で構成された
+    // SwsContextのまま新しいdstWidth/dstHeightでバッファ確保・sws_scaleを行うことになり、
+    // バッファオーバーフローや不正なスケーリングを招く。
     if (!m_impl->swsContext ||
         m_impl->lastSrcWidth != srcWidth ||
         m_impl->lastSrcHeight != srcHeight ||
-        m_impl->lastSrcFormat != srcFormat) {
-        
+        m_impl->lastSrcFormat != srcFormat ||
+        m_impl->lastDstWidth != dstWidth ||
+        m_impl->lastDstHeight != dstHeight) {
+
         if (m_impl->swsContext) {
             sws_freeContext(m_impl->swsContext);
+            m_impl->swsContext = nullptr;
         }
 
         m_impl->swsContext = sws_getContext(
@@ -176,6 +186,13 @@ bool FrameConverter::ConvertSoftware(AVFrame* frame, ID3D11Texture2D* dstTexture
 
         if (!m_impl->swsContext) {
             LOG_ERROR("Failed to create sws context");
+            // 生成失敗時は次回呼び出しで確実に再試行されるようキャッシュ済み
+            // 寸法情報を無効化しておく
+            m_impl->lastSrcWidth = 0;
+            m_impl->lastSrcHeight = 0;
+            m_impl->lastSrcFormat = AV_PIX_FMT_NONE;
+            m_impl->lastDstWidth = 0;
+            m_impl->lastDstHeight = 0;
             if (swFrame) av_frame_free(&swFrame);
             return false;
         }
@@ -183,13 +200,15 @@ bool FrameConverter::ConvertSoftware(AVFrame* frame, ID3D11Texture2D* dstTexture
         m_impl->lastSrcWidth = srcWidth;
         m_impl->lastSrcHeight = srcHeight;
         m_impl->lastSrcFormat = srcFormat;
+        m_impl->lastDstWidth = dstWidth;
+        m_impl->lastDstHeight = dstHeight;
 
         LOG_DEBUG("Created sws context: {}x{} ({}) -> {}x{} (BGRA)",
                   srcWidth, srcHeight, av_get_pix_fmt_name(srcFormat),
                   dstWidth, dstHeight);
     }
 
-    // RGBAバッファを確保
+    // RGBAバッファを確保（MED-3: dst解像度に追随して必要サイズを再確保する）
     size_t bufferSize = static_cast<size_t>(dstWidth) * dstHeight * 4;
     if (m_impl->rgbaBuffer.size() < bufferSize) {
         m_impl->rgbaBuffer.resize(bufferSize);
@@ -199,12 +218,24 @@ bool FrameConverter::ConvertSoftware(AVFrame* frame, ID3D11Texture2D* dstTexture
     uint8_t* dstData[1] = { m_impl->rgbaBuffer.data() };
     int dstLinesize[1] = { dstWidth * 4 };
 
-    sws_scale(
+    int scaledHeight = sws_scale(
         m_impl->swsContext,
         srcFrame->data, srcFrame->linesize,
         0, srcHeight,
         dstData, dstLinesize
     );
+
+    // MED-4: sws_scale の戻り値（出力スライス高さ）を検証する。
+    // 失敗(<=0)または期待した高さと一致しない場合は、未初期化/前フレームの
+    // バッファをそのままアップロードしてしまわないよう false を返す。
+    if (scaledHeight <= 0 || scaledHeight != dstHeight) {
+        LOG_ERROR("sws_scale failed or returned unexpected height: {} (expected {})",
+                   scaledHeight, dstHeight);
+        if (swFrame) {
+            av_frame_free(&swFrame);
+        }
+        return false;
+    }
 
     // テクスチャにコピー
     bool result = m_impl->d3dContext->UpdateTexture(

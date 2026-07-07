@@ -33,13 +33,13 @@ URL解決 → スライス読み込み（CustomIOContext） → 単一再生パ�
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              VideoPlayer                                      │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │                     SliceLoadingManager（新規）                          ││
+│  │                     SliceLoadingManager                                  ││
 │  │  ┌───────────────┐  ┌──────────────────┐  ┌────────────────────────┐   ││
 │  │  │ YtDlpResolver │  │ CustomIOContext  │  │ VideoDecoder (FFmpeg)  │   ││
 │  │  │               │→ │                  │→ │                        │   ││
 │  │  │ URL→Stream    │  │ AVIO Callbacks   │  │ HW Decode (D3D11VA)    │   ││
 │  │  └───────────────┘  └────────┬─────────┘  └────────────────────────┘   ││
-│  │                              │                                          ││
+│  │                              │ （内部で生成・所有）                     ││
 │  │                     ┌────────▼─────────┐                               ││
 │  │                     │  SparseFileCache │                               ││
 │  │                     │  ┌─────────────┐ │                               ││
@@ -51,21 +51,22 @@ URL解決 → スライス読み込み（CustomIOContext） → 単一再生パ�
 │  │                     └────────┬─────────┘                               ││
 │  │                              │                                          ││
 │  │  ┌───────────────────────────┼────────────────────────────────────┐    ││
-│  │  │                           │                                    │    ││
+│  │  │       CustomIOContextが内部で生成・所有する                      │    ││
 │  │  │ ┌─────────────────────────▼────────────────────────────────┐  │    ││
 │  │  │ │                   ChunkDownloader                        │  │    ││
 │  │  │ │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐        │  │    ││
-│  │  │ │  │Worker 0 │ │Worker 1 │ │Worker 2 │ │Worker 3 │        │  │    ││
+│  │  │ │  │Worker 0 │ │Worker 1 │ │Worker 2 │ │  ...    │        │  │    ││
 │  │  │ │  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘        │  │    ││
 │  │  │ │       └───────────┴───────────┴───────────┘              │  │    ││
-│  │  │ │                       ↓                                  │  │    ││
+│  │  │ │                       ↓ （単一queueMutex + queueCvで保護）│  │    ││
 │  │  │ │              Priority Queue                              │  │    ││
 │  │  │ │  [Critical] → [High] → [Medium] → [Low]                  │  │    ││
 │  │  │ └──────────────────────────────────────────────────────────┘  │    ││
-│  │  │                                                                │    ││
+│  │  │        （ワーカー数はmaxConcurrentDownloadsで指定、既定6）       │    ││
 │  │  │ ┌──────────────────────────────────────────────────────────┐  │    ││
 │  │  │ │                  PrefetchScheduler                       │  │    ││
-│  │  │ │  Current Position → Priority Calculation → Request       │  │    ││
+│  │  │ │  50ms間隔のバックグラウンドスレッドがTriggerPrefetch()を実行 │  │    ││
+│  │  │ │  （NotifySeek時は即座にも実行）                            │  │    ││
 │  │  │ └──────────────────────────────────────────────────────────┘  │    ││
 │  │  └────────────────────────────────────────────────────────────────┘    ││
 │  └─────────────────────────────────────────────────────────────────────────┘│
@@ -76,6 +77,8 @@ URL解決 → スライス読み込み（CustomIOContext） → 単一再生パ�
 │  └─────────────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**実際の所有関係（重要）**: `SliceLoadingManager` (`cpp/src/io/SliceLoadingManager.h/cpp`) は `CustomIOContext` の `unique_ptr` だけを保持し、`SparseFileCache` / `ChunkDownloader` / `PrefetchScheduler` を直接は持たない。これら3つは `CustomIOContext::InitializeHttp()` (`cpp/src/io/CustomIOContext.cpp:188-293`) が内部で生成・起動する。上図はデータフローの理解のために並べて描いているが、クラス階層としては `SliceLoadingManager → CustomIOContext → {SparseFileCache, ChunkDownloader, PrefetchScheduler, HttpClient}` である。
 
 ---
 
@@ -106,6 +109,7 @@ URL解決 → スライス読み込み（CustomIOContext） → 単一再生パ�
 
 ### 完了済み
 - ✅ 全フェーズ統合完了
+- ⚠️ ただし「キャッシュ永続化（ファイル保存）」は未実装（後述のセクション参照）。設定フィールド（`cachePath`）だけが存在し、実際のファイル書き込みコードは無い。
 
 ---
 
@@ -113,169 +117,214 @@ URL解決 → スライス読み込み（CustomIOContext） → 単一再生パ�
 
 ### 1. PlayerConfig拡張
 
+実際の定義は `cpp/src/player/VideoPlayer.h:31-74`。
+
 ```cpp
-/// @brief プレイヤー設定（拡張版）
+/// @brief プレイヤー設定
 struct PlayerConfig {
-    // === 入力ソース（いずれか1つを指定） ===
-    std::string source;                     // ファイルパス or URL
-    
+    // === 入力ソース ===
+    std::string source;                     // ファイルパス or URL（推奨）
+    std::string filePath;                   // 入力ファイルパス（後方互換性のため維持、sourceが優先）
+
     // === 出力設定 ===
-    std::string senderName = "ytdlpSpout";
+    std::string senderName = "ytdlpSpout";  // Spout Sender名
     int outputWidth = 0;                    // 0=ソース解像度
     int outputHeight = 0;
-    
+
     // === 再生設定 ===
     bool loop = false;
     bool useHardwareAccel = true;
     bool verbose = false;
-    
+
     // === スライス読み込み設定 ===
     struct SliceConfig {
-        bool enabled = true;                // スライス読み込み有効
-        size_t chunkSize = 1 * 1024 * 1024; // 1MB
-        size_t maxCacheMemory = 128 * 1024 * 1024;  // 128MB
-        int maxConcurrentDownloads = 4;
-        int prefetchChunksAhead = 8;
-        std::string cachePath;              // キャッシュ保存先（空=メモリのみ）
+        bool enabled = true;
+        size_t chunkSize = 2 * 1024 * 1024;         // 2MB
+        size_t maxCacheMemory = 256 * 1024 * 1024;  // 256MB
+        int maxConcurrentDownloads = 6;
+        int prefetchChunksAhead = 24;               // 48MB分
+        int criticalChunksAhead = 6;                // 即座にダウンロードする範囲
+        bool enableContinuousDownload = true;
+        std::string cachePath;                      // 現状未使用（後述のセクション参照）
     } slice;
-    
+
     // === yt-dlp設定 ===
     struct YtDlpConfig {
-        std::string path;                   // yt-dlpパス（空=自動検出）
-        int preferredHeight = 1080;         // 希望解像度
-        std::string formatSpec;             // カスタムフォーマット指定
+        std::string path;                   // 空=自動検出
+        int preferredHeight = 1080;
     } ytdlp;
+
+    // === HTTPヘッダー設定 ===
+    std::map<std::string, std::string> httpHeaders;  // Cookie等
+
+    // === HLS判定ヒント ===
+    int isHlsHint = -1;  // -1=自動判定、0=非HLS、1=HLS（yt-dlp側の判定結果を伝搬）
+
+    const std::string& GetSource() const {
+        return source.empty() ? filePath : source;
+    }
 };
 ```
 
-### 2. SliceLoadingManager（新規クラス）
+これらのデフォルト値は `cpp/src/bindings/c_api.cpp` の `ytdlpspout_config_ex_init()`（chunkSize=2MB, maxCacheMemory=256MB, maxConcurrentDownloads=6, prefetchChunksAhead=24, criticalChunksAhead=6, enableContinuousDownload=1）と一致している。
+
+### 2. SliceLoadingManager
+
+実際の定義は `cpp/src/io/SliceLoadingManager.h`（`ytdlpspout::io`名前空間）。`PlayerConfig::SliceConfig`とは別に、専用の`SliceLoadingConfig`構造体を取る点に注意。
 
 ```cpp
+/// @brief スライス読み込み設定（io::SliceLoadingConfig, SliceLoadingManager.h:29-40）
+struct SliceLoadingConfig {
+    size_t chunkSize = 2 * 1024 * 1024;
+    size_t maxCacheMemory = 256 * 1024 * 1024;
+    int maxConcurrentDownloads = 6;
+    int prefetchChunksAhead = 24;
+    int criticalChunksAhead = 6;
+    bool enableContinuousDownload = true;
+    std::string cachePath;
+    std::string ytdlpPath;
+    int preferredHeight = 1080;
+    std::map<std::string, std::string> httpHeaders;
+};
+
+/// @brief ソースタイプ（SliceLoadingManager.h:43-48）
+enum class SliceSourceType { Unknown, LocalFile, HttpUrl, YtDlpUrl };
+
 /// @brief スライス読み込みマネージャー
-/// @details URL/ファイルを統一的に扱うスライス読み込み制御
 class SliceLoadingManager {
 public:
-    SliceLoadingManager();
-    ~SliceLoadingManager();
-    
-    // === 初期化 ===
-    
-    /// @brief ソースを開く
-    /// @param source ファイルパス or URL
-    /// @param config スライス設定
-    /// @return 成功時true
-    bool Open(const std::string& source, const PlayerConfig::SliceConfig& config);
-    
-    /// @brief クローズ
+    bool Open(const std::string& source, const SliceLoadingConfig& config = {});
     void Close();
-    
-    // === FFmpeg連携 ===
-    
-    /// @brief AVIOContextを取得
+    bool IsOpen() const;
+
     AVIOContext* GetAVIOContext();
-    
-    /// @brief ファイルサイズを取得
+    CustomIOContext* GetCustomIOContext();      // OpenWithCustomIO()に渡すために使う
     int64_t GetFileSize() const;
-    
-    /// @brief URLか（yt-dlp経由）
-    bool IsRemoteSource() const;
-    
-    // === 再生位置連携 ===
-    
-    /// @brief 再生位置を更新（プリフェッチ最適化用）
+    SliceSourceType GetSourceType() const;      // IsRemoteSource()は存在しない
+    const std::string& GetResolvedUrl() const;
+
     void UpdatePlaybackPosition(double seconds);
-    
-    /// @brief シーク通知
+    void UpdatePlaybackPositionBytes(int64_t byteOffset);
     void NotifySeek(double seconds);
-    
-    // === 統計 ===
-    
-    /// @brief ダウンロード進捗を取得（0.0〜1.0）
+    void NotifySeekBytes(int64_t byteOffset);
+
     double GetDownloadProgress() const;
-    
-    /// @brief 推定帯域幅を取得
-    double GetBandwidth() const;
-    
-    /// @brief 全チャンクがキャッシュ済みか
+    double GetBandwidth() const;                // 現状スタブ（後述）
     bool IsFullyCached() const;
-    
-private:
-    struct Impl;
-    std::unique_ptr<Impl> m_impl;
+    size_t GetCachedChunkCount() const;
+    size_t GetTotalChunkCount() const;
+
+    double GetDuration() const;                 // yt-dlp解決後のみ有効
+    int GetBitrate() const;                     // yt-dlp解決後のみ有効
 };
 ```
 
+**注意点（実装で確認済みの制限）**:
+- `GetBandwidth()` は `cpp/src/io/SliceLoadingManager.cpp:358-367` で常に`0.0`を返すスタブ実装（`// TODO: 実際の帯域幅測定を実装`とコメントされている）。`ChunkDownloader`自体は帯域幅を実測しているが、`SliceLoadingManager`からは配線されていない。
+- `VideoPlayer::Start()` (`cpp/src/player/VideoPlayer.cpp:238-246`) は `PlayerConfig::SliceConfig` から `io::SliceLoadingConfig` へ値をコピーする際、`chunkSize` / `maxCacheMemory` / `maxConcurrentDownloads` / `prefetchChunksAhead` / `cachePath` / `ytdlp.*` / `httpHeaders` はコピーするが、**`criticalChunksAhead` と `enableContinuousDownload` はコピーしていない**。そのため非HLSのスライス読み込みでは、この2つの値は常に `SliceLoadingConfig` 自身の既定値（`criticalChunksAhead=6`, `enableContinuousDownload=true`）が使われ、呼び出し側（GUI/C API）が指定した値は反映されない。
+
 ### 3. VideoDecoder拡張
+
+実際の定義は `cpp/src/decoder/VideoDecoder.h:68-87`。`OpenWithSliceLoading()`という名前のメソッドは存在しない。
 
 ```cpp
 class VideoDecoder {
 public:
-    // 既存: ファイルパスで開く
-    bool Open(const std::string& filePath, ID3D11Device* device);
-    
-    // 新規: カスタムIOContextで開く
-    bool OpenWithCustomIO(
-        CustomIOContext* ioContext,
-        ID3D11Device* device = nullptr
-    );
-    
-    // 新規: SliceLoadingManagerで開く（推奨）
-    bool OpenWithSliceLoading(
-        SliceLoadingManager* manager,
-        ID3D11Device* device = nullptr
-    );
+    // 既存: ファイルパス/URLで開く（httpHeadersはHLS内部リクエストにも適用）
+    bool Open(const std::string& filePath, ID3D11Device* d3dDevice = nullptr,
+              const std::map<std::string, std::string>& httpHeaders = {});
+
+    // カスタムIOContextで開く（非HLSスライス読み込み用）
+    bool OpenWithCustomIO(io::CustomIOContext* ioContext, ID3D11Device* d3dDevice = nullptr,
+                          const std::map<std::string, std::string>& httpHeaders = {});
+
+    // 生のAVIOContextで開く（HLSスライス読み込み用、Phase 7で追加）
+    bool OpenWithAVIOContext(AVIOContext* avioContext, const std::string& formatHint = "",
+                             ID3D11Device* d3dDevice = nullptr,
+                             const std::map<std::string, std::string>& httpHeaders = {});
 };
 ```
 
+`VideoPlayer`は`SliceLoadingManager`から`GetCustomIOContext()`で`CustomIOContext*`を取り出し、それを`OpenWithCustomIO()`に渡す（下記4.参照）。「`SliceLoadingManager`を丸ごと渡す`OpenWithSliceLoading()`」という設計は実装されていない。
+
 ### 4. VideoPlayer統合
+
+実際のロジックは `cpp/src/player/VideoPlayer.cpp` の `Start()` (135-352行), `Seek()` (434-474行), `ProcessFrame()` (515行以降), `GetDownloadProgress()`/`IsFullyCached()` (781-824行) にある。要点を抜粋・簡略化すると次の通り（実コードはHLS分岐・エラー処理・ロック等を含みより詳細）。
 
 ```cpp
 bool VideoPlayer::Start(const PlayerConfig& config) {
-    // 1. ソースタイプ判定
-    SourceType srcType = DetermineSourceType(config.source);
-    
-    // 2. スライス読み込みマネージャー初期化
-    if (config.slice.enabled) {
-        m_impl->sliceManager = std::make_unique<SliceLoadingManager>();
-        if (!m_impl->sliceManager->Open(config.source, config.slice)) {
-            return false;
+    const std::string& source = config.GetSource();
+
+    // HLS判定: FFI経由のヒント(isHlsHint>=0)があれば優先、なければURLヒューリスティック
+    bool isHls = (config.isHlsHint >= 0)
+        ? (config.isHlsHint != 0)
+        : hls::HlsSliceLoadingManager::IsHlsUrl(source);
+
+    bool useHlsSliceLoading = config.slice.enabled && isHls;
+    bool useSliceLoading    = config.slice.enabled && !isHls;
+
+    if (useHlsSliceLoading) {
+        m_impl->hlsManager = std::make_unique<hls::HlsSliceLoadingManager>();
+        if (!m_impl->hlsManager->Open(source, hlsConfig)) {
+            // 失敗時: FFmpegネイティブHLS（AVIOなし）にフォールバック
+            m_impl->hlsManager.reset();
+            m_impl->decoder->Open(source, device, config.httpHeaders);
+        } else {
+            AVIOContext* avioCtx = m_impl->hlsManager->GetAVIOContext();
+            m_impl->decoder->OpenWithAVIOContext(avioCtx, "", device, config.httpHeaders);
+            m_impl->isHlsMode = true;
         }
-        
-        // デコーダーをカスタムIOで開く
-        if (!m_impl->decoder->OpenWithSliceLoading(m_impl->sliceManager.get(), device)) {
-            return false;
+    } else if (useSliceLoading) {
+        m_impl->sliceManager = std::make_unique<io::SliceLoadingManager>();
+        if (!m_impl->sliceManager->Open(source, sliceConfig)) {
+            // 失敗時: 直接オープンにフォールバック
+            m_impl->sliceManager.reset();
+            m_impl->decoder->Open(source, device, config.httpHeaders);
+        } else {
+            io::CustomIOContext* ioContext = m_impl->sliceManager->GetCustomIOContext();
+            if (ioContext && ioContext->IsInitialized()) {
+                m_impl->decoder->OpenWithCustomIO(ioContext, device, config.httpHeaders);
+            } else {
+                // CustomIOContext未初期化時: 解決済みURLへの直接オープン
+                m_impl->decoder->Open(m_impl->sliceManager->GetResolvedUrl(), device, config.httpHeaders);
+            }
         }
     } else {
-        // 従来のファイルパス直接オープン（ローカルファイルのみ）
-        if (!m_impl->decoder->Open(config.source, device)) {
-            return false;
-        }
+        // slice.enabled=false、またはHLSでスライス無効時
+        m_impl->decoder->Open(source, device, config.httpHeaders);
     }
-    
-    // 3. 残りの初期化（既存コード）
-    // ...
-}
-
-bool VideoPlayer::ProcessFrame() {
-    // 再生位置をSliceLoadingManagerに通知（プリフェッチ最適化）
-    if (m_impl->sliceManager) {
-        m_impl->sliceManager->UpdatePlaybackPosition(GetPlaybackTime());
-    }
-    
-    // 既存のフレーム処理
     // ...
 }
 
 bool VideoPlayer::Seek(double seconds) {
-    // シークをSliceLoadingManagerに通知
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        m_impl->hlsManager->NotifySeek(seconds);
+    }
     if (m_impl->sliceManager) {
         m_impl->sliceManager->NotifySeek(seconds);
     }
-    
-    // 既存のシーク処理
+    return m_impl->decoder->Seek(seconds);
     // ...
 }
+
+bool VideoPlayer::ProcessFrame() {
+    // 現在時刻が確定した後、再生位置を通知（プリフェッチ最適化）
+    if (m_impl->isHlsMode && m_impl->hlsManager) {
+        m_impl->hlsManager->UpdatePlaybackPosition(m_impl->currentTime);
+    } else if (m_impl->sliceManager) {
+        m_impl->sliceManager->UpdatePlaybackPosition(m_impl->currentTime);
+    }
+    // ...
+}
+
+double VideoPlayer::GetDownloadProgress() const {
+    if (m_impl->isHlsMode && m_impl->hlsManager) return m_impl->hlsManager->GetDownloadProgress();
+    if (m_impl->sliceManager) return m_impl->sliceManager->GetDownloadProgress();
+    return 1.0;  // スライス読み込み無効時は100%扱い
+}
 ```
+
+`hlsManager`と`sliceManager`は排他的（`useHlsSliceLoading`/`useSliceLoading`は同時にtrueにならない）。`isHlsMode`フラグが、`Seek()`/`ProcessFrame()`/`GetDownloadProgress()`/`IsFullyCached()`/`GetHlsCacheStats()`のどちらのマネージャーを使うかを決める。
 
 ---
 
@@ -290,31 +339,38 @@ sequenceDiagram
     participant SliceLoadingManager
     participant YtDlpResolver
     participant CustomIOContext
-    participant ChunkDownloader
     participant SparseFileCache
+    participant ChunkDownloader
+    participant PrefetchScheduler
     participant VideoDecoder
-    
+
     User->>VideoPlayer: Start(config)
-    VideoPlayer->>SliceLoadingManager: Open(source)
-    
-    alt URL source
-        SliceLoadingManager->>YtDlpResolver: GetStreamUrl(url)
-        YtDlpResolver-->>SliceLoadingManager: streamUrl, fileSize
-    else Local file
-        SliceLoadingManager->>SliceLoadingManager: GetFileSize()
+    VideoPlayer->>SliceLoadingManager: Open(source, sliceConfig)
+
+    alt yt-dlp URL
+        SliceLoadingManager->>YtDlpResolver: GetStreamUrl(source, preferredHeight)
+        YtDlpResolver-->>SliceLoadingManager: resolvedUrl
+        SliceLoadingManager->>YtDlpResolver: ResolveUrl(source)（duration/bitrate取得）
+    else HTTP URL / Local file
+        Note over SliceLoadingManager: sourceをそのままresolvedUrlとして使用
     end
-    
-    SliceLoadingManager->>SparseFileCache: Initialize(fileSize)
-    SliceLoadingManager->>ChunkDownloader: SetUrl(streamUrl)
-    SliceLoadingManager->>ChunkDownloader: Start()
-    SliceLoadingManager->>CustomIOContext: Initialize(cache, downloader)
-    
-    VideoPlayer->>VideoDecoder: OpenWithSliceLoading(manager)
+
+    SliceLoadingManager->>CustomIOContext: Initialize(resolvedUrl, ioConfig)
+    Note over CustomIOContext: HEADリクエスト（失敗時GET Range 0-0にフォールバック）で<br/>サイズ/シーク可否を判定してから、内部でcache/downloader/prefetcherを生成
+    CustomIOContext->>SparseFileCache: Initialize(contentLength)
+    CustomIOContext->>ChunkDownloader: SetUrl / SetHeaders, Start()
+    CustomIOContext->>PrefetchScheduler: Initialize(cache, downloader), Start()
+    CustomIOContext->>CustomIOContext: CreateAVIOContext()
+
+    VideoPlayer->>SliceLoadingManager: GetCustomIOContext()
+    VideoPlayer->>VideoDecoder: OpenWithCustomIO(ioContext, device, httpHeaders)
     VideoDecoder->>CustomIOContext: GetAVIOContext()
     VideoDecoder->>FFmpeg: avformat_open_input(avioCtx)
-    
-    Note over ChunkDownloader,SparseFileCache: バックグラウンドで並列ダウンロード開始
+
+    Note over ChunkDownloader,PrefetchScheduler: PrefetchScheduler起動直後からバックグラウンドで並列ダウンロード開始
 ```
+
+`sliceManager->Open()`が失敗した場合、`VideoPlayer::Start()`は`decoder->Open(source, device, httpHeaders)`（FFmpegの通常のURL/ファイルオープン）にフォールバックする（`VideoPlayer.cpp:248-255`）。
 
 ### フレーム読み取りフロー
 
@@ -325,26 +381,34 @@ sequenceDiagram
     participant FFmpeg
     participant CustomIOContext
     participant SparseFileCache
+    participant PrefetchScheduler
     participant ChunkDownloader
-    
+
+    par バックグラウンド（50ms間隔、またはシーク時に即時実行）
+        PrefetchScheduler->>SparseFileCache: GetChunkState / GetChunkFailCount
+        PrefetchScheduler->>ChunkDownloader: RequestChunk(offset, priority)
+        ChunkDownloader->>SparseFileCache: WriteChunk(data) / SetChunkState(Cached or Error)
+    end
+
     VideoPlayer->>VideoDecoder: DecodeFrame()
     VideoDecoder->>FFmpeg: av_read_frame()
     FFmpeg->>CustomIOContext: read_packet(buf, size)
-    CustomIOContext->>SparseFileCache: Read(offset, size)
-    
-    alt Chunk cached
-        SparseFileCache-->>CustomIOContext: data
-    else Chunk not cached
-        SparseFileCache->>ChunkDownloader: RequestChunk(offset, Critical)
-        Note over ChunkDownloader: 最優先でダウンロード
-        ChunkDownloader-->>SparseFileCache: WriteChunk(data)
-        SparseFileCache-->>CustomIOContext: data
+    CustomIOContext->>SparseFileCache: Read(offset, buf, size, readTimeoutMs)
+
+    alt チャンクが既にCached
+        SparseFileCache-->>CustomIOContext: 即座にデータをコピーして返す
+    else チャンクが未キャッシュ
+        Note over SparseFileCache: chunkAvailableCv.wait_for(timeoutMs)で待機<br/>（プリフェッチ側の非同期ダウンロード完了を待つだけで、<br/>Read()自身はChunkDownloaderを直接呼ばない）
+        SparseFileCache-->>CustomIOContext: 到着後に返却／タイムアウトで0／恒久失敗で-1
     end
-    
-    CustomIOContext-->>FFmpeg: bytes_read
+
+    CustomIOContext->>PrefetchScheduler: UpdatePlaybackPosition(position)
+    CustomIOContext-->>FFmpeg: bytes_read（またはAVERROR_EOF/EAGAIN/EIO）
     FFmpeg-->>VideoDecoder: AVPacket
     VideoDecoder-->>VideoPlayer: DecodedFrame
 ```
+
+**重要**: `SparseFileCache`は`ChunkDownloader`を直接呼び出さない。ダウンロードの発行は常に`PrefetchScheduler`のバックグラウンドスレッド（`updateIntervalMs`＝既定50ms間隔、`CustomIOContext.cpp:280`）が能動的に行うプル型であり、`Read()`側は条件変数（`chunkAvailableCv`）で完了を待つだけである（`SparseFileCache.cpp:366-435`, `PrefetchScheduler.cpp:115-146,188-256`）。
 
 ---
 
@@ -352,117 +416,149 @@ sequenceDiagram
 
 ### チャンク優先度
 
-```
-Priority Level | 説明 | 例
---------------|------|----
-Critical (0)  | 即時必要（再生ブロック） | 現在の読み取り位置
-High (1)      | 間もなく必要 | 現在位置 + 1-2チャンク
-Medium (2)    | 先読み | 現在位置 + 3-8チャンク
-Low (3)       | バックグラウンド | 残りのチャンク
-```
+`ChunkPriority`列挙型（`cpp/src/io/ChunkDownloader.h:45-50`）は`Critical=0 / High=1 / Medium=2 / Low=3`の4段階。「Urgent」というレベルは存在しない。
 
-### プリフェッチ戦略
+実際の割り当ては`PrefetchScheduler::TriggerPrefetch()`（`cpp/src/io/PrefetchScheduler.cpp:188-256`）が次のロジックで決める（デフォルト値: `criticalChunksAhead=6`, `prefetchChunksAhead=24`, `continuousDownloadBatch=48`）。
+
+| Priority | 値 | 実際の割当条件 |
+|----------|----|----------------|
+| Critical | 0  | 現在チャンクから`criticalChunksAhead`個先まで（既定6個先まで） |
+| High     | 1  | 現在チャンクから固定値`+6`先まで（ハードコード）。既定設定では`criticalChunksAhead`も6のためCriticalの範囲と完全に重なり、事実上到達しない分岐になっている |
+| Medium   | 2  | 上記を超えて`prefetchChunksAhead`個先まで（既定24個＝約48MB） |
+| Low      | 3  | `enableContinuousDownload`が有効な場合、`prefetchChunksAhead`を超えた範囲を`continuousDownloadBatch`個ずつ（既定48個）バッチでリクエスト |
+
+`Error`状態のチャンクは、`GetChunkFailCount(chunk) <= kMaxChunkFailCount`（2）である限り同じロジックで再リクエスト対象になる。それを超えたチャンクはスケジューラからは無視され、明示的な`RequestChunk()`呼び出し（例: 新しいシーク）でのみ`Pending`に戻され再挑戦される。
+
+### プリフェッチのトリガー
+
+`PrefetchScheduler::UpdatePlaybackPosition()`（`PrefetchScheduler.cpp:93-98`）自体は現在位置をアトミックに保存してワーカースレッドを起こすだけで、その場でチャンクをリクエストするわけではない。実際のリクエストは以下の2つのタイミングでのみ`TriggerPrefetch()`が呼ばれて発行される。
+
+- バックグラウンドワーカースレッドが`config.updateIntervalMs`（既定50ms）間隔で定期実行（`PrefetchScheduler.cpp:129-143`）
+- `NotifySeek()`が呼ばれた際に即座に1回実行（`PrefetchScheduler.cpp:100-105`）
 
 ```cpp
-void PrefetchScheduler::UpdatePlaybackPosition(int64_t byteOffset) {
-    int64_t currentChunk = byteOffset / chunkSize;
-    
-    // Critical: 現在のチャンク
-    RequestChunk(currentChunk, ChunkPriority::Critical);
-    
-    // High: 次の2チャンク
-    for (int i = 1; i <= 2; i++) {
-        if (currentChunk + i < totalChunks) {
-            RequestChunk(currentChunk + i, ChunkPriority::High);
+// PrefetchScheduler.cpp:188-256 の要点（実コードを簡略化）
+void PrefetchScheduler::Impl::TriggerPrefetch() {
+    int64_t currentChunk = cache->GetChunkIndex(currentPosition);
+
+    for (int64_t chunk : GetPrefetchChunks()) {  // currentChunk .. +prefetchChunksAhead-1
+        ChunkState state = cache->GetChunkState(chunk);
+        bool shouldRequest = (state == ChunkState::Empty) ||
+            (state == ChunkState::Error && cache->GetChunkFailCount(chunk) <= kMaxChunkFailCount);
+        if (shouldRequest) {
+            ChunkPriority priority =
+                (chunk <= currentChunk + config.criticalChunksAhead) ? ChunkPriority::Critical :
+                (chunk <= currentChunk + 6)                          ? ChunkPriority::High :
+                                                                        ChunkPriority::Medium;
+            if (state == ChunkState::Error) cache->SetChunkState(chunk, ChunkState::Empty);
+            downloader->RequestChunk(cache->GetByteOffset(chunk), priority);
         }
     }
-    
-    // Medium: 3-8チャンク先
-    for (int i = 3; i <= 8; i++) {
-        if (currentChunk + i < totalChunks) {
-            RequestChunk(currentChunk + i, ChunkPriority::Medium);
-        }
+
+    if (config.enableContinuousDownload) {
+        // prefetchChunksAheadを超えた範囲をcontinuousDownloadBatch個ずつLow優先度でリクエスト
     }
-    
-    // Low: アイドル時に残りをダウンロード
-    ScheduleBackgroundDownload();
 }
 ```
 
 ---
 
-## キャッシュ永続化（オプション）
+## キャッシュ永続化（未実装・設定項目のみ存在）
 
-### メモリキャッシュ → ファイルキャッシュ
+`PlayerConfig::SliceConfig::cachePath`（`VideoPlayer.h:55`）、`io::SliceLoadingConfig::cachePath`（`SliceLoadingManager.h:36`）、C APIの`YtdlpSpoutSliceConfig::cachePath`（`ytdlpspout.h:74`）という設定フィールドは存在し、値はPlayerConfigまで伝播する。しかし、この値を実際に消費してファイルへチャンクを書き出す処理はコードベース中に存在しない（`CustomIOContextConfig`（`CustomIOContext.h:34-44`）に`cachePath`相当のフィールドがそもそも無く、`SliceLoadingManager`がCustomIOContext初期化時にこの値を橋渡ししていない）。`metadata.json`や`chunk_XXXX.bin`といったファイルキャッシュ形式、および`persistCache`フラグも実装には存在しない。
 
-```cpp
-struct SliceConfig {
-    std::string cachePath;  // 空=メモリのみ、指定=ファイルに保存
-    bool persistCache = false;  // true=再生終了後もキャッシュ保持
-};
-```
-
-### キャッシュファイル形式
-
-```
-cache/
-├── {video_id}/
-│   ├── metadata.json     # ファイルサイズ、チャンク数等
-│   ├── chunk_0000.bin    # チャンクデータ
-│   ├── chunk_0001.bin
-│   └── ...
-```
-
-全チャンクが揃った場合、結合して元の動画ファイルとして保存可能。
+したがって、現状のキャッシュは**常にメモリ上のみ**（`SparseFileCache`のLRU管理下）であり、「ファイルキャッシュへの永続化」は設計上の将来構想に留まる。UIやC API経由で`cachePath`を指定しても、現時点では何の効果も持たない。
 
 ---
 
 ## C API拡張
 
-```cpp
-// スライス読み込み設定
-typedef struct {
-    int enabled;
-    size_t chunk_size;
-    size_t max_cache_memory;
-    int max_concurrent_downloads;
-    int prefetch_chunks_ahead;
-    const char* cache_path;
-} ytdlpspout_slice_config;
+実際の定義は `cpp/include/ytdlpspout/ytdlpspout.h`（構造体・宣言）と `cpp/src/bindings/c_api.cpp`（実装）。
 
-// 拡張開始関数
+```c
+/// @brief スライス読み込み設定（ytdlpspout.h:66-75）
+typedef struct YtdlpSpoutSliceConfig {
+    int enabled;
+    size_t chunkSize;
+    size_t maxCacheMemory;
+    int maxConcurrentDownloads;
+    int prefetchChunksAhead;
+    int criticalChunksAhead;
+    int enableContinuousDownload;
+    const char* cachePath;            // 現状未使用（前セクション参照）
+} YtdlpSpoutSliceConfig;
+
+/// @brief yt-dlp設定（ytdlpspout.h:78-81）
+typedef struct YtdlpSpoutYtDlpConfig {
+    const char* path;
+    int preferredHeight;
+} YtdlpSpoutYtDlpConfig;
+
+/// @brief HTTPヘッダー1件（ytdlpspout.h:84-87）
+typedef struct YtdlpSpoutHttpHeader {
+    const char* key;
+    const char* value;
+} YtdlpSpoutHttpHeader;
+
+/// @brief 拡張設定（ytdlpspout.h:90-103）
+typedef struct YtdlpSpoutConfigEx {
+    const char* source;
+    const char* senderName;
+    int outputWidth;
+    int outputHeight;
+    int loop;
+    int useHardwareAccel;
+    int verbose;
+    YtdlpSpoutSliceConfig slice;
+    YtdlpSpoutYtDlpConfig ytdlp;
+    const YtdlpSpoutHttpHeader* httpHeaders;
+    int httpHeadersCount;
+    int isHlsHint;                    // -1=自動判定、0=非HLS、1=HLS
+} YtdlpSpoutConfigEx;
+
+// 既定値を設定する初期化関数（呼び出し必須。ゼロ初期化ではデフォルトにならない）
+YTDLPSPOUT_API void ytdlpspout_config_ex_init(YtdlpSpoutConfigEx* config);
+
+// 構造体1つを渡す拡張開始関数（個別引数のオーバーロードは存在しない）
 YTDLPSPOUT_API int ytdlpspout_start_ex(
-    ytdlpspout_handle handle,
-    const char* source,                    // ファイルパス or URL
-    const char* sender_name,
-    int output_width,
-    int output_height,
-    int loop,
-    int use_hardware_accel,
-    int verbose,
-    const ytdlpspout_slice_config* slice_config  // NULL=デフォルト
+    YtdlpSpoutHandle handle,
+    const YtdlpSpoutConfigEx* config
 );
 
 // 統計取得
-YTDLPSPOUT_API double ytdlpspout_get_download_progress(ytdlpspout_handle handle);
-YTDLPSPOUT_API double ytdlpspout_get_bandwidth(ytdlpspout_handle handle);
-YTDLPSPOUT_API int ytdlpspout_is_fully_cached(ytdlpspout_handle handle);
+YTDLPSPOUT_API double ytdlpspout_get_download_progress(YtdlpSpoutHandle handle);
+YTDLPSPOUT_API double ytdlpspout_get_bandwidth(YtdlpSpoutHandle handle);       // 常に0.0を返すスタブ（後述）
+YTDLPSPOUT_API int ytdlpspout_is_fully_cached(YtdlpSpoutHandle handle);
+YTDLPSPOUT_API void ytdlpspout_get_cache_stats(                                 // 簡易実装（後述）
+    YtdlpSpoutHandle handle, size_t* cachedChunks, size_t* totalChunks);
 
 // HLS統計取得
 typedef struct YtdlpSpoutHlsCacheStats {
-    int cachedSegments;       // キャッシュ済みセグメント数
-    int totalSegments;        // 総セグメント数
-    double downloadProgress;  // ダウンロード進捗 (0.0〜1.0)
-    double bandwidth;         // 推定帯域幅 (bytes/sec)
-    int isFullyCached;        // 完全キャッシュ済み (1=true)
-    int isHlsMode;            // HLSモードで再生中 (1=true)
+    int cachedSegments;
+    int totalSegments;
+    double downloadProgress;
+    double bandwidth;
+    int isFullyCached;
+    int isHlsMode;
 } YtdlpSpoutHlsCacheStats;
 
 YTDLPSPOUT_API int ytdlpspout_get_hls_cache_stats(
-    ytdlpspout_handle handle,
+    YtdlpSpoutHandle handle,
     YtdlpSpoutHlsCacheStats* stats
 );
 ```
+
+**実際のデフォルト値（`ytdlpspout_config_ex_init()`, `c_api.cpp:519-541`）**: `chunkSize=2MB`, `maxCacheMemory=256MB`, `maxConcurrentDownloads=6`, `prefetchChunksAhead=24`, `criticalChunksAhead=6`, `enableContinuousDownload=1`。これは`PlayerConfig::SliceConfig`の既定値と一致する。
+
+なお`YtdlpSpoutSliceConfig`構造体自身のフィールドコメント（`ytdlpspout.h:68-73`）には「デフォルト: 1MB」「128MB」「4」「16」「4」という**古い値が書かれたまま**になっている。C構造体のためメンバのデフォルト初期化子は持てず、実際に値を設定するのは`ytdlpspout_config_ex_init()`のみであり、そちらが正である。
+
+**`ytdlpspout_start_ex()`内のフォールバック値**（`c_api.cpp:596-608`）: 呼び出し側が`config_ex_init()`を経由せず`slice.chunkSize`等を0のまま渡した場合に限り、`chunkSize=1MB` / `maxCacheMemory=128MB` / `maxConcurrentDownloads=4` / `prefetchChunksAhead=8`にフォールバックする（`criticalChunksAhead`は0以下なら`PlayerConfig`側の既定値6をそのまま使う）。通常`config_ex_init()`を呼んでいれば、このフォールバックには入らない。
+
+**統計APIの実装状況（確認済みの事実）**:
+- `ytdlpspout_get_download_progress()` / `ytdlpspout_is_fully_cached()`: `VideoPlayer::GetDownloadProgress()`/`IsFullyCached()`を呼ぶ実装（動作する）。
+- `ytdlpspout_get_bandwidth()`: `c_api.cpp:690-697`で常に`0.0`を返すスタブ。コメントに`// TODO: 帯域幅測定は将来実装予定`とあり、`VideoPlayer`へのアクセスすら行っていない。
+- `ytdlpspout_get_cache_stats()`: `c_api.cpp:708-730`。正確なチャンク数を返す実装ではなく、`GetDownloadProgress() >= 1.0`のときだけ`cachedChunks=1, totalChunks=1`を返す簡易な近似実装（コメントに「注: 正確なチャンク数を取得するにはVideoPlayerに追加APIが必要」とある）。
+- `ytdlpspout_get_hls_cache_stats()`: `VideoPlayer::GetHlsCacheStats()`経由で、HLSモードなら`HlsSliceLoadingManager`から、非HLSのスライス読み込みなら`SliceLoadingManager`から統計を取得する（`VideoPlayer.cpp:832-855`）。ただし非HLS側の`bandwidth`は前述の`SliceLoadingManager::GetBandwidth()`スタブにより常に`0.0`になる。HLS側の`HlsSliceLoadingManager::GetBandwidth()`（`HlsSliceLoadingManager.cpp:706-712`）は`ChunkDownloader::GetBandwidth()`に委譲する実測値で、こちらは機能する。
 
 ---
 
@@ -477,45 +573,49 @@ YTDLPSPOUT_API int ytdlpspout_get_hls_cache_stats(
 1. ✅ SliceLoadingManager クラス作成 (`cpp/src/io/SliceLoadingManager.h/cpp`)
 2. ✅ YtDlpResolver統合（URL解決）
 3. ✅ VideoPlayer統合（PlayerConfig拡張、SliceConfig/YtDlpConfig追加）
-4. ✅ ユニットテスト (`test_slice_loading_manager.cpp` - 9テスト全て通過)
+4. ✅ ユニットテスト (`test_slice_loading_manager.cpp` - `TEST_CASE`が9件)
 
 ### Phase 3: C API拡張 ✅ **完了**
 1. ✅ `ytdlpspout_config_ex_init()` 実装 - デフォルト設定初期化
 2. ✅ `ytdlpspout_start_ex()` 実装 - 拡張設定で再生開始
 3. ✅ 統計API実装:
    - `ytdlpspout_get_download_progress()` - ダウンロード進捗
-   - `ytdlpspout_get_bandwidth()` - 帯域幅
+   - `ytdlpspout_get_bandwidth()` - 帯域幅（現状スタブ、常に0.0。上記C API拡張セクション参照）
    - `ytdlpspout_is_fully_cached()` - 完全キャッシュ判定
-   - `ytdlpspout_get_cache_stats()` - キャッシュ統計
+   - `ytdlpspout_get_cache_stats()` - キャッシュ統計（簡易近似実装。上記参照）
    - `ytdlpspout_get_hls_cache_stats()` - HLS統計情報（セグメント数、帯域幅、HLSモード判定等）
-4. ✅ ユニットテスト (`test_c_api.cpp` - 41テスト、73アサーション全て通過)
+4. ✅ ユニットテスト (`test_c_api.cpp` - `TEST_CASE`が43件、`REQUIRE`/`CHECK`合計約77件)
 
 #### 追加された構造体
+実体は前掲の「C API拡張」セクション（`cpp/include/ytdlpspout/ytdlpspout.h`）を参照。要約:
+
 ```c
-// スライス読み込み設定
 YtdlpSpoutSliceConfig {
-    int enabled;              // 有効フラグ
-    size_t chunkSize;         // チャンクサイズ (1MB)
-    size_t maxCacheMemory;    // キャッシュメモリ (128MB)
-    int maxConcurrentDownloads; // 並列数 (4)
-    int prefetchChunksAhead;  // 先読み数 (8)
-    const char* cachePath;    // ファイルキャッシュパス
+    int enabled;
+    size_t chunkSize;              // 既定 2MB（config_ex_initで設定）
+    size_t maxCacheMemory;         // 既定 256MB
+    int maxConcurrentDownloads;    // 既定 6
+    int prefetchChunksAhead;       // 既定 24
+    int criticalChunksAhead;       // 既定 6
+    int enableContinuousDownload;  // 既定 1
+    const char* cachePath;         // 現状未使用
 }
 
-// yt-dlp設定
 YtdlpSpoutYtDlpConfig {
-    const char* path;         // yt-dlpパス
-    int preferredHeight;      // 希望解像度 (1080)
+    const char* path;
+    int preferredHeight;           // 既定 1080
 }
 
-// 拡張設定
 YtdlpSpoutConfigEx {
-    const char* source;       // ソース
-    const char* senderName;   // Sender名
-    int outputWidth/Height;   // 出力サイズ
-    int loop/useHardwareAccel/verbose;
+    const char* source;
+    const char* senderName;
+    int outputWidth, outputHeight;
+    int loop, useHardwareAccel, verbose;
     YtdlpSpoutSliceConfig slice;
     YtdlpSpoutYtDlpConfig ytdlp;
+    const YtdlpSpoutHttpHeader* httpHeaders;
+    int httpHeadersCount;
+    int isHlsHint;
 }
 ```
 
@@ -530,7 +630,7 @@ YtdlpSpoutConfigEx {
 2. `python/native_streamer_wrapper.py` - プロパティ追加
    - `download_progress` プロパティ
    - `is_fully_cached` プロパティ
-   - `bandwidth` プロパティ（推定帯域幅 bytes/sec）
+   - `bandwidth` プロパティ（推定帯域幅 bytes/sec。C API側が現状スタブのため、非HLS再生時は常に0になる点に留意）
 3. `gui.py` - 進捗表示機能追加
    - `_update_native_progress()` - NativeStreamerWrapperの進捗を取得・表示
    - `show_native_progress()` - 進捗バー表示
@@ -604,11 +704,11 @@ YtdlpSpoutConfigEx {
 **目標**: HLSストリーム（m3u8）を統合管理するマネージャークラス
 
 1. `cpp/src/hls/HlsSliceLoadingManager.h/cpp` - HLSスライス読み込みマネージャー（新規作成）
-   - **HlsSliceConfig** 構造体:
-     - `maxCacheMemory`: キャッシュメモリサイズ（256MB）
-     - `maxConcurrentDownloads`: 並列ダウンロード数（4）
-     - `prefetchSegmentsAhead`: 先読みセグメント数（5）
-     - `readTimeoutMs`: 読み取りタイムアウト（30秒）
+   - **HlsSliceConfig** 構造体（`HlsSliceLoadingManager.h:48-63`）:
+     - `maxCacheMemory`: キャッシュメモリサイズ（既定256MB）
+     - `maxConcurrentDownloads`: 並列ダウンロード数（構造体自体の既定は4だが、`VideoPlayer::Start()`が`config.slice.maxConcurrentDownloads`＝既定6で上書きする）
+     - `prefetchSegmentsAhead`: 先読みセグメント数（既定5。`VideoPlayer::Start()`でも5に固定設定される）
+     - `readTimeoutMs`: 読み取りタイムアウト（既定30秒）
      - `httpHeaders`: HTTPヘッダー（Cookie等）
    - **HlsSliceLoadingManager** クラス:
      - `Open(hlsUrl, config)`: HLS URLで開く
@@ -625,7 +725,7 @@ YtdlpSpoutConfigEx {
      - `IsHlsUrl(url)`: HLS URLか判定（静的メソッド）
      - `GetDuration()`: 総時間（秒）
      - `GetDownloadProgress()`: ダウンロード進捗
-     - `GetBandwidth()`: 推定帯域幅
+     - `GetBandwidth()`: 推定帯域幅（`ChunkDownloader::GetBandwidth()`に委譲する実測値）
      - `IsFullyCached()`: 完全キャッシュ済みか
      - `GetCachedSegmentCount()`: キャッシュ済みセグメント数
      - `GetTotalSegmentCount()`: 総セグメント数
@@ -651,7 +751,7 @@ YtdlpSpoutConfigEx {
    - ニコニコ動画等のCookie認証が必要なサービスに対応
 
 5. テスト追加:
-   - `cpp/tests/test_hls_slice_loading_manager.cpp` - 10テスト
+   - `cpp/tests/test_hls_slice_loading_manager.cpp` - GoogleTestの`TEST`/`TEST_F`が15件
      - IsHlsUrl判定テスト
      - 初期化テスト（無効入力）
      - 統計情報テスト
@@ -703,7 +803,7 @@ YtdlpSpoutConfigEx {
      - `std::unique_ptr<hls::HlsSliceLoadingManager> hlsManager`
      - `bool isHlsMode` フラグ
    - **Start()変更**:
-     - `HlsSliceLoadingManager::IsHlsUrl()` でHLS判定
+     - `HlsSliceLoadingManager::IsHlsUrl()` でHLS判定（`isHlsHint`が指定されていればそちらを優先）
      - HLSの場合: HlsSliceLoadingManager経由でオープン
      - 非HLSの場合: 既存のSliceLoadingManager使用
      - フォールバック: FFmpegネイティブHLS
@@ -718,7 +818,7 @@ YtdlpSpoutConfigEx {
      - HLSモード時はhlsManagerから取得
 
 3. テスト追加:
-   - `cpp/tests/test_video_player_hls.cpp` - 10テスト
+   - `cpp/tests/test_video_player_hls.cpp` - GoogleTestの`TEST`/`TEST_F`が12件
      - HLS URL判定テスト
      - PlayerConfig設定テスト
      - 無効入力テスト
@@ -768,6 +868,8 @@ HLSコンポーネントでは複数のコンポーネントがミューテッ�
 
 #### HlsSliceLoadingManager のパターン
 
+実際のコードは`HlsSliceLoadingManager::UpdatePlaybackPosition()`（`cpp/src/hls/HlsSliceLoadingManager.cpp:744-`）にあり、以下は要点を簡略化したもの。
+
 ```cpp
 // ✅ 良い例: UpdatePlaybackPosition
 void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
@@ -775,18 +877,18 @@ void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
     std::vector<std::tuple<std::string, int64_t, ChunkPriority>> segmentsToRequest;
     int64_t currentSegment;
     int prefetchAhead;
-    
+
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
         currentSegment = m_impl->cache->GetSegmentIndexFromTime(seconds);
         // ... 情報収集 ...
     }
-    
+
     // ロック外でリクエスト発行
     for (const auto& [url, index, priority] : segmentsToRequest) {
         m_impl->downloader->RequestSegment(url, index, priority);
     }
-    
+
     // ロック外でキャッシュ最適化
     m_impl->cache->OptimizeForPlayback(currentSegment, prefetchAhead);
 }
@@ -804,6 +906,8 @@ void HlsSliceLoadingManager::UpdatePlaybackPosition(double seconds) {
 
 #### HlsCustomAVIOContext のパターン
 
+実際のコードは`HlsCustomAVIOContext::ReadPacket()`（`cpp/src/hls/HlsCustomAVIOContext.cpp:531-`）にあり、以下は要点を簡略化したもの。
+
 ```cpp
 // ✅ 良い例: ReadPacket
 int HlsCustomAVIOContext::ReadPacket(void* opaque, uint8_t* buf, int bufSize) {
@@ -818,10 +922,10 @@ int HlsCustomAVIOContext::ReadPacket(void* opaque, uint8_t* buf, int bufSize) {
             timeout = impl.readTimeoutMs;
             cache = impl.cache;
         }
-        
+
         // 2. ロック外でデータ取得（待機可能）
         auto segmentData = cache->ReadSegment(segmentToRead, timeout);
-        
+
         // 3. 再度ロックして状態更新
         {
             std::lock_guard<std::mutex> lock(impl.mutex);
@@ -869,22 +973,27 @@ if (slashPos == std::string::npos || slashPos < MIN_SCHEME_LENGTH) break;
 
 ### HLSスライスローディング初期化の待機
 
-HLSストリームを開く際、FFmpegが `avformat_find_stream_info()` でセグメントを読み込もうとする前に、最初のセグメントが利用可能になっている必要があります。`HlsSliceLoadingManager::Open()` は、条件変数を使用して最初のセグメントがダウンロードされるまで効率的に待機します：
+HLSストリームを開く際、FFmpegが `avformat_find_stream_info()` でセグメントを読み込もうとする前に、最初のセグメントが利用可能になっている必要があります。`HlsSliceLoadingManager::Open()` は、条件変数を使用して最初のセグメントがダウンロードされるまで効率的に待機します（実際のコードは`cpp/src/hls/HlsSliceLoadingManager.cpp:515-577`）：
 
 ```cpp
-// HlsSliceLoadingManager.cpp - Open()内
+// HlsSliceLoadingManager.cpp - Open()内（要点を簡略化。実際はfMP4の初期化セグメントも同様に待機する）
 
-// 最初のセグメントをURGENT優先度でリクエスト
+// 最初のセグメントをCritical優先度でリクエスト（"Urgent"という優先度は存在しない）
 const auto& firstSegment = m_impl->playlist.segments[0];
-m_impl->downloader->RequestSegment(firstSegment.url, 0, io::ChunkPriority::URGENT);
+m_impl->downloader->RequestSegment(firstSegment.url, 0, io::ChunkPriority::Critical,
+                                    firstSegment.byteRangeStart, firstSegment.byteRangeLength);
+
+// fMP4の場合は初期化セグメント（index -1）も同様に待機してから...
 
 // 条件変数で待機（ポーリングではなく即座に通知を受ける）
 const int waitTimeoutMs = config.readTimeoutMs > 0 ? config.readTimeoutMs : 30000;
 if (!m_impl->cache->WaitForSegment(0, waitTimeoutMs)) {
-    LOG_WARN("First segment not available within timeout");
+    LOG_ERROR("First segment not available after {}ms wait", waitTimeoutMs);
+    m_impl->isOpen = false;
+    return false;
 }
 
-// プリフェッチを開始（最初のセグメントがダウンロードされた後）
+// プリフェッチを開始（最初のセグメントがダウンロードされた後、ロック解放後に呼び出す）
 UpdatePlaybackPosition(0.0);
 ```
 

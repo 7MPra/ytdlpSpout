@@ -592,6 +592,166 @@ void TestWaitForChunkTimeout() {
 }
 
 // =============================================================================
+// チャンク失敗カウント・恒久失敗テスト (Issue B-IO)
+// =============================================================================
+
+void TestChunkFailCountIncrementsOnError() {
+    TEST_CASE("Chunk fail count increments on each Error transition")
+    {
+        SparseFileCacheConfig config;
+        config.chunkSize = 1024;
+        SparseFileCache cache(config);
+
+        cache.Initialize(5 * 1024);
+
+        ASSERT_EQ(cache.GetChunkFailCount(0), 0);
+
+        cache.SetChunkState(0, ChunkState::Error);
+        ASSERT_EQ(cache.GetChunkFailCount(0), 1);
+
+        cache.SetChunkState(0, ChunkState::Error);
+        ASSERT_EQ(cache.GetChunkFailCount(0), 2);
+    }
+    TEST_END()
+}
+
+void TestChunkFailCountResetOnSuccess() {
+    TEST_CASE("Chunk fail count resets to 0 after successful WriteChunk")
+    {
+        SparseFileCacheConfig config;
+        config.chunkSize = 1024;
+        SparseFileCache cache(config);
+
+        cache.Initialize(5 * 1024);
+
+        cache.SetChunkState(0, ChunkState::Error);
+        cache.SetChunkState(0, ChunkState::Error);
+        ASSERT_EQ(cache.GetChunkFailCount(0), 2);
+
+        std::vector<uint8_t> data(1024, 0xEF);
+        ASSERT_TRUE(cache.WriteChunk(0, data.data(), data.size()));
+
+        ASSERT_EQ(cache.GetChunkFailCount(0), 0);
+        ASSERT_EQ(cache.GetChunkState(0), ChunkState::Cached);
+    }
+    TEST_END()
+}
+
+void TestChunkFailCountPreservedAcrossEmptyReset() {
+    TEST_CASE("Chunk fail count is preserved when state is reset to Empty (PrefetchScheduler retry pattern)")
+    {
+        SparseFileCacheConfig config;
+        config.chunkSize = 1024;
+        SparseFileCache cache(config);
+
+        cache.Initialize(5 * 1024);
+
+        cache.SetChunkState(0, ChunkState::Error);
+        ASSERT_EQ(cache.GetChunkFailCount(0), 1);
+
+        // PrefetchSchedulerが再リクエスト前に行うのと同様にEmptyへリセット
+        cache.SetChunkState(0, ChunkState::Empty);
+        ASSERT_EQ(cache.GetChunkState(0), ChunkState::Empty);
+
+        // リセットしても失敗カウントは保持される
+        ASSERT_EQ(cache.GetChunkFailCount(0), 1);
+    }
+    TEST_END()
+}
+
+void TestReadReturnsErrorImmediatelyAfterMaxFailures() {
+    TEST_CASE("Read returns -1 immediately (no timeout wait) once chunk exceeds max fail count")
+    {
+        SparseFileCacheConfig config;
+        config.chunkSize = 1024;
+        SparseFileCache cache(config);
+
+        cache.Initialize(5 * 1024);
+
+        // kMaxChunkFailCount+1回、Error状態に遷移させて恒久的失敗をシミュレートする
+        for (int i = 0; i <= kMaxChunkFailCount; ++i) {
+            cache.SetChunkState(0, ChunkState::Error);
+        }
+        ASSERT_GT(cache.GetChunkFailCount(0), kMaxChunkFailCount);
+
+        std::vector<uint8_t> readData(1024);
+        auto start = std::chrono::steady_clock::now();
+        // 大きめのタイムアウトを指定しても、待たずに即座に返るはず
+        int64_t bytesRead = cache.Read(0, readData.data(), readData.size(), 5000);
+        auto elapsed = std::chrono::steady_clock::now() - start;
+
+        ASSERT_EQ(bytesRead, -1);
+        ASSERT_LE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 1000);
+    }
+    TEST_END()
+}
+
+void TestReadWakesImmediatelyOnErrorTransition() {
+    TEST_CASE("Read wakes immediately (not after full timeout) when a chunk reaches permanent Error while waiting")
+    {
+        SparseFileCacheConfig config;
+        config.chunkSize = 1024;
+        SparseFileCache cache(config);
+
+        cache.Initialize(5 * 1024);
+
+        std::thread failer([&cache]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            for (int i = 0; i <= kMaxChunkFailCount; ++i) {
+                cache.SetChunkState(0, ChunkState::Error);
+            }
+        });
+
+        std::vector<uint8_t> readData(1024);
+        auto start = std::chrono::steady_clock::now();
+        int64_t bytesRead = cache.Read(0, readData.data(), readData.size(), 10000);  // 10秒タイムアウト
+        auto elapsed = std::chrono::steady_clock::now() - start;
+
+        failer.join();
+
+        ASSERT_EQ(bytesRead, -1);
+        // 10秒のタイムアウトを待たず、Error遷移直後（150ms程度+マージン）に返ったはず
+        ASSERT_LE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 2000);
+    }
+    TEST_END()
+}
+
+void TestReadSucceedsAfterErrorRecovery() {
+    TEST_CASE("Read succeeds after chunk recovers from Error via Empty then Cached (below fail threshold)")
+    {
+        SparseFileCacheConfig config;
+        config.chunkSize = 1024;
+        SparseFileCache cache(config);
+
+        cache.Initialize(5 * 1024);
+
+        // 上限未満の失敗（1回）
+        cache.SetChunkState(0, ChunkState::Error);
+        ASSERT_LE(cache.GetChunkFailCount(0), kMaxChunkFailCount);
+
+        // PrefetchSchedulerが行うのと同様にEmptyへリセットしてから再ダウンロードする
+        cache.SetChunkState(0, ChunkState::Empty);
+
+        // 別スレッドで遅延書き込み（再ダウンロード成功をシミュレート）
+        std::thread writer([&cache]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::vector<uint8_t> data(1024, 0xCD);
+            cache.WriteChunk(0, data.data(), data.size());
+        });
+
+        std::vector<uint8_t> readData(1024);
+        int64_t bytesRead = cache.Read(0, readData.data(), readData.size(), 5000);
+
+        writer.join();
+
+        ASSERT_EQ(bytesRead, 1024);
+        ASSERT_EQ(cache.GetChunkState(0), ChunkState::Cached);
+        ASSERT_EQ(cache.GetChunkFailCount(0), 0);  // 成功でリセットされている
+    }
+    TEST_END()
+}
+
+// =============================================================================
 // メイン関数
 // =============================================================================
 
@@ -638,7 +798,15 @@ int main() {
     std::cout << "\n--- Wait Tests ---" << std::endl;
     TestWaitForChunk();
     TestWaitForChunkTimeout();
-    
+
+    std::cout << "\n--- Chunk Fail Count / Permanent Error Tests (Issue B-IO) ---" << std::endl;
+    TestChunkFailCountIncrementsOnError();
+    TestChunkFailCountResetOnSuccess();
+    TestChunkFailCountPreservedAcrossEmptyReset();
+    TestReadReturnsErrorImmediatelyAfterMaxFailures();
+    TestReadWakesImmediatelyOnErrorTransition();
+    TestReadSucceedsAfterErrorRecovery();
+
     // 結果サマリー
     std::cout << "\n=== Test Summary ===" << std::endl;
     std::cout << "Passed: " << s_testsPassed << std::endl;

@@ -141,7 +141,9 @@ bool Application::ParseArguments(int argc, char* argv[]) {
     }
 
     // フォーマット文字列から高さを解析
-    if (m_impl->config.format != "best") {
+    // RES-5: --format ""（空文字）が渡された場合、fmt.back()はUBを引き起こすため
+    // 空文字列は"best"相当として扱いスキップする
+    if (m_impl->config.format != "best" && !m_impl->config.format.empty()) {
         // "1080p" -> 1080
         std::string fmt = m_impl->config.format;
         if (fmt.back() == 'p' || fmt.back() == 'P') {
@@ -175,10 +177,17 @@ int Application::Run() {
     LOG_INFO("Loop: {}", m_impl->config.loop ? "yes" : "no");
     LOG_INFO("Hardware Accel: {}", m_impl->config.useHardwareAccel ? "yes" : "no");
 
+    // RES-6: シグナルハンドラ設定は、ブロッキングするURL解決（yt-dlp呼び出し、最大30秒×2回）
+    // より前に登録する。ハンドラはg_currentPlayerのnullチェックを行うため、
+    // プレイヤー生成前のこの時点で登録しても安全。これにより解決中のCtrl-Cで
+    // 子プロセス（yt-dlp）が回収されずリークすることを防ぐ。
+    std::signal(SIGINT, SignalHandler);
+    std::signal(SIGTERM, SignalHandler);
+
     // =========================================================================
     // URLタイプに応じた処理分岐
     // =========================================================================
-    
+
     auto sourceType = ytdlp::YtDlpResolver::GetSourceType(m_impl->config.inputFile);
     
     switch (sourceType) {
@@ -230,10 +239,6 @@ int Application::Run() {
             return 1;
         }
     }
-
-    // シグナルハンドラ設定
-    std::signal(SIGINT, SignalHandler);
-    std::signal(SIGTERM, SignalHandler);
 
     // プレイヤー作成
     m_impl->player = std::make_unique<VideoPlayer>();
